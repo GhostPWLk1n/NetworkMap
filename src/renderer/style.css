@@ -1,0 +1,495 @@
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+  margin: 0;
+  color: #1a1a1a;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden; /* скроллится не вся страница, а только области внутри активного листа */
+}
+
+/* ---- Шапка и табы ---- */
+#app-header {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 20px;
+  border-bottom: 1px solid #ddd;
+  background: #f7f7f8;
+  flex: 0 0 auto;
+}
+#app-header h1 { font-size: 16px; margin: 0; }
+.app-version { font-size: 11px; font-weight: 400; color: #999; vertical-align: middle; }
+#tabs { display: flex; gap: 4px; }
+.tab-btn {
+  padding: 6px 14px;
+  border: 1px solid #ccc;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: #eee;
+  cursor: pointer;
+  font-size: 13px;
+}
+.tab-btn.active { background: #fff; font-weight: 600; border-color: #999; }
+
+/* Лист занимает весь остаток вьюпорта под шапкой; сам не скроллится — скроллится либо
+   .tab-scroll-body (Пользователи/Устройства/Склад/ПО), либо внутренние области плана */
+.tab-content { display: none; flex-direction: column; min-height: 0; padding: 20px; }
+.tab-content.active { display: flex; flex: 1; }
+#tab-users.active, #tab-devices.active, #tab-warehouse.active, #tab-software.active { padding: 0; }
+
+/* Закреплённая шапка листа (поиск + добавление) — не скроллится вместе со списком карточек */
+.tab-sticky-header { flex: 0 0 auto; padding: 20px 20px 0; }
+.tab-scroll-body { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 20px 20px; }
+
+/* ---- Лист "Планы": тулбар | канва | инспектор ---- */
+#floor-tabs { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; margin-bottom: 12px; }
+.plan-layout {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0; /* без этого flex-дети не сжимаются ниже контента и overflow не работает */
+}
+
+#plan-tools, #plan-inspector {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafafa;
+  overflow-y: auto; /* длинные списки (пользователи/склад/история) скроллятся внутри панели */
+  min-height: 0;
+}
+#plan-tools { flex: 0 0 220px; }
+#plan-inspector {
+  /* flex-basis (не width) обычно определяет размер flex-элемента по главной оси —
+     нативный resize браузера меняет только inline width, поэтому здесь явно уходим
+     от flex-basis на auto + обычный width, иначе перетаскивание не будет иметь эффекта */
+  flex: 0 0 auto;
+  width: 260px;
+  min-width: 200px;
+  max-width: 640px;
+  overflow: auto;
+  resize: horizontal;
+}
+#plan-tools h3, #plan-inspector h3 { margin: 0 0 10px; font-size: 13px; color: #555; text-transform: uppercase; letter-spacing: .03em; }
+
+.tool-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.tool-btn:hover { background: #f0f0f0; }
+.tool-btn.active { background: #dbe9ff; border-color: #7aa6f0; }
+.tool-btn.tool-danger.active { background: #ffdada; border-color: #e07a7a; }
+
+#device-picker { width: 100%; margin-bottom: 10px; padding: 5px; }
+#plan-mode-label { font-size: 12px; color: #666; margin-top: 8px; line-height: 1.4; }
+
+#plan-stage-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  background: #fafafa;
+}
+#zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #ddd;
+  background: #f2f2f2;
+  position: sticky;
+  top: 0;
+}
+#zoom-controls button {
+  width: 26px; height: 26px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+#zoom-controls #zoom-reset { width: auto; padding: 0 8px; }
+#zoom-controls #mode-switch-btn { width: auto; height: 26px; padding: 0 10px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+
+#layer-toggles { display: flex; gap: 2px; }
+#zoom-controls .layer-toggle {
+  width: 26px; height: 26px; padding: 0;
+  border: 1px solid #ccc; border-radius: 4px; background: #fff;
+  cursor: pointer; opacity: 0.4; filter: grayscale(1);
+}
+#zoom-controls .layer-toggle.active { opacity: 1; filter: none; background: #eef4ff; border-color: #9db8e8; }
+#mode-switch-btn.view-mode { background: #ffe9c2; border-color: #e0a940; }
+#plan-tools.view-mode-locked .tool-btn,
+#plan-tools.view-mode-locked select,
+#plan-tools.view-mode-locked #device-drag-list,
+#plan-tools.view-mode-locked #user-drag-list,
+#plan-tools.view-mode-locked #warehouse-drag-list,
+#plan-tools.view-mode-locked #zone-drag-item {
+  opacity: 0.4;
+  pointer-events: none;
+}
+#zoom-label { font-size: 12px; color: #555; width: 42px; text-align: center; }
+#plan-stage { display: inline-block; }
+
+#plan-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+#plan-search-input {
+  width: 160px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 12px;
+}
+#plan-search button {
+  width: 24px; height: 24px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+#plan-search button.active { background: #dbe9ff; border-color: #7aa6f0; }
+#plan-search-history-wrap { position: relative; }
+#plan-search-history-list {
+  position: absolute;
+  top: 28px;
+  right: 0;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  min-width: 170px;
+  max-height: 220px;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  z-index: 20;
+}
+#plan-search-history-list.hidden { display: none; }
+#plan-search-history-list li {
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border: none;
+}
+#plan-search-history-list li:hover { background: #f0f0f0; }
+#plan-search-history-list li.search-history-empty { color: #999; cursor: default; }
+#plan-search-history-list li.search-history-empty:hover { background: none; }
+
+.inspector-empty { color: #999; font-size: 13px; }
+.inspector-field { margin-bottom: 8px; font-size: 13px; }
+.inspector-field label { display: block; font-size: 11px; color: #888; text-transform: uppercase; }
+.inspector-field .value { font-size: 13px; word-break: break-word; }
+.inspector-actions { margin-top: 14px; display: flex; gap: 8px; }
+.inspector-actions button { flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 6px; cursor: pointer; background: #fff; }
+.inspector-actions .danger { border-color: #e07a7a; color: #b33; }
+.inspector-ping-status { font-size: 12px; margin-top: 6px; color: #444; }
+
+#plan-tools-search {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+#device-drag-list, #user-drag-list, #warehouse-drag-list {
+  max-height: 140px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: #fff;
+}
+.device-drag-item, .user-drag-item, .warehouse-drag-item {
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: grab;
+  border-bottom: 1px solid #f0f0f0;
+}
+.device-drag-item:last-child, .user-drag-item:last-child, .warehouse-drag-item:last-child { border-bottom: none; }
+.device-drag-item:hover, .user-drag-item:hover, .warehouse-drag-item:hover { background: #f5f5f5; }
+.device-drag-item:active, .user-drag-item:active, .warehouse-drag-item:active { cursor: grabbing; }
+.device-drag-item .wh-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 5px;
+  background: #eee;
+  color: #666;
+}
+.warehouse-drag-item .wh-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-right: 5px;
+  background: #eee;
+  color: #666;
+}
+
+.inspector-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  color: #888;
+  margin: 12px 0 4px;
+}
+
+.device-card-extras { border-top: 1px solid #eee; margin-top: 10px; padding-top: 2px; }
+.mini-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
+.mini-list li { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid #f0f0f0; }
+.mini-list li.detached { color: #aaa; text-decoration: line-through; }
+.mini-list li button { flex-shrink: 0; padding: 2px 6px; font-size: 11px; }
+.inspector-empty-note { color: #999; font-size: 12px; padding: 3px 0; }
+.inspector-add-form { display: flex; gap: 4px; margin-bottom: 4px; }
+.inspector-add-form select { font-size: 11px; padding: 3px; }
+.inspector-add-form input { flex: 1; font-size: 11px; padding: 3px; min-width: 0; }
+.inspector-add-form button { padding: 3px 8px; }
+
+/* ---- Переключатель этажей (Планы) ---- */
+#floor-tabs-list { display: flex; gap: 4px; flex-wrap: wrap; }
+.floor-tab-btn {
+  padding: 5px 12px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #f0f0f0;
+  cursor: pointer;
+  font-size: 12px;
+}
+.floor-tab-btn.active { background: #dbe9ff; border-color: #7aa6f0; font-weight: 600; }
+#floor-add-btn { padding: 5px 10px; border: 1px dashed #999; border-radius: 6px; background: #fff; cursor: pointer; font-size: 12px; color: #555; }
+#floor-add-btn:hover { background: #f5f5f5; }
+
+/* ---- Листы "Пользователи" / "Устройства": поиск, карточки ---- */
+.search-bar { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; }
+.search-bar input {
+  flex: 1;
+  max-width: 420px;
+  padding: 7px 10px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.search-toggle {
+  width: 30px; height: 30px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.search-toggle.active { background: #dbe9ff; border-color: #7aa6f0; }
+.search-advanced {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: #f7f7f8;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.search-advanced.hidden { display: none; }
+.search-advanced label { display: flex; flex-direction: column; gap: 3px; color: #555; }
+.search-advanced label.search-advanced-checkbox { flex-direction: row; align-items: center; gap: 6px; }
+.search-advanced label.search-advanced-checkbox input { width: auto; }
+.search-advanced-note { color: #999; font-size: 11px; margin: 0; margin-left: auto; }
+
+#user-add-form-wrap, #device-add-form-wrap, #warehouse-add-form-wrap, #software-add-form-wrap { margin-bottom: 14px; }
+#user-add-form-wrap summary, #device-add-form-wrap summary, #warehouse-add-form-wrap summary, #software-add-form-wrap summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: #444;
+  padding: 6px 0;
+}
+#user-add-form-wrap form, #device-add-form-wrap form, #warehouse-add-form-wrap form, #software-add-form-wrap form {
+  margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+}
+#warehouse-form input[name="cost"], #software-warehouse-form input[name="cost"] { width: 160px; }
+
+.card-list { display: flex; flex-direction: column; gap: 6px; }
+.card-row {
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+/* Списанные устройства / уволенные сотрудники — видны только по тумблеру "показать...",
+   отображаются приглушённо серым, но карточка по-прежнему открывается для восстановления */
+.card-row.status-removed { background: #f2f2f2; border-color: #ddd; }
+.card-row.status-removed .card-row-header { opacity: 0.65; }
+.card-row.status-removed .card-title { color: #777; }
+.card-row.status-removed .card-subtitle { color: #aaa; }
+
+/* Подсветка строк по статусу — устройства (ремонт/на складе), склад (в заказе/выдано) */
+.card-row.status-repair { background: #fff8e6; border-color: #ecc94b; }
+.card-row.status-storage { background: #eef2f7; border-color: #a9c0dd; }
+.card-row.wh-status-ordered { background: #eaf2ff; border-color: #a9c6f5; }
+.card-row.wh-status-issued { background: #eafaf0; border-color: #a3ddb8; }
+.card-row.wh-status-written_off { background: #f2f2f2; border-color: #ddd; opacity: 0.75; }
+
+/* Бейджи ручных/автоматических пометок */
+.flag-badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+.flag-badge.flag-problem { background: #fde3cf; color: #9c4a15; }
+.flag-badge.flag-attention { background: #fdf3c0; color: #7a6300; }
+.flag-badge.flag-error { background: #fbd5d5; color: #9b1c1c; }
+.flag-badge.flag-auto { border: 1px dashed currentColor; cursor: help; }
+.card-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.card-row-header:hover { background: #fafafa; }
+.card-row-header .card-title { font-weight: 500; }
+.card-row-header .card-subtitle { color: #888; font-size: 12px; }
+.card-row-header .card-chevron { margin-left: auto; color: #999; font-size: 11px; transition: transform .15s; }
+.card-row.expanded .card-chevron { transform: rotate(90deg); }
+
+.card-body { display: none; padding: 12px; border-top: 1px solid #eee; background: #fcfcfc; }
+.card-row.expanded .card-body { display: block; }
+.card-body form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; margin-bottom: 10px; }
+.card-body form label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #777; }
+.card-body form label.span-2 { grid-column: 1 / -1; }
+.card-body form input, .card-body form select { font-size: 13px; padding: 6px 8px; }
+.card-body-actions { display: flex; gap: 8px; align-items: center; }
+.card-body-actions .status-note { font-size: 12px; color: #4caf50; }
+
+/* ---- Контекстное меню ---- */
+#context-menu {
+  position: fixed;
+  z-index: 100;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+  min-width: 160px;
+  padding: 4px 0;
+  list-style: none;
+  margin: 0;
+}
+#context-menu.hidden { display: none; }
+#context-menu li { padding: 7px 14px; font-size: 13px; cursor: pointer; border: none; }
+#context-menu li:hover { background: #f0f0f0; }
+#context-menu li.danger { color: #b33; }
+
+#import-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+#import-status { font-size: 13px; color: #444; }
+#import-report {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  background: #f7f7f8;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 12px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+#import-report.hidden { display: none; }
+#import-report ul { margin: 4px 0 0; padding-left: 18px; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+.modal-overlay.hidden { display: none; }
+.modal-box {
+  background: #fff;
+  border-radius: 10px;
+  padding: 18px 20px;
+  min-width: 320px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+}
+.modal-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #333; }
+.modal-box input {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  margin-bottom: 14px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions button { padding: 6px 14px; }
+
+#db-settings-btn { margin-left: auto; font-size: 12px; white-space: nowrap; }
+#db-settings-btn.has-warning { background: #fff3e0; border-color: #f0b96a; }
+.db-settings-box { width: 460px; max-width: 90vw; }
+.db-current-info { margin-bottom: 8px; }
+.db-current-info label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .03em; }
+.db-path-value {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  background: #f5f5f5;
+  border: 1px solid #e0e0e0;
+  border-radius: 5px;
+  padding: 6px 8px;
+  margin: 3px 0;
+  word-break: break-all;
+}
+.db-badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #eee; color: #555; }
+.db-badge.custom { background: #dbe9ff; color: #2a5db0; }
+.db-warning {
+  background: #fff3e0;
+  border: 1px solid #f0b96a;
+  color: #8a5a00;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+.db-warning.hidden { display: none; }
+.db-explainer { margin: 0 0 12px; }
+.db-actions-grid { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.db-actions-grid .tool-btn { text-align: left; }
+#db-status-note { display: block; margin-bottom: 8px; min-height: 16px; }
+
+input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
+button { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; background: #f5f5f5; cursor: pointer; }
+button:hover { background: #eaeaea; }
+.status-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #bbb;
+  flex-shrink: 0;
+}
+.hint { color: #666; font-size: 13px; }

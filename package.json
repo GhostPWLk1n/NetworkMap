@@ -1,0 +1,73 @@
+{
+  "name": "network-map-app",
+  "version": "1.13.0",
+  "description": "Учёт компьютеров/устройств и планов размещения",
+  "main": "src/main/index.js",
+  "author": "Pavel Fomin",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "postinstall": "electron-rebuild -f -w better-sqlite3",
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "dist:win": "cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.1",
+    "cross-env": "^10.1.0",
+    "electron": "^31.3.1",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "konva": "^10.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "build": {
+    "appId": "com.networkmap.app",
+    "productName": "NetworkMap",
+    "copyright": "Copyright © 2024 NodeCalculate Team, Pavel Fomin",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "icon.png",
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "NetworkMap"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-portable.${ext}"
+    }
+  }
+}
