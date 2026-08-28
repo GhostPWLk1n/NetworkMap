@@ -121,7 +121,7 @@ body {
   cursor: pointer;
 }
 #zoom-controls #zoom-reset { width: auto; padding: 0 8px; }
-#zoom-controls #mode-switch-btn { width: auto; height: 26px; padding: 0 10px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+#zoom-controls #mode-switch-btn, #zoom-controls #ping-plan-btn { width: auto; height: 26px; padding: 0 10px; font-size: 12px; font-weight: 600; white-space: nowrap; }
 
 #layer-toggles { display: flex; gap: 2px; }
 #zoom-controls .layer-toggle {
@@ -291,6 +291,8 @@ body {
   border-radius: 4px;
   font-size: 13px;
 }
+.search-count { font-size: 12px; color: #888; white-space: nowrap; margin: 0 2px; }
+
 .search-toggle {
   width: 30px; height: 30px;
   padding: 0;

@@ -66,6 +66,7 @@
           <button id="zoom-in" type="button" title="Увеличить">＋</button>
           <button id="zoom-reset" type="button" title="Сбросить масштаб">Сброс</button>
           <button id="mode-switch-btn" type="button" title="Переключить режим рисование/просмотр">✏️ Рисование</button>
+          <button id="ping-plan-btn" type="button" title="Обновить пинг всех устройств на этом этаже">🔄📶</button>
 
           <div id="layer-toggles">
             <button id="layer-toggle-zone" type="button" class="layer-toggle active" data-layer="0" title="Слой 0: зоны (базовый, под стенами)">🟩</button>
@@ -139,7 +140,9 @@
   <div id="tab-devices" class="tab-content">
     <div class="tab-sticky-header">
       <div class="search-bar" id="devices-search-bar">
-        <input id="devices-search-input" placeholder="Поиск: hostname / IP / инв. номер / заметка" autocomplete="off" />
+        <input id="devices-search-input" list="devices-search-datalist" placeholder="Поиск: hostname / IP / инв. номер / заметка / оборудование" autocomplete="off" />
+        <datalist id="devices-search-datalist"></datalist>
+        <span id="devices-search-count" class="search-count"></span>
         <button class="search-toggle" id="devices-search-clear" type="button" title="Очистить">×</button>
         <button class="search-toggle" id="devices-search-case" type="button" title="Учитывать регистр">Аа</button>
         <button class="search-toggle" id="devices-search-wildcard" type="button" title="Подстановочные знаки *">*</button>
@@ -171,7 +174,10 @@
         <label class="search-advanced-checkbox">
           <input type="checkbox" id="devices-filter-show-decommissioned" /> показать списанные
         </label>
-        <p class="search-advanced-note">Заготовка под будущие фильтры (отдел, наличие владельца и т.д.)</p>
+        <label class="search-advanced-checkbox">
+          <input type="checkbox" id="devices-filter-no-owner" /> без пользователя
+        </label>
+        <p class="search-advanced-note">Заготовка под будущие фильтры (отдел и т.д.)</p>
       </div>
 
       <details id="device-add-form-wrap">

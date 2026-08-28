@@ -376,14 +376,40 @@ async function renderDevices() {
   devicesCache = list;
 
   deviceEquipmentIndex = new Map();
+  const suggestions = new Set();
   const addToIndex = (deviceId, text) => {
     if (!text) return;
     const prev = deviceEquipmentIndex.get(deviceId);
     deviceEquipmentIndex.set(deviceId, prev ? `${prev} ${text}` : text);
   };
-  components.forEach((c) => addToIndex(c.device_id, `${COMPONENT_TYPE_LABELS[c.component_type] || c.component_type} ${c.description}`));
-  peripherals.forEach((p) => addToIndex(p.device_id, `${PERIPHERAL_TYPE_LABELS[p.peripheral_type] || p.peripheral_type} ${p.description}`));
-  software.forEach((s) => addToIndex(s.device_id, `${SOFTWARE_TYPE_LABELS[s.software_type] || s.software_type} ${s.name} ${s.license_key || ''}`));
+  devicesCache.forEach((d) => {
+    if (d.hostname) suggestions.add(d.hostname);
+    if (d.owner_name) suggestions.add(d.owner_name);
+    if (d.inventory_number) suggestions.add(d.inventory_number);
+  });
+  components.forEach((c) => {
+    addToIndex(c.device_id, `${COMPONENT_TYPE_LABELS[c.component_type] || c.component_type} ${c.description}`);
+    if (c.description) suggestions.add(c.description);
+  });
+  peripherals.forEach((p) => {
+    addToIndex(p.device_id, `${PERIPHERAL_TYPE_LABELS[p.peripheral_type] || p.peripheral_type} ${p.description}`);
+    if (p.description) suggestions.add(p.description);
+  });
+  software.forEach((s) => {
+    addToIndex(s.device_id, `${SOFTWARE_TYPE_LABELS[s.software_type] || s.software_type} ${s.name} ${s.license_key || ''}`);
+    if (s.name) suggestions.add(s.name);
+    if (s.license_key) suggestions.add(s.license_key);
+  });
+
+  // Автодополнение — реальные значения из данных (hostname, владельцы, комплектующие,
+  // периферия, ПО, лицензионные ключи), не история запросов
+  const datalist = document.getElementById('devices-search-datalist');
+  datalist.innerHTML = '';
+  [...suggestions].sort((a, b) => a.localeCompare(b, 'ru')).forEach((value) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    datalist.appendChild(opt);
+  });
 
   applyDevicesFilter();
 }
@@ -393,22 +419,30 @@ function applyDevicesFilter() {
   const typeFilterEl = document.getElementById('devices-filter-type');
   const statusFilterEl = document.getElementById('devices-filter-status');
   const showDecommissionedEl = document.getElementById('devices-filter-show-decommissioned');
+  const noOwnerEl = document.getElementById('devices-filter-no-owner');
   const typeFilter = typeFilterEl ? typeFilterEl.value : '';
   const statusFilter = statusFilterEl ? statusFilterEl.value : '';
   const showDecommissioned = showDecommissionedEl ? showDecommissionedEl.checked : false;
+  const noOwnerOnly = noOwnerEl ? noOwnerEl.checked : false;
   const query = (state.query || '').trim();
 
-  const filtered = devicesCache.filter((d) => {
-    const haystack = [d.hostname, d.primary_ip, d.inventory_number, d.device_type, d.owner_name, d.notes, deviceEquipmentIndex.get(d.id)]
-      .filter(Boolean).join(' ');
-    const matchesText = !query || matchesQuery(haystack, query, state);
+  // Знаменатель счётчика — сколько устройств вообще доступно при текущих
+  // фильтрах типа/статуса (без учёта текстового запроса); числитель — после него
+  const eligible = devicesCache.filter((d) => {
     const matchesType = !typeFilter || d.device_type === typeFilter;
     const matchesStatus = !statusFilter || d.status === statusFilter;
-    // Списанные скрыты по умолчанию — если явно не включили тумблер и не выбрали
-    // статус "decommissioned" в фильтре (тогда это осознанный запрос, показываем)
+    const matchesOwner = !noOwnerOnly || !d.owner_user_id;
     const isHiddenByDefault = d.status === 'decommissioned' && !showDecommissioned && statusFilter !== 'decommissioned';
-    return matchesText && matchesType && matchesStatus && !isHiddenByDefault;
+    return matchesType && matchesStatus && matchesOwner && !isHiddenByDefault;
   });
+  const filtered = eligible.filter((d) => {
+    const haystack = [d.hostname, d.primary_ip, d.inventory_number, d.device_type, d.owner_name, d.notes, deviceEquipmentIndex.get(d.id)]
+      .filter(Boolean).join(' ');
+    return !query || matchesQuery(haystack, query, state);
+  });
+
+  const countEl = document.getElementById('devices-search-count');
+  if (countEl) countEl.textContent = `${filtered.length} из ${eligible.length}`;
 
   const container = document.getElementById('device-cards');
   container.innerHTML = '';
@@ -623,6 +657,7 @@ devicesSearchState = bindSearchBar('devices', applyDevicesFilter);
 document.getElementById('devices-filter-type').addEventListener('change', applyDevicesFilter);
 document.getElementById('devices-filter-status').addEventListener('change', applyDevicesFilter);
 document.getElementById('devices-filter-show-decommissioned').addEventListener('change', applyDevicesFilter);
+document.getElementById('devices-filter-no-owner').addEventListener('change', applyDevicesFilter);
 
 /** Переключает на лист "Планы", открывает нужный этаж и выделяет иконку устройства */
 async function findDeviceOnPlan(deviceId) {
@@ -1454,6 +1489,7 @@ function renderPointItem(item) {
   }
 
   group.on('click', async (e) => {
+    if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая — средняя занята панорамой
     e.cancelBubble = true;
     if (planState.mode === 'delete') { await removePlanItem(item.id); return; }
     if (planState.mode === 'cable' && (item.item_type === 'device' || item.item_type === 'desk')) {
@@ -1497,6 +1533,10 @@ function renderPointItem(item) {
       });
     }
     showContextMenu(e.evt.clientX, e.evt.clientY, items);
+  });
+
+  group.on('dragstart', () => {
+    if (planState.panFrom) group.stopDrag(); // средняя кнопка уже занята панорамой — эта иконка не должна тащиться
   });
 
   group.on('dragend', async () => {
@@ -1626,6 +1666,61 @@ function updatePingBadge(itemId, status) {
   if (data) { data.last_ping_status = status; group.setAttr('itemData', data); }
 }
 
+/** BFS по уже нарисованным кабелям от корневого plan_item (например, роутера) —
+ *  возвращает id всех point-item'ов типа "устройство", достижимых цепочкой кабелей
+ *  (включая сам корень, если он тоже устройство). Переиспользуется массовым пингом
+ *  "все на роутере" и позже вкладкой "Сеть" для построения иерархии подсети. */
+function getConnectedDeviceIds(rootPlanItemId) {
+  const visited = new Set([rootPlanItemId]);
+  const queue = [rootPlanItemId];
+  const deviceIds = [];
+  while (queue.length) {
+    const currentId = queue.shift();
+    const node = planState.itemsById.get(currentId);
+    if (node && node.getAttr('itemData')?.item_type === 'device') deviceIds.push(currentId);
+    planState.cablesById.forEach((line) => {
+      const cable = line.getAttr('cableData');
+      let neighborId = null;
+      if (cable.from_item_id === currentId) neighborId = cable.to_item_id;
+      else if (cable.to_item_id === currentId) neighborId = cable.from_item_id;
+      if (neighborId != null && !visited.has(neighborId)) {
+        visited.add(neighborId);
+        queue.push(neighborId);
+      }
+    });
+  }
+  return deviceIds;
+}
+
+/** Массово пингует набор устройств (по id plan_item), обновляя бейджи по мере ответов.
+ *  Используется кнопками "обновить пинг всех на плане/в зоне/на роутере". */
+async function pingManyDevices(planItemIds, label) {
+  const targets = planItemIds
+    .map((id) => planState.itemsById.get(id))
+    .filter((node) => node && node.getAttr('itemData')?.item_type === 'device' && node.getAttr('itemData')?.device_ip);
+  if (targets.length === 0) { flashModeWarning('Нет устройств с IP для пинга'); return; }
+
+  const labelEl = document.getElementById('plan-mode-label');
+  const original = labelEl.textContent;
+  const originalColor = labelEl.style.color;
+  labelEl.textContent = `Пингуем ${targets.length}${label ? ' (' + label + ')' : ''}…`;
+  labelEl.style.color = '';
+
+  await Promise.all(targets.map(async (node) => {
+    const data = node.getAttr('itemData');
+    try {
+      const result = await window.api.ping.run(data.ref_id, data.device_ip);
+      updatePingBadge(data.id, result.status);
+    } catch { /* одно неудавшееся устройство не должно рвать остальные */ }
+  }));
+
+  labelEl.textContent = `Готово: ${targets.length} устройств`;
+  setTimeout(() => {
+    labelEl.textContent = original;
+    labelEl.style.color = originalColor;
+  }, 1600);
+}
+
 function updatePingBadgeByDeviceId(deviceId, status) {
   planState.itemsById.forEach((group, id) => {
     const data = group.getAttr('itemData');
@@ -1695,6 +1790,7 @@ function renderLineItem(item) {
   }
 
   group.on('click', async (e) => {
+    if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая — средняя занята панорамой
     e.cancelBubble = true;
     if (planState.mode === 'delete') { await removePlanItem(item.id); return; }
     // Клик по стене в режиме "Дверь" — врезаем дверь прямо в эту стену вместо выделения
@@ -1917,6 +2013,7 @@ function renderCable(cable) {
   line.visible(planState.layerVisibility[2]);
 
   line.on('click', async (e) => {
+    if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая — средняя занята панорамой
     e.cancelBubble = true;
     if (planState.mode === 'delete') { await removeCable(cable.id); return; }
     selectNode(line);
@@ -2088,6 +2185,7 @@ function renderZone(zone) {
     perfectDrawEnabled: false
   });
   shape.on('click', async (e) => {
+    if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая — средняя занята панорамой
     e.cancelBubble = true;
     if (planState.mode === 'delete') { await removeZone(zone.id); return; }
     selectNode(group);
@@ -2105,7 +2203,14 @@ function renderZone(zone) {
     });
     labelNode.offsetX(labelNode.width() / 2);
     labelNode.offsetY(labelNode.height() / 2);
-    labelNode.on('click', (e) => { e.cancelBubble = true; selectNode(group); });
+    labelNode.on('click', (e) => {
+      if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return;
+      e.cancelBubble = true;
+      selectNode(group);
+    });
+    labelNode.on('dragstart', () => {
+      if (planState.panFrom) labelNode.stopDrag();
+    });
     labelNode.on('dragend', async () => {
       const updated = await window.api.zones.updateLabel(zone.id, {
         name: zone.name, label_x: labelNode.x(), label_y: labelNode.y(),
@@ -2217,6 +2322,11 @@ function renderZoneInspector(el, node) {
 
   el.appendChild(sectionTitle('Объекты в зоне'));
   const itemsInZone = findItemsInZone(zone);
+  const pingZoneBtn = document.createElement('button');
+  pingZoneBtn.type = 'button';
+  pingZoneBtn.textContent = '🔄📶 Обновить пинг в зоне';
+  pingZoneBtn.onclick = () => pingManyDevices(itemsInZone.map((it) => it.id), `зона «${zone.name}»`);
+  el.appendChild(pingZoneBtn);
   if (itemsInZone.length === 0) {
     el.appendChild(smallNote('Пусто'));
   } else {
@@ -2615,8 +2725,9 @@ function updateZoomLabel(scale) {
 function setZoom(newScale) {
   newScale = clampScale(newScale);
   const stage = planState.stage;
+  const wrap = document.getElementById('plan-stage-wrap');
   const oldScale = stage.scaleX();
-  const center = { x: stage.width() / 2, y: stage.height() / 2 };
+  const center = { x: wrap.clientWidth / 2, y: wrap.clientHeight / 2 };
   const relatedTo = { x: (center.x - stage.x()) / oldScale, y: (center.y - stage.y()) / oldScale };
   stage.scale({ x: newScale, y: newScale });
   stage.position({ x: center.x - relatedTo.x * newScale, y: center.y - relatedTo.y * newScale });
@@ -2631,6 +2742,9 @@ function bindZoomButtons() {
   document.getElementById('zoom-reset').addEventListener('click', () => {
     planState.stage.position({ x: 0, y: 0 });
     setZoom(1);
+  });
+  document.getElementById('ping-plan-btn').addEventListener('click', () => {
+    pingManyDevices([...planState.itemsById.keys()], 'весь этаж');
   });
 }
 
@@ -2871,7 +2985,10 @@ function focusOnNode(node) {
   const stage = planState.stage;
   const targetScale = Math.max(stage.scaleX(), 1);
   setZoom(targetScale);
-  const center = { x: stage.width() / 2, y: stage.height() / 2 };
+  const wrap = document.getElementById('plan-stage-wrap');
+  wrap.scrollLeft = 0;
+  wrap.scrollTop = 0;
+  const center = { x: wrap.clientWidth / 2, y: wrap.clientHeight / 2 };
   const nodeCenter = node.getAttr('kind') === 'zone'
     ? computeZoneCentroidPx(JSON.parse(node.getAttr('zoneData').cells))
     : { x: node.x() + CELL_PX / 2, y: node.y() + CELL_PX / 2 };
@@ -2984,6 +3101,15 @@ function renderInspector(node) {
       if (itemZone) el.appendChild(field('Зона', itemZone.name));
       if (item.review_note) el.appendChild(field('⚠️ На проверку', item.review_note));
       if (item.device_ip) appendPingButton(el, item);
+      if (item.device_type === 'router' || item.device_type === 'switch') {
+        const pingConnectedBtn = document.createElement('button');
+        pingConnectedBtn.type = 'button';
+        pingConnectedBtn.className = 'tool-btn';
+        pingConnectedBtn.textContent = '🔄📶 Пинг подключённых устройств';
+        pingConnectedBtn.title = 'Обход по уже нарисованным кабелям от этого устройства';
+        pingConnectedBtn.onclick = () => pingManyDevices(getConnectedDeviceIds(item.id), item.device_hostname || 'сеть');
+        el.appendChild(pingConnectedBtn);
+      }
 
       const openCardBtn = document.createElement('button');
       openCardBtn.type = 'button';
