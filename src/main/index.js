@@ -78,6 +78,7 @@ function registerIpcHandlers() {
 
   // --- владение устройством (закрепление пользователя + история) ---
   ipcMain.handle('ownership:history', (_event, deviceId) => ownershipRepo.history(deviceId));
+  ipcMain.handle('ownership:historyForUser', (_event, userId) => ownershipRepo.historyForUser(userId));
   ipcMain.handle('ownership:assign', (_event, { deviceId, userId }) => ownershipRepo.assign(deviceId, userId));
   ipcMain.handle('ownership:unassign', (_event, deviceId) => ownershipRepo.unassign(deviceId));
 

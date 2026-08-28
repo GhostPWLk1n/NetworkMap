@@ -57,6 +57,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   ownership: {
     history: (deviceId) => ipcRenderer.invoke('ownership:history', deviceId),
+    historyForUser: (userId) => ipcRenderer.invoke('ownership:historyForUser', userId),
     assign: (deviceId, userId) => ipcRenderer.invoke('ownership:assign', { deviceId, userId }),
     unassign: (deviceId) => ipcRenderer.invoke('ownership:unassign', deviceId)
   },

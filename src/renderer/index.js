@@ -254,7 +254,13 @@ function buildUserCard(u) {
   header.append(title, subtitle);
   if (badge) header.appendChild(badge);
   header.appendChild(chevron);
-  header.addEventListener('click', () => row.classList.toggle('expanded'));
+  header.addEventListener('click', () => {
+    row.classList.toggle('expanded');
+    if (row.classList.contains('expanded') && !devicesLoaded) {
+      devicesLoaded = true;
+      refreshUserDevices();
+    }
+  });
   header.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showContextMenu(e.clientX, e.clientY, [
@@ -336,8 +342,70 @@ function buildUserCard(u) {
 
   form.appendChild(actions);
   body.appendChild(form);
+
+  const devicesExtras = document.createElement('div');
+  devicesExtras.className = 'device-card-extras';
+  devicesExtras.textContent = 'Загрузка…';
+  body.appendChild(devicesExtras);
+  let devicesLoaded = false;
+  let refreshUserDevices;
+  refreshUserDevices = () => renderUserDevices(devicesExtras, u.id);
+
   row.append(header, body);
   return row;
+}
+
+/** Устройства, которыми пользователь владеет сейчас и владел раньше — обратная сторона
+ *  "Истории владельцев" на карточке устройства. Лениво подгружается при разворачивании. */
+async function renderUserDevices(container, userId) {
+  const history = await window.api.ownership.historyForUser(userId);
+  container.innerHTML = '';
+
+  const current = history.filter((h) => !h.unassigned_at);
+  const past = history.filter((h) => h.unassigned_at);
+
+  const buildDeviceRow = (h) => {
+    const li = document.createElement('li');
+    const label = document.createElement('span');
+    const period = h.unassigned_at ? `${h.assigned_at || '?'} → ${h.unassigned_at}` : `с ${h.assigned_at || '?'}`;
+    label.textContent = `${h.device_hostname || '(без имени)'} (${h.device_type || '—'}) — ${period}`;
+    li.appendChild(label);
+    const openBtn = document.createElement('button');
+    openBtn.textContent = '📇';
+    openBtn.title = 'Открыть карточку устройства';
+    openBtn.onclick = () => openDeviceCard(h.device_id);
+    li.appendChild(openBtn);
+    const findBtn = document.createElement('button');
+    findBtn.textContent = '📍';
+    findBtn.title = 'Найти на плане';
+    findBtn.onclick = () => findDeviceOnPlan(h.device_id);
+    li.appendChild(findBtn);
+    return li;
+  };
+
+  container.appendChild(sectionTitle('Текущие устройства'));
+  if (current.length === 0) {
+    container.appendChild(smallNote('Нет устройств'));
+  } else {
+    const ul = document.createElement('ul');
+    ul.className = 'mini-list';
+    current.forEach((h) => ul.appendChild(buildDeviceRow(h)));
+    container.appendChild(ul);
+  }
+
+  container.appendChild(sectionTitle('Ранее'));
+  if (past.length === 0) {
+    container.appendChild(smallNote('Нет записей'));
+  } else {
+    const ul = document.createElement('ul');
+    ul.className = 'mini-list';
+    past.forEach((h) => {
+      const li = buildDeviceRow(h);
+      li.className = 'detached';
+      ul.appendChild(li);
+    });
+    container.appendChild(ul);
+  }
 }
 
 document.getElementById('user-form').addEventListener('submit', async (e) => {
@@ -670,7 +738,7 @@ async function findDeviceOnPlan(deviceId) {
   document.querySelector('.tab-btn[data-tab="plan"]').click();
   await switchFloorPlan(target.floor_plan_id);
   const node = planState.itemsById.get(target.id);
-  if (node) { selectNode(node); focusOnNode(node); }
+  if (node) { selectNode(node); focusOnNode(node); blinkNode(node); }
 }
 
 /** Переключает на лист "Устройства", сбрасывает фильтры (чтобы карточка точно попала в выдачу),
@@ -2981,6 +3049,21 @@ function runPlanSearch(query) {
   if (firstMatch) focusOnNode(firstMatch);
 }
 
+/** Центр объекта в пикселях канвы — общий для focusOnNode и blinkNode.
+ *  У зоны это центроид её клеток, у точечного объекта — центр клетки,
+ *  у линии/кабеля — центр их bounding box. */
+function getNodeCenterPx(node) {
+  const kind = node.getAttr('kind');
+  if (kind === 'zone') {
+    return computeZoneCentroidPx(JSON.parse(node.getAttr('zoneData').cells));
+  }
+  if (kind === 'point') {
+    return { x: node.x() + CELL_PX / 2, y: node.y() + CELL_PX / 2 };
+  }
+  const rect = node.getClientRect({ relativeTo: planState.layer });
+  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+}
+
 function focusOnNode(node) {
   const stage = planState.stage;
   const targetScale = Math.max(stage.scaleX(), 1);
@@ -2989,11 +3072,47 @@ function focusOnNode(node) {
   wrap.scrollLeft = 0;
   wrap.scrollTop = 0;
   const center = { x: wrap.clientWidth / 2, y: wrap.clientHeight / 2 };
-  const nodeCenter = node.getAttr('kind') === 'zone'
-    ? computeZoneCentroidPx(JSON.parse(node.getAttr('zoneData').cells))
-    : { x: node.x() + CELL_PX / 2, y: node.y() + CELL_PX / 2 };
+  const nodeCenter = getNodeCenterPx(node);
   stage.position({ x: center.x - nodeCenter.x * stage.scaleX(), y: center.y - nodeCenter.y * stage.scaleY() });
   stage.batchDraw();
+}
+
+/** Пульсирующее кольцо вокруг объекта, 2-3 раза — постоянная оранжевая рамка выделения
+ *  легко теряется на маленькой (36px) иконке, особенно после автоматического фокуса
+ *  издалека ("Найти на плане"). Само выделение (highlight) при этом не трогаем —
+ *  кольцо просто временно привлекает внимание поверх него. */
+function blinkNode(node, times = 3) {
+  if (!node || !planState.layer) return;
+  const { x, y } = getNodeCenterPx(node);
+  const ring = new Konva.Circle({
+    x, y, radius: CELL_PX * 0.55,
+    stroke: '#ff3b30', strokeWidth: 3, opacity: 0, listening: false
+  });
+  planState.layer.add(ring);
+  ring.moveToTop();
+
+  let count = 0;
+  const pulseOnce = () => {
+    if (!ring.getStage()) return; // этаж успели переключить/объект удалили — тихо прекращаем
+    ring.radius(CELL_PX * 0.55);
+    ring.opacity(0);
+    ring.to({
+      opacity: 0.9, duration: 0.2,
+      onFinish: () => {
+        if (!ring.getStage()) return;
+        ring.to({
+          opacity: 0, radius: CELL_PX * 1.1, duration: 0.35,
+          onFinish: () => {
+            count++;
+            if (!ring.getStage()) return;
+            if (count < times) pulseOnce();
+            else ring.destroy();
+          }
+        });
+      }
+    });
+  };
+  pulseOnce();
 }
 
 function clearPlanSearch() {

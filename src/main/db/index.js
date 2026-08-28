@@ -717,6 +717,17 @@ const ownershipRepo = {
       ORDER BY h.id DESC
     `).all(deviceId);
   },
+  /** Обратная сторона history() — какими устройствами пользователь владеет сейчас
+   *  и владел раньше. Используется карточкой пользователя. */
+  historyForUser(userId) {
+    return getDb().prepare(`
+      SELECT h.*, d.hostname AS device_hostname, d.device_type AS device_type, d.status AS device_status
+      FROM device_user_history h
+      JOIN devices d ON d.id = h.device_id
+      WHERE h.user_id = ?
+      ORDER BY h.id DESC
+    `).all(userId);
+  },
   /** Закрепляет пользователя за устройством: закрывает предыдущую активную запись (если была) и открывает новую */
   assign(deviceId, userId) {
     const db = getDb();
