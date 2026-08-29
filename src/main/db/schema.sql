@@ -40,6 +40,9 @@ CREATE TABLE devices (
     owner_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
     host_device_id    INTEGER REFERENCES devices(id) ON DELETE CASCADE,
                         -- заполнено только для device_type='vm': физический сервер-хост
+    uplink_device_id  INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+                        -- ручная связь для сетевой иерархии (вкладка "Сеть") — куда подключён
+                        -- этот роутер/свитч, если кабель провести нельзя (например, через этажи)
     status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN
                         ('active','repair','storage','decommissioned')),
     flag              TEXT CHECK (flag IN ('problem','attention','error')), -- ручная пометка, NULL = нет
@@ -164,7 +167,13 @@ CREATE TABLE plan_items (
     height_cells   INTEGER NOT NULL DEFAULT 1,
     label          TEXT,
     z_index        INTEGER NOT NULL DEFAULT 0,
-    review_note    TEXT    -- ручной комментарий "на проверку" — независим от пометок сущностей
+    review_note    TEXT,   -- ручной комментарий "на проверку" — независим от пометок сущностей
+    socket_id      INTEGER REFERENCES cable_sockets(id) ON DELETE SET NULL,
+                    -- устройство "подключено" к сокету на кабеле — все устройства на сокетах
+                    -- одного кабеля образуют один сетевой сегмент (вкладка "Сеть")
+    network_role   TEXT CHECK (network_role IN ('primary','backup','satellite'))
+                    -- роль устройства (обычно роутера) в сети сегмента, если на сегменте
+                    -- несколько роутеров — выбирается вручную
 );
 
 CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
@@ -178,17 +187,36 @@ CREATE INDEX idx_planitems_ref ON plan_items(ref_id);
 CREATE TABLE cables (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
-    from_item_id   INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
-    to_item_id     INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+    from_item_id   INTEGER REFERENCES plan_items(id) ON DELETE SET NULL,
+    to_item_id     INTEGER REFERENCES plan_items(id) ON DELETE SET NULL,
+                    -- необязательны: кабель можно провести и без устройств на концах —
+                    -- устройства подключаются через сокеты (см. cable_sockets), а не напрямую
     cable_type     TEXT NOT NULL DEFAULT 'network' CHECK (cable_type IN ('network','power','other')),
     label          TEXT,
-    waypoints      TEXT NOT NULL DEFAULT '[]',  -- JSON: [{"x":3,"y":5}, ...]
-    CHECK (from_item_id <> to_item_id)
+    waypoints      TEXT NOT NULL DEFAULT '[]',  -- JSON: [{"x":3,"y":5}, ...] — устаревшее, для обратной совместимости
+    path           TEXT NOT NULL DEFAULT '[]',  -- JSON: [{"x":..,"y":..}, ...] — полный путь линии, точки редактирования
+    color          TEXT NOT NULL DEFAULT '#4a90d9',  -- разные кабели рядом — разным цветом
+    CHECK (from_item_id IS NULL OR to_item_id IS NULL OR from_item_id <> to_item_id)
 );
 
 CREATE INDEX idx_cables_plan ON cables(floor_plan_id);
 CREATE INDEX idx_cables_from ON cables(from_item_id);
 CREATE INDEX idx_cables_to ON cables(to_item_id);
+
+-- ------------------------------------------------------------
+-- Сокеты на кабеле — точки, где устройство "подключается" к линии.
+-- Все устройства на сокетах одного кабеля образуют один сетевой сегмент.
+-- ------------------------------------------------------------
+CREATE TABLE cable_sockets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cable_id    INTEGER NOT NULL REFERENCES cables(id) ON DELETE CASCADE,
+    x           REAL NOT NULL,  -- координаты в клетках (могут быть дробными — сокет лежит на пути кабеля)
+    y           REAL NOT NULL,
+    label       TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_sockets_cable ON cable_sockets(cable_id);
 
 -- ------------------------------------------------------------
 -- История владельцев устройства (кто и когда был закреплён/откреплён)

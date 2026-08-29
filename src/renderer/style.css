@@ -38,7 +38,7 @@ body {
    .tab-scroll-body (Пользователи/Устройства/Склад/ПО), либо внутренние области плана */
 .tab-content { display: none; flex-direction: column; min-height: 0; padding: 20px; }
 .tab-content.active { display: flex; flex: 1; }
-#tab-users.active, #tab-devices.active, #tab-warehouse.active, #tab-software.active { padding: 0; }
+#tab-users.active, #tab-devices.active, #tab-warehouse.active, #tab-software.active, #tab-network.active { padding: 0; }
 
 /* Закреплённая шапка листа (поиск + добавление) — не скроллится вместе со списком карточек */
 .tab-sticky-header { flex: 0 0 auto; padding: 20px 20px 0; }
@@ -127,9 +127,11 @@ body {
 #zoom-controls .layer-toggle {
   width: 26px; height: 26px; padding: 0;
   border: 1px solid #ccc; border-radius: 4px; background: #fff;
-  cursor: pointer; opacity: 0.4; filter: grayscale(1);
+  cursor: pointer; font-size: 13px;
 }
-#zoom-controls .layer-toggle.active { opacity: 1; filter: none; background: #eef4ff; border-color: #9db8e8; }
+#zoom-controls .layer-toggle.state-hidden { opacity: 0.4; filter: grayscale(1); }
+#zoom-controls .layer-toggle.state-visible { opacity: 1; filter: none; background: #eef4ff; border-color: #9db8e8; }
+#zoom-controls .layer-toggle.state-locked { opacity: 1; filter: none; background: #fff3cd; border-color: #e0a940; font-size: 10px; }
 #mode-switch-btn.view-mode { background: #ffe9c2; border-color: #e0a940; }
 #plan-tools.view-mode-locked .tool-btn,
 #plan-tools.view-mode-locked select,
@@ -140,6 +142,8 @@ body {
   opacity: 0.4;
   pointer-events: none;
 }
+.tool-btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
+.layer-locked-pocket { opacity: 0.4; pointer-events: none; position: relative; }
 #zoom-label { font-size: 12px; color: #555; width: 42px; text-align: center; }
 #plan-stage { display: inline-block; }
 
@@ -258,6 +262,31 @@ body {
 
 .device-card-extras { border-top: 1px solid #eee; margin-top: 10px; padding-top: 2px; }
 .mini-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
+
+#network-root-bar { display: flex; align-items: center; gap: 8px; padding: 16px 20px 8px; font-size: 13px; }
+#network-root-bar select { padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; min-width: 240px; }
+#network-root-bar button { padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+#network-root-bar button:disabled { opacity: 0.6; cursor: default; }
+.net-ping-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.network-node-row.net-cascade-affected { opacity: 0.55; background: #fafafa; }
+.net-cascade-note { color: #b26a00 !important; font-weight: 500; }
+#network-tree { padding: 8px 20px 20px; font-size: 13px; }
+.network-node { margin: 2px 0; }
+.network-node-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 5px 8px; border: 1px solid #e0e0e0; border-radius: 6px; background: #fafafa;
+}
+.network-node-row .net-type-icon { font-size: 14px; }
+.network-node-row .net-hostname { font-weight: 500; }
+.network-node-row .net-via { font-size: 11px; color: #888; }
+.network-node-row .net-role { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 500; }
+.network-node-row .net-role-primary { background: #d1f2dd; color: #1a7a41; }
+.network-node-row .net-role-backup { background: #fde3cf; color: #9c4a15; }
+.network-node-row .net-role-satellite { background: #e0e7ff; color: #3949ab; }
+.network-node-row .net-actions { margin-left: auto; display: flex; gap: 2px; }
+.network-node-row button { padding: 1px 5px; font-size: 11px; }
+.network-children { margin: 4px 0 4px 26px; padding-left: 12px; border-left: 2px dashed #ddd; }
+.network-empty { color: #999; padding: 20px; text-align: center; }
 .mini-list li { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid #f0f0f0; }
 .mini-list li.detached { color: #aaa; text-decoration: line-through; }
 .mini-list li button { flex-shrink: 0; padding: 2px 6px; font-size: 11px; }

@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('api', {
     update: (id, payload) => ipcRenderer.invoke('devices:update', { id, payload }),
     setStatus: (id, status, note) => ipcRenderer.invoke('devices:setStatus', { id, status, note }),
     setFlag: (id, flag) => ipcRenderer.invoke('devices:setFlag', { id, flag }),
+    setUplink: (id, uplinkDeviceId) => ipcRenderer.invoke('devices:setUplink', { id, uplinkDeviceId }),
     statusHistory: (id) => ipcRenderer.invoke('devices:statusHistory', id),
     remove: (id) => ipcRenderer.invoke('devices:remove', id),
     search: (query) => ipcRenderer.invoke('devices:search', query)
@@ -48,12 +49,20 @@ contextBridge.exposeInMainWorld('api', {
     remove: (id) => ipcRenderer.invoke('planItems:remove', id),
     findByDeviceRef: (deviceId) => ipcRenderer.invoke('planItems:findByDeviceRef', deviceId),
     listPlacedDeviceIds: () => ipcRenderer.invoke('planItems:listPlacedDeviceIds'),
-    setReviewNote: (id, note) => ipcRenderer.invoke('planItems:setReviewNote', { id, note })
+    setReviewNote: (id, note) => ipcRenderer.invoke('planItems:setReviewNote', { id, note }),
+    setSocket: (id, socketId) => ipcRenderer.invoke('planItems:setSocket', { id, socketId }),
+    setNetworkRole: (id, role) => ipcRenderer.invoke('planItems:setNetworkRole', { id, role })
   },
   cables: {
     list: (floorPlanId) => ipcRenderer.invoke('cables:list', floorPlanId),
     create: (payload) => ipcRenderer.invoke('cables:create', payload),
+    updatePath: (id, path) => ipcRenderer.invoke('cables:updatePath', { id, path }),
     remove: (id) => ipcRenderer.invoke('cables:remove', id)
+  },
+  sockets: {
+    listByPlan: (floorPlanId) => ipcRenderer.invoke('sockets:listByPlan', floorPlanId),
+    create: (payload) => ipcRenderer.invoke('sockets:create', payload),
+    remove: (id) => ipcRenderer.invoke('sockets:remove', id)
   },
   ownership: {
     history: (deviceId) => ipcRenderer.invoke('ownership:history', deviceId),
@@ -98,6 +107,10 @@ contextBridge.exposeInMainWorld('api', {
     create: (payload) => ipcRenderer.invoke('zones:create', payload),
     updateLabel: (id, payload) => ipcRenderer.invoke('zones:updateLabel', { id, payload }),
     remove: (id) => ipcRenderer.invoke('zones:remove', id)
+  },
+  network: {
+    listRoots: () => ipcRenderer.invoke('network:listRoots'),
+    buildTree: (rootDeviceId) => ipcRenderer.invoke('network:buildTree', rootDeviceId)
   },
   importExcel: {
     devices: () => ipcRenderer.invoke('import:excelDevices')

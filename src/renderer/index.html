@@ -15,6 +15,7 @@
       <button class="tab-btn" data-tab="devices">Устройства</button>
       <button class="tab-btn" data-tab="warehouse">Склад</button>
       <button class="tab-btn" data-tab="software">ПО</button>
+      <button class="tab-btn" data-tab="network">Сеть</button>
     </nav>
     <button id="db-settings-btn" type="button" title="Подключение к базе данных">🗄 БД</button>
   </header>
@@ -52,6 +53,7 @@
 
         <h3>Связи</h3>
         <button id="mode-cable" type="button" class="tool-btn">🔌 Кабель</button>
+        <button id="mode-socket" type="button" class="tool-btn" title="Клик рядом с кабелем ставит точку подключения">🔘 Сокет</button>
 
         <h3>Инструмент</h3>
         <button id="mode-delete" type="button" class="tool-btn tool-danger">🗑 Удалить</button>
@@ -69,10 +71,10 @@
           <button id="ping-plan-btn" type="button" title="Обновить пинг всех устройств на этом этаже">🔄📶</button>
 
           <div id="layer-toggles">
-            <button id="layer-toggle-zone" type="button" class="layer-toggle active" data-layer="0" title="Слой 0: зоны (базовый, под стенами)">🟩</button>
-            <button id="layer-toggle-0" type="button" class="layer-toggle active" data-layer="1" title="Слой 1: стены и мебель">🧱</button>
-            <button id="layer-toggle-1" type="button" class="layer-toggle active" data-layer="2" title="Слой 2: кабель-менеджмент">🔌</button>
-            <button id="layer-toggle-2" type="button" class="layer-toggle active" data-layer="3" title="Слой 3: оборудование">🖥</button>
+            <button id="layer-toggle-zone" type="button" class="layer-toggle" data-layer="0" data-icon="🟩" title="Слой 0: зоны (базовый, под стенами)">🟩</button>
+            <button id="layer-toggle-0" type="button" class="layer-toggle" data-layer="1" data-icon="🧱" title="Слой 1: стены и мебель">🧱</button>
+            <button id="layer-toggle-1" type="button" class="layer-toggle" data-layer="2" data-icon="🔌" title="Слой 2: кабель-менеджмент">🔌</button>
+            <button id="layer-toggle-2" type="button" class="layer-toggle" data-layer="3" data-icon="🖥" title="Слой 3: оборудование">🖥</button>
           </div>
 
           <div id="plan-search">
@@ -298,6 +300,29 @@
 
     <div class="tab-scroll-body">
       <div id="software-cards"></div>
+    </div>
+  </div>
+
+  <!-- ЛИСТ 6: Сеть -->
+  <div id="tab-network" class="tab-content">
+    <div class="tab-sticky-header">
+      <div id="network-root-bar">
+        <label for="network-root-select">Корень дерева (роутер/свитч):</label>
+        <select id="network-root-select"></select>
+        <button id="network-refresh-btn" type="button" title="Перечитать дерево заново">🔄 Обновить</button>
+        <button id="network-ping-tree-btn" type="button" title="Пропинговать все устройства в текущем дереве">🔄📶 Пинговать дерево</button>
+      </div>
+      <p class="search-advanced-note">
+        Иерархия строится из двух источников: уже нарисованные на планах кабели (в пределах
+        одного этажа) и ручной аплинк — куда подключён роутер/свитч, если кабель провести
+        нельзя (например, через этажи). Задаётся в инспекторе устройства на плане.
+        Устройство ниже недоступного узла помечается отдельно — обычно проблема не в нём
+        самом, а выше по дереву.
+      </p>
+    </div>
+
+    <div class="tab-scroll-body">
+      <div id="network-tree">Выберите корень дерева выше</div>
     </div>
   </div>
 

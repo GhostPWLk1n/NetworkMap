@@ -1,8 +1,8 @@
 const path = require('path');
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const {
-  initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo,
-  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo,
+  initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, socketsRepo,
+  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath
 } = require('./db');
 const { pingHost } = require('./ping');
@@ -42,6 +42,7 @@ function registerIpcHandlers() {
   ipcMain.handle('devices:update', (_event, { id, payload }) => devicesRepo.update(id, payload));
   ipcMain.handle('devices:setStatus', (_event, { id, status, note }) => devicesRepo.setStatus(id, status, note));
   ipcMain.handle('devices:setFlag', (_event, { id, flag }) => devicesRepo.setFlag(id, flag));
+  ipcMain.handle('devices:setUplink', (_event, { id, uplinkDeviceId }) => devicesRepo.setUplink(id, uplinkDeviceId));
   ipcMain.handle('devices:statusHistory', (_event, id) => devicesRepo.statusHistory(id));
   ipcMain.handle('devices:remove', (_event, id) => devicesRepo.remove(id));
   ipcMain.handle('devices:search', (_event, query) => devicesRepo.search(query));
@@ -70,11 +71,19 @@ function registerIpcHandlers() {
   ipcMain.handle('planItems:findByDeviceRef', (_event, deviceId) => planItemsRepo.findByDeviceRef(deviceId));
   ipcMain.handle('planItems:listPlacedDeviceIds', () => planItemsRepo.listPlacedDeviceIds());
   ipcMain.handle('planItems:setReviewNote', (_event, { id, note }) => planItemsRepo.setReviewNote(id, note));
+  ipcMain.handle('planItems:setSocket', (_event, { id, socketId }) => planItemsRepo.setSocket(id, socketId));
+  ipcMain.handle('planItems:setNetworkRole', (_event, { id, role }) => planItemsRepo.setNetworkRole(id, role));
 
   // --- cables ---
   ipcMain.handle('cables:list', (_event, floorPlanId) => cablesRepo.listByPlan(floorPlanId));
   ipcMain.handle('cables:create', (_event, payload) => cablesRepo.create(payload));
+  ipcMain.handle('cables:updatePath', (_event, { id, path }) => cablesRepo.updatePath(id, path));
   ipcMain.handle('cables:remove', (_event, id) => cablesRepo.remove(id));
+
+  // --- сокеты на кабеле ---
+  ipcMain.handle('sockets:listByPlan', (_event, floorPlanId) => socketsRepo.listByPlan(floorPlanId));
+  ipcMain.handle('sockets:create', (_event, payload) => socketsRepo.create(payload));
+  ipcMain.handle('sockets:remove', (_event, id) => socketsRepo.remove(id));
 
   // --- владение устройством (закрепление пользователя + история) ---
   ipcMain.handle('ownership:history', (_event, deviceId) => ownershipRepo.history(deviceId));
@@ -119,6 +128,9 @@ function registerIpcHandlers() {
   ipcMain.handle('zones:create', (_event, payload) => zonesRepo.create(payload));
   ipcMain.handle('zones:updateLabel', (_event, { id, payload }) => zonesRepo.updateLabel(id, payload));
   ipcMain.handle('zones:remove', (_event, id) => zonesRepo.remove(id));
+
+  ipcMain.handle('network:listRoots', () => networkRepo.listRoots());
+  ipcMain.handle('network:buildTree', (_event, rootDeviceId) => networkRepo.buildTree(rootDeviceId));
 
   // --- импорт из Excel ---
   ipcMain.handle('import:excelDevices', async () => {
