@@ -336,6 +336,25 @@ CREATE TABLE plan_zones (
 );
 CREATE INDEX idx_zones_plan ON plan_zones(floor_plan_id);
 
+-- ------------------------------------------------------------
+-- Журнал изменений — лог всех значимых действий пользователя в приложении.
+-- Без внешних ключей на сущности намеренно: запись должна остаться в истории,
+-- даже если сама сущность потом будет удалена (иначе "удалил устройство" сотрёт
+-- сам факт своего удаления при каскаде). Лимит 10 000 записей — старые обрезаются
+-- в auditLogRepo.log() при вставке новой.
+-- ------------------------------------------------------------
+CREATE TABLE audit_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    entity_type  TEXT NOT NULL,   -- 'user' | 'device' | 'plan_item' | 'cable' | 'zone' | 'warehouse_item' |
+                                   -- 'software' | 'component' | 'peripheral' | 'floor_plan' | 'ownership'
+    entity_id    INTEGER,         -- id сущности на момент действия (может уже не существовать)
+    action       TEXT NOT NULL,   -- 'create' | 'update' | 'delete' | 'status_change' | другое короткое слово
+    summary      TEXT NOT NULL    -- человекочитаемое описание, готовое для показа в списке
+);
+CREATE INDEX idx_audit_log_created ON audit_log(created_at);
+CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
+
 -- ============================================================
 -- Полнотекстовый поиск (FTS5) по устройствам и пользователям
 -- ============================================================

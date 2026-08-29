@@ -2,11 +2,12 @@ const path = require('path');
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const {
   initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
-  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo,
+  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath
 } = require('./db');
 const { pingHost } = require('./ping');
 const { importExcel } = require('./import');
+const { parsePcInfoFile, parsePcInfoFolder, applyPcInfoImport } = require('./pcInfoImport');
 
 let mainWindow;
 
@@ -134,6 +135,8 @@ function registerIpcHandlers() {
   ipcMain.handle('network:listRoots', () => networkRepo.listRoots());
   ipcMain.handle('network:buildTree', (_event, rootDeviceId) => networkRepo.buildTree(rootDeviceId));
 
+  ipcMain.handle('auditLog:list', (_event, filters) => auditLogRepo.list(filters));
+
   // --- импорт из Excel ---
   ipcMain.handle('import:excelDevices', async () => {
     const picked = await dialog.showOpenDialog(mainWindow, {
@@ -144,6 +147,26 @@ function registerIpcHandlers() {
     if (picked.canceled || picked.filePaths.length === 0) return null;
     return importExcel(picked.filePaths[0]);
   });
+
+  // --- импорт сведений о ПК из JSON-файлов, собранных scripts/collect-pc-info.ps1 ---
+  ipcMain.handle('import:pcInfoPickFile', async (_event, forceDeviceId) => {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Выберите файл со сведениями о ПК (.json)',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+      properties: ['openFile']
+    });
+    if (picked.canceled || picked.filePaths.length === 0) return null;
+    return parsePcInfoFile(picked.filePaths[0], forceDeviceId || null);
+  });
+  ipcMain.handle('import:pcInfoPickFolder', async () => {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Выберите папку с файлами сведений о ПК (.json)',
+      properties: ['openDirectory']
+    });
+    if (picked.canceled || picked.filePaths.length === 0) return null;
+    return parsePcInfoFolder(picked.filePaths[0]);
+  });
+  ipcMain.handle('import:pcInfoApply', (_event, { parsed, fieldChoices }) => applyPcInfoImport(parsed, fieldChoices));
 
   // --- подключение к базе данных (локальный файл или сетевой путь, напр. шара из Docker) ---
   ipcMain.handle('settings:getDbInfo', () => ({

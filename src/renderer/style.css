@@ -38,7 +38,7 @@ body {
    .tab-scroll-body (Пользователи/Устройства/Склад/ПО), либо внутренние области плана */
 .tab-content { display: none; flex-direction: column; min-height: 0; padding: 20px; }
 .tab-content.active { display: flex; flex: 1; }
-#tab-users.active, #tab-devices.active, #tab-warehouse.active, #tab-software.active, #tab-network.active { padding: 0; }
+#tab-users.active, #tab-devices.active, #tab-warehouse.active, #tab-software.active, #tab-network.active, #tab-audit.active { padding: 0; }
 
 /* Закреплённая шапка листа (поиск + добавление) — не скроллится вместе со списком карточек */
 .tab-sticky-header { flex: 0 0 auto; padding: 20px 20px 0; }
@@ -264,6 +264,21 @@ body {
 .mini-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
 
 #network-root-bar { display: flex; align-items: center; gap: 8px; padding: 16px 20px 8px; font-size: 13px; }
+
+#audit-filter-bar { display: flex; align-items: center; gap: 10px; padding: 16px 20px 8px; font-size: 13px; flex-wrap: wrap; }
+#audit-filter-bar label { display: flex; align-items: center; gap: 4px; }
+#audit-filter-bar input, #audit-filter-bar select { padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; }
+#audit-filter-bar button { padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+#audit-log-list { padding: 8px 20px 20px; font-size: 13px; }
+.audit-row {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 10px; border-bottom: 1px solid #f0f0f0;
+}
+.audit-row:hover { background: #fafafa; }
+.audit-icon { font-size: 13px; flex-shrink: 0; width: 18px; text-align: center; }
+.audit-time { color: #888; font-size: 12px; white-space: nowrap; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.audit-type { color: #666; font-size: 11px; background: #eef1f4; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; }
+.audit-summary { flex: 1; }
 #network-root-bar select { padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; min-width: 240px; }
 #network-root-bar button { padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
 #network-root-bar button:disabled { opacity: 0.6; cursor: default; }
@@ -472,6 +487,18 @@ body {
   box-shadow: 0 8px 30px rgba(0,0,0,0.25);
 }
 .modal-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; color: #333; }
+
+.pc-import-box { max-width: 480px; max-height: 80vh; overflow-y: auto; }
+.pc-import-progress { font-size: 12px; color: #888; margin-bottom: 8px; }
+.pc-import-warning { background: #fff3cd; border: 1px solid #e0a940; border-radius: 4px; padding: 6px 10px; font-size: 12px; margin-bottom: 10px; }
+.pc-import-field { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #eee; }
+.pc-import-field:last-child { border-bottom: none; }
+.pc-import-field-label { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.pc-import-field-options { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.pc-import-field-options label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.pc-import-field.no-conflict { opacity: 0.65; font-size: 12px; }
+#pc-import-modal-actions { flex-wrap: wrap; }
+
 .modal-box input {
   width: 100%;
   padding: 8px 10px;

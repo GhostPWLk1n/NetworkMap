@@ -114,7 +114,15 @@ contextBridge.exposeInMainWorld('api', {
     listRoots: () => ipcRenderer.invoke('network:listRoots'),
     buildTree: (rootDeviceId) => ipcRenderer.invoke('network:buildTree', rootDeviceId)
   },
+  auditLog: {
+    list: (filters) => ipcRenderer.invoke('auditLog:list', filters)
+  },
   importExcel: {
     devices: () => ipcRenderer.invoke('import:excelDevices')
+  },
+  importPcInfo: {
+    pickFile: (forceDeviceId) => ipcRenderer.invoke('import:pcInfoPickFile', forceDeviceId),
+    pickFolder: () => ipcRenderer.invoke('import:pcInfoPickFolder'),
+    apply: (parsed, fieldChoices) => ipcRenderer.invoke('import:pcInfoApply', { parsed, fieldChoices })
   }
 });

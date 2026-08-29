@@ -7,8 +7,21 @@ let db;
 let currentDbPath = null;
 let lastConnectWarning = null; // строка предупреждения, если пришлось откатиться на локальную БД
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
+const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
+const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
+const PLAN_ITEM_TYPE_LABELS_RU = { device: 'Устройство', desk: 'Стол', wall: 'Стена', door: 'Дверь', stairs: 'Лестница' };
+
+/** Человекочитаемое название объекта плана для журнала изменений — для устройства
+ *  подставляет его hostname, для остальных типов — просто название типа. */
+function planItemLabelForLog(db, item) {
+  if (item.item_type === 'device' && item.ref_id) {
+    const device = db.prepare('SELECT hostname, device_type FROM devices WHERE id = ?').get(item.ref_id);
+    return `Устройство «${device ? (device.hostname || device.device_type) : '?'}»`;
+  }
+  return PLAN_ITEM_TYPE_LABELS_RU[item.item_type] || item.item_type;
+}
 
 function getDefaultDbPath() {
   return path.join(app.getPath('userData'), 'data.db');
@@ -99,6 +112,7 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 11) migrateToV11();
   if (db.pragma('user_version', { simple: true }) < 12) migrateToV12();
   if (db.pragma('user_version', { simple: true }) < 13) migrateToV13();
+  if (db.pragma('user_version', { simple: true }) < 14) migrateToV14();
 }
 
 /**
@@ -509,6 +523,27 @@ function migrateToV13() {
   tx();
 }
 
+/** v13 -> v14: журнал изменений — лог всех значимых действий пользователя. */
+function migrateToV14() {
+  console.log('[db] миграция схемы v13 -> v14 (журнал изменений)');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE audit_log (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+          entity_type  TEXT NOT NULL,
+          entity_id    INTEGER,
+          action       TEXT NOT NULL,
+          summary      TEXT NOT NULL
+      );
+      CREATE INDEX idx_audit_log_created ON audit_log(created_at);
+      CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
+    `);
+    db.pragma('user_version = 14');
+  });
+  tx();
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -528,10 +563,14 @@ const usersRepo = {
       VALUES (@full_name, @department, @position, @email, @phone, @notes)
     `);
     const info = stmt.run({ full_name, department, position, email, phone, notes });
-    return getDb().prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    const user = getDb().prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('user', user.id, 'create', `Пользователь «${user.full_name}» создан`);
+    return user;
   },
   remove(id) {
+    const user = getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
     getDb().prepare('DELETE FROM users WHERE id = ?').run(id);
+    if (user) auditLogRepo.log('user', id, 'delete', `Пользователь «${user.full_name}» удалён безвозвратно`);
     return { id };
   },
   update(id, { full_name, department = null, position = null, email = null, phone = null, notes = null }) {
@@ -539,19 +578,27 @@ const usersRepo = {
       UPDATE users SET full_name = ?, department = ?, position = ?, email = ?, phone = ?, notes = ?, updated_at = datetime('now')
       WHERE id = ?
     `).run(full_name, department, position, email, phone, notes, id);
-    return getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const user = getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    auditLogRepo.log('user', id, 'update', `Пользователь «${user.full_name}» отредактирован`);
+    return user;
   },
   /** Быстрое увольнение/восстановление — отдельно от общей формы редактирования, как и у устройств */
   setStatus(id, status) {
     if (status !== 'active' && status !== 'dismissed') throw new Error('Недопустимый статус');
     getDb().prepare(`UPDATE users SET status = ?, updated_at = datetime('now') WHERE id = ?`).run(status, id);
-    return getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const user = getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    auditLogRepo.log('user', id, 'status_change',
+      status === 'dismissed' ? `Пользователь «${user.full_name}» уволен` : `Пользователь «${user.full_name}» восстановлен в правах`);
+    return user;
   },
   /** Ручная пометка Проблема/Внимание/Ошибка — null снимает пометку */
   setFlag(id, flag) {
     if (flag !== null && !FLAG_VALUES.includes(flag)) throw new Error('Недопустимая пометка');
     getDb().prepare(`UPDATE users SET flag = ? WHERE id = ?`).run(flag, id);
-    return getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const user = getDb().prepare('SELECT * FROM users WHERE id = ?').get(id);
+    auditLogRepo.log('user', id, 'update',
+      flag ? `Пользователю «${user.full_name}» поставлена пометка «${FLAG_LABELS_RU[flag] || flag}»` : `С пользователя «${user.full_name}» снята пометка`);
+    return user;
   }
 };
 
@@ -601,10 +648,14 @@ const devicesRepo = {
       device_type, hostname, inventory_number, os, cpu, ram, disk,
       owner_user_id, host_device_id, status, notes, ip_address, mac_address
     });
-    return db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId);
+    const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId);
+    auditLogRepo.log('device', deviceId, 'create', `Устройство «${device.hostname || device.device_type}» создано`);
+    return device;
   },
   remove(id) {
+    const device = getDb().prepare('SELECT * FROM devices WHERE id = ?').get(id);
     getDb().prepare('DELETE FROM devices WHERE id = ?').run(id);
+    if (device) auditLogRepo.log('device', id, 'delete', `Устройство «${device.hostname || device.device_type}» удалено безвозвратно`);
     return { id };
   },
   update(id, { device_type, hostname = null, inventory_number = null, os = null, cpu = null,
@@ -638,7 +689,9 @@ const devicesRepo = {
       }
     });
     tx();
-    return db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    auditLogRepo.log('device', id, 'update', `Устройство «${device.hostname || device.device_type}» отредактировано`);
+    return device;
   },
   /** Быстрая смена статуса (кнопка "Сервис" и т.п.) — не трогает остальные поля устройства */
   setStatus(id, status, note = null) {
@@ -648,7 +701,9 @@ const devicesRepo = {
       db.prepare('INSERT INTO device_status_history (device_id, status, note) VALUES (?, ?, ?)').run(id, status, note);
     });
     tx();
-    return db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    auditLogRepo.log('device', id, 'status_change', `Устройство «${device.hostname || device.device_type}»: статус → ${DEVICE_STATUS_LABELS_RU[status] || status}${note ? ` (${note})` : ''}`);
+    return device;
   },
   statusHistory(id) {
     return getDb().prepare('SELECT * FROM device_status_history WHERE device_id = ? ORDER BY id DESC').all(id);
@@ -657,14 +712,21 @@ const devicesRepo = {
   setFlag(id, flag) {
     if (flag !== null && !FLAG_VALUES.includes(flag)) throw new Error('Недопустимая пометка');
     getDb().prepare(`UPDATE devices SET flag = ? WHERE id = ?`).run(flag, id);
-    return getDb().prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    const device = getDb().prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    auditLogRepo.log('device', id, 'update',
+      flag ? `Устройству «${device.hostname || device.device_type}» поставлена пометка «${FLAG_LABELS_RU[flag] || flag}»` : `С устройства «${device.hostname || device.device_type}» снята пометка`);
+    return device;
   },
   /** Ручная связь для вкладки "Сеть" — куда подключён этот роутер/свитч, если кабель
    *  провести нельзя (например, через этажи). null снимает связь. */
   setUplink(id, uplinkDeviceId) {
     if (uplinkDeviceId === id) throw new Error('Устройство не может быть подключено само на себя');
     getDb().prepare(`UPDATE devices SET uplink_device_id = ? WHERE id = ?`).run(uplinkDeviceId, id);
-    return getDb().prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    const device = getDb().prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    const uplinkTarget = uplinkDeviceId ? getDb().prepare('SELECT hostname FROM devices WHERE id = ?').get(uplinkDeviceId) : null;
+    auditLogRepo.log('device', id, 'update',
+      uplinkTarget ? `Устройство «${device.hostname}»: аплинк → «${uplinkTarget.hostname}»` : `Устройство «${device.hostname}»: аплинк снят`);
+    return device;
   },
   search(query) {
     const db = getDb();
@@ -735,7 +797,9 @@ const floorPlansRepo = {
       VALUES (?, ?, ?, ?, ?)
     `).run(floor.id, name, grid_step, grid_width_cells, grid_height_cells);
 
-    return db.prepare('SELECT * FROM floor_plans WHERE id = ?').get(info.lastInsertRowid);
+    const plan = db.prepare('SELECT * FROM floor_plans WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('floor_plan', plan.id, 'create', `План «${plan.name}» создан`);
+    return plan;
   },
   ensureDefault() {
     const db = getDb();
@@ -748,11 +812,15 @@ const floorPlansRepo = {
     const db = getDb();
     const count = db.prepare('SELECT COUNT(*) c FROM floor_plans').get().c;
     if (count <= 1) throw new Error('Нельзя удалить последний план — должен остаться хотя бы один');
+    const plan = db.prepare('SELECT * FROM floor_plans WHERE id = ?').get(id);
     db.prepare('DELETE FROM floor_plans WHERE id = ?').run(id);
+    if (plan) auditLogRepo.log('floor_plan', id, 'delete', `План «${plan.name}» удалён вместе со всеми объектами на нём`);
     return { id };
   },
   rename(id, name) {
+    const before = getDb().prepare('SELECT name FROM floor_plans WHERE id = ?').get(id);
     getDb().prepare('UPDATE floor_plans SET name = ? WHERE id = ?').run(name, id);
+    if (before && before.name !== name) auditLogRepo.log('floor_plan', id, 'update', `План «${before.name}» переименован в «${name}»`);
     return getDb().prepare('SELECT * FROM floor_plans WHERE id = ?').get(id);
   }
 };
@@ -809,13 +877,16 @@ const planItemsRepo = {
   },
   create({ floor_plan_id, item_type, ref_id = null, x, y, x2 = null, y2 = null, rotation = 0,
            width_cells = 1, height_cells = 1, label = null, z_index = 0 }) {
-    const info = getDb().prepare(`
+    const db = getDb();
+    const info = db.prepare(`
       INSERT INTO plan_items (floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
                                width_cells, height_cells, label, z_index)
       VALUES (@floor_plan_id, @item_type, @ref_id, @x, @y, @x2, @y2, @rotation,
               @width_cells, @height_cells, @label, @z_index)
     `).run({ floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation, width_cells, height_cells, label, z_index });
-    return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(info.lastInsertRowid);
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('plan_item', item.id, 'create', `${planItemLabelForLog(db, item)} размещён(а) на плане`);
+    return item;
   },
   move(id, x, y) {
     getDb().prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, id);
@@ -827,7 +898,10 @@ const planItemsRepo = {
     return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
   },
   remove(id) {
-    getDb().prepare('DELETE FROM plan_items WHERE id = ?').run(id);
+    const db = getDb();
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    db.prepare('DELETE FROM plan_items WHERE id = ?').run(id);
+    if (item) auditLogRepo.log('plan_item', id, 'delete', `${planItemLabelForLog(db, item)} убран(а) с плана`);
     return { id };
   }
 };
@@ -860,7 +934,9 @@ const cablesRepo = {
       INSERT INTO cables (floor_plan_id, from_item_id, to_item_id, cable_type, label, waypoints, path, color)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(floor_plan_id, from_item_id, to_item_id, cable_type, label, JSON.stringify(waypoints), JSON.stringify(path), color);
-    return db.prepare('SELECT * FROM cables WHERE id = ?').get(info.lastInsertRowid);
+    const cable = db.prepare('SELECT * FROM cables WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('cable', cable.id, 'create', `Кабель №${cable.id} проложен на плане`);
+    return cable;
   },
   /** Точки редактирования линии — перетащить существующую, добавить новую, удалить. */
   updatePath(id, path) {
@@ -872,10 +948,13 @@ const cablesRepo = {
   setLabel(id, label) {
     const clean = label && label.trim() ? label.trim() : null;
     getDb().prepare('UPDATE cables SET label = ? WHERE id = ?').run(clean, id);
+    auditLogRepo.log('cable', id, 'update', clean ? `Кабелю №${id} присвоено имя «${clean}»` : `С кабеля №${id} снято имя`);
     return getDb().prepare('SELECT * FROM cables WHERE id = ?').get(id);
   },
   remove(id) {
+    const cable = getDb().prepare('SELECT * FROM cables WHERE id = ?').get(id);
     getDb().prepare('DELETE FROM cables WHERE id = ?').run(id);
+    if (cable) auditLogRepo.log('cable', id, 'delete', `Кабель №${id}${cable.label ? ` (${cable.label})` : ''} удалён`);
     return { id };
   }
 };
@@ -904,17 +983,31 @@ const cableConnectionsRepo = {
   connect(planItemId, cableId) {
     const db = getDb();
     const item = db.prepare(`
-      SELECT pi.id, d.device_type FROM plan_items pi JOIN devices d ON d.id = pi.ref_id WHERE pi.id = ?
+      SELECT pi.id, d.device_type, d.hostname FROM plan_items pi JOIN devices d ON d.id = pi.ref_id WHERE pi.id = ?
     `).get(planItemId);
     const isMultiPort = item && (item.device_type === 'router' || item.device_type === 'switch');
     if (!isMultiPort) {
       db.prepare('DELETE FROM cable_connections WHERE plan_item_id = ?').run(planItemId);
     }
     db.prepare('INSERT OR IGNORE INTO cable_connections (plan_item_id, cable_id) VALUES (?, ?)').run(planItemId, cableId);
+    if (item) {
+      const cable = db.prepare('SELECT * FROM cables WHERE id = ?').get(cableId);
+      const cableLabel = cable ? `кабелю №${cable.id}${cable.label ? ` (${cable.label})` : ''}` : `кабелю №${cableId}`;
+      auditLogRepo.log('cable_connection', planItemId, 'create', `«${item.hostname || item.device_type}» подключён к ${cableLabel}`);
+    }
     return cableConnectionsRepo.listByPlanItem(planItemId);
   },
   disconnect(planItemId, cableId) {
-    getDb().prepare('DELETE FROM cable_connections WHERE plan_item_id = ? AND cable_id = ?').run(planItemId, cableId);
+    const db = getDb();
+    const item = db.prepare(`
+      SELECT pi.ref_id, d.device_type, d.hostname FROM plan_items pi LEFT JOIN devices d ON d.id = pi.ref_id WHERE pi.id = ?
+    `).get(planItemId);
+    db.prepare('DELETE FROM cable_connections WHERE plan_item_id = ? AND cable_id = ?').run(planItemId, cableId);
+    if (item) {
+      const cable = db.prepare('SELECT * FROM cables WHERE id = ?').get(cableId);
+      const cableLabel = cable ? `кабеля №${cable.id}${cable.label ? ` (${cable.label})` : ''}` : `кабеля №${cableId}`;
+      auditLogRepo.log('cable_connection', planItemId, 'delete', `«${item.hostname || item.device_type}» отключён от ${cableLabel}`);
+    }
     return { planItemId, cableId };
   },
   disconnectAll(planItemId) {
@@ -962,11 +1055,17 @@ const ownershipRepo = {
       db.prepare('UPDATE devices SET owner_user_id = ? WHERE id = ?').run(userId, deviceId);
     });
     tx();
+    const device = db.prepare('SELECT hostname, device_type FROM devices WHERE id = ?').get(deviceId);
+    const user = db.prepare('SELECT full_name FROM users WHERE id = ?').get(userId);
+    auditLogRepo.log('ownership', deviceId, 'update',
+      `«${device ? (device.hostname || device.device_type) : deviceId}» закреплено за «${user ? user.full_name : userId}»`);
     return { deviceId, userId };
   },
   /** Открепляет текущего владельца (если есть) — закрывает активную запись истории */
   unassign(deviceId) {
     const db = getDb();
+    const device = db.prepare('SELECT hostname, device_type, owner_user_id FROM devices WHERE id = ?').get(deviceId);
+    const prevOwner = device && device.owner_user_id ? db.prepare('SELECT full_name FROM users WHERE id = ?').get(device.owner_user_id) : null;
     const tx = db.transaction(() => {
       db.prepare(`
         UPDATE device_user_history SET unassigned_at = datetime('now')
@@ -975,6 +1074,10 @@ const ownershipRepo = {
       db.prepare('UPDATE devices SET owner_user_id = NULL WHERE id = ?').run(deviceId);
     });
     tx();
+    if (device) {
+      auditLogRepo.log('ownership', deviceId, 'update',
+        `«${device.hostname || device.device_type}» откреплено${prevOwner ? ` от «${prevOwner.full_name}»` : ''}`);
+    }
     return { deviceId };
   }
 };
@@ -982,6 +1085,13 @@ const ownershipRepo = {
 // ------------------------------------------------------------
 // Комплектующие устройства (с историей замен)
 // ------------------------------------------------------------
+
+/** Человекочитаемое название устройства по id для журнала изменений — hostname,
+ *  либо тип устройства, если hostname не задан, либо просто #id, если устройства уже нет. */
+function deviceLabelForLog(db, deviceId) {
+  const device = db.prepare('SELECT hostname, device_type FROM devices WHERE id = ?').get(deviceId);
+  return device ? (device.hostname || device.device_type) : `#${deviceId}`;
+}
 
 const componentsRepo = {
   listByDevice(deviceId) {
@@ -997,18 +1107,26 @@ const componentsRepo = {
     `).all();
   },
   add({ device_id, component_type, description, cost = null, note = null }) {
-    const info = getDb().prepare(`
+    const db = getDb();
+    const info = db.prepare(`
       INSERT INTO device_components (device_id, component_type, description, cost, attached_at, note)
       VALUES (?, ?, ?, ?, datetime('now'), ?)
     `).run(device_id, component_type, description, cost, note);
-    return getDb().prepare('SELECT * FROM device_components WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('component', info.lastInsertRowid, 'create', `«${deviceLabelForLog(db, device_id)}»: установлено «${description}»`);
+    return db.prepare('SELECT * FROM device_components WHERE id = ?').get(info.lastInsertRowid);
   },
   detach(id) {
-    getDb().prepare(`UPDATE device_components SET detached_at = datetime('now') WHERE id = ?`).run(id);
+    const db = getDb();
+    const comp = db.prepare('SELECT * FROM device_components WHERE id = ?').get(id);
+    db.prepare(`UPDATE device_components SET detached_at = datetime('now') WHERE id = ?`).run(id);
+    if (comp) auditLogRepo.log('component', id, 'update', `«${deviceLabelForLog(db, comp.device_id)}»: снято «${comp.description}»`);
     return { id };
   },
   remove(id) {
-    getDb().prepare('DELETE FROM device_components WHERE id = ?').run(id);
+    const db = getDb();
+    const comp = db.prepare('SELECT * FROM device_components WHERE id = ?').get(id);
+    db.prepare('DELETE FROM device_components WHERE id = ?').run(id);
+    if (comp) auditLogRepo.log('component', id, 'delete', `Запись о «${comp.description}» удалена безвозвратно`);
     return { id };
   }
 };
@@ -1031,18 +1149,26 @@ const peripheralsRepo = {
     `).all();
   },
   add({ device_id, peripheral_type, description, note = null }) {
-    const info = getDb().prepare(`
+    const db = getDb();
+    const info = db.prepare(`
       INSERT INTO device_peripherals (device_id, peripheral_type, description, attached_at, note)
       VALUES (?, ?, ?, datetime('now'), ?)
     `).run(device_id, peripheral_type, description, note);
-    return getDb().prepare('SELECT * FROM device_peripherals WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('peripheral', info.lastInsertRowid, 'create', `«${deviceLabelForLog(db, device_id)}»: подключена периферия «${description}»`);
+    return db.prepare('SELECT * FROM device_peripherals WHERE id = ?').get(info.lastInsertRowid);
   },
   detach(id) {
-    getDb().prepare(`UPDATE device_peripherals SET detached_at = datetime('now') WHERE id = ?`).run(id);
+    const db = getDb();
+    const periph = db.prepare('SELECT * FROM device_peripherals WHERE id = ?').get(id);
+    db.prepare(`UPDATE device_peripherals SET detached_at = datetime('now') WHERE id = ?`).run(id);
+    if (periph) auditLogRepo.log('peripheral', id, 'update', `«${deviceLabelForLog(db, periph.device_id)}»: отключена «${periph.description}»`);
     return { id };
   },
   remove(id) {
-    getDb().prepare('DELETE FROM device_peripherals WHERE id = ?').run(id);
+    const db = getDb();
+    const periph = db.prepare('SELECT * FROM device_peripherals WHERE id = ?').get(id);
+    db.prepare('DELETE FROM device_peripherals WHERE id = ?').run(id);
+    if (periph) auditLogRepo.log('peripheral', id, 'delete', `Запись о «${periph.description}» удалена безвозвратно`);
     return { id };
   }
 };
@@ -1068,21 +1194,29 @@ const softwareRepo = {
     `).all();
   },
   add({ device_id, software_type, name, license_key = null, cost = null, note = null }) {
-    const info = getDb().prepare(`
+    const db = getDb();
+    const info = db.prepare(`
       INSERT INTO device_software (device_id, software_type, name, license_key, cost, installed_at, note)
       VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
     `).run(device_id, software_type, name, license_key, cost, note);
-    return getDb().prepare('SELECT * FROM device_software WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('software', info.lastInsertRowid, 'create', `«${deviceLabelForLog(db, device_id)}»: установлено ПО «${name}»`);
+    return db.prepare('SELECT * FROM device_software WHERE id = ?').get(info.lastInsertRowid);
   },
   remove(id) {
-    getDb().prepare('DELETE FROM device_software WHERE id = ?').run(id);
+    const db = getDb();
+    const sw = db.prepare('SELECT * FROM device_software WHERE id = ?').get(id);
+    db.prepare('DELETE FROM device_software WHERE id = ?').run(id);
+    if (sw) auditLogRepo.log('software', id, 'delete', `Запись о ПО «${sw.name}» удалена безвозвратно`);
     return { id };
   },
   /** Ручная пометка Проблема/Внимание/Ошибка — null снимает пометку */
   setFlag(id, flag) {
     if (flag !== null && !FLAG_VALUES.includes(flag)) throw new Error('Недопустимая пометка');
     getDb().prepare(`UPDATE device_software SET flag = ? WHERE id = ?`).run(flag, id);
-    return getDb().prepare('SELECT * FROM device_software WHERE id = ?').get(id);
+    const sw = getDb().prepare('SELECT * FROM device_software WHERE id = ?').get(id);
+    auditLogRepo.log('software', id, 'update',
+      flag ? `ПО «${sw.name}» помечено «${FLAG_LABELS_RU[flag] || flag}»` : `С ПО «${sw.name}» снята пометка`);
+    return sw;
   }
 };
 
@@ -1091,6 +1225,7 @@ const softwareRepo = {
 // ------------------------------------------------------------
 
 const WAREHOUSE_STATUSES = ['ordered', 'in_stock', 'issued', 'written_off'];
+const WAREHOUSE_STATUS_LABELS_RU = { ordered: 'Заказано', in_stock: 'На складе', issued: 'Выдано', written_off: 'Списано' };
 
 const warehouseRepo = {
   list(category = null) {
@@ -1121,6 +1256,7 @@ const warehouseRepo = {
       INSERT INTO warehouse_items (category, item_type, description, license_key, cost, status, note)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(category, item_type, description, license_key, cost, status, note);
+    auditLogRepo.log('warehouse_item', info.lastInsertRowid, 'create', `На склад добавлено «${description}»`);
     return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(info.lastInsertRowid);
   },
   /** Редактирование складской карточки — не трогает source/target (это история, а не поле формы) */
@@ -1130,11 +1266,13 @@ const warehouseRepo = {
       UPDATE warehouse_items SET item_type = ?, description = ?, license_key = ?, cost = ?, status = ?, note = ?
       WHERE id = ?
     `).run(item_type, description, license_key, cost, status, note, id);
+    auditLogRepo.log('warehouse_item', id, 'update', `Складская запись «${description}» отредактирована`);
     return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
   },
   /** Снимает комплектующую с устройства (закрывает device_components) и кладёт на склад, сохраняя стоимость */
   receiveComponent(componentId, note = null) {
     const db = getDb();
+    let logText;
     const tx = db.transaction(() => {
       const comp = db.prepare('SELECT * FROM device_components WHERE id = ?').get(componentId);
       if (!comp) throw new Error('Комплектующая не найдена');
@@ -1143,13 +1281,16 @@ const warehouseRepo = {
         INSERT INTO warehouse_items (category, item_type, description, cost, status, source_device_id, note)
         VALUES ('component', ?, ?, ?, 'in_stock', ?, ?)
       `).run(comp.component_type, comp.description, comp.cost, comp.device_id, note);
+      logText = `«${comp.description}» снято с «${deviceLabelForLog(db, comp.device_id)}» и отправлено на склад`;
     });
     tx();
+    auditLogRepo.log('warehouse_item', componentId, 'update', logText);
     return { componentId };
   },
   /** Снимает ПО с устройства (закрывает device_software) и кладёт на склад — ключ и стоимость сохраняются */
   receiveSoftware(softwareId, note = null) {
     const db = getDb();
+    let logText;
     const tx = db.transaction(() => {
       const sw = db.prepare('SELECT * FROM device_software WHERE id = ?').get(softwareId);
       if (!sw) throw new Error('ПО не найдено');
@@ -1158,14 +1299,17 @@ const warehouseRepo = {
         INSERT INTO warehouse_items (category, item_type, description, license_key, cost, status, source_device_id, note)
         VALUES ('software', ?, ?, ?, ?, 'in_stock', ?, ?)
       `).run(sw.software_type, sw.name, sw.license_key, sw.cost, sw.device_id, note);
+      logText = `«${sw.name}» снято с «${deviceLabelForLog(db, sw.device_id)}» и отправлено на склад`;
     });
     tx();
+    auditLogRepo.log('warehouse_item', softwareId, 'update', logText);
     return { softwareId };
   },
   /** Выдаёт складскую единицу на устройство: создаёт новую запись в components/software (со стоимостью)
    *  и закрывает складскую (status='issued'). */
   issueToDevice(itemId, deviceId) {
     const db = getDb();
+    let logText;
     const tx = db.transaction(() => {
       const item = db.prepare('SELECT * FROM warehouse_items WHERE id = ?').get(itemId);
       if (!item) throw new Error('Позиция склада не найдена');
@@ -1185,25 +1329,34 @@ const warehouseRepo = {
 
       db.prepare(`UPDATE warehouse_items SET removed_at = datetime('now'), target_device_id = ?, status = 'issued' WHERE id = ?`)
         .run(deviceId, itemId);
+      logText = `«${item.description}» выдано на «${deviceLabelForLog(db, deviceId)}»`;
     });
     tx();
+    auditLogRepo.log('warehouse_item', itemId, 'update', logText);
     return { itemId, deviceId };
   },
   /** Быстрая смена статуса без правки остальных полей (например, "получено" или "списано") */
   setStatus(id, status) {
     if (!WAREHOUSE_STATUSES.includes(status)) throw new Error('Недопустимый статус');
     getDb().prepare('UPDATE warehouse_items SET status = ? WHERE id = ?').run(status, id);
-    return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
+    const item = getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
+    auditLogRepo.log('warehouse_item', id, 'status_change', `«${item.description}»: статус → ${WAREHOUSE_STATUS_LABELS_RU[status] || status}`);
+    return item;
   },
   remove(id) {
+    const item = getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
     getDb().prepare('DELETE FROM warehouse_items WHERE id = ?').run(id);
+    if (item) auditLogRepo.log('warehouse_item', id, 'delete', `Складская запись «${item.description}» удалена безвозвратно`);
     return { id };
   },
   /** Ручная пометка Проблема/Внимание/Ошибка — null снимает пометку */
   setFlag(id, flag) {
     if (flag !== null && !FLAG_VALUES.includes(flag)) throw new Error('Недопустимая пометка');
     getDb().prepare(`UPDATE warehouse_items SET flag = ? WHERE id = ?`).run(flag, id);
-    return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
+    const item = getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
+    auditLogRepo.log('warehouse_item', id, 'update',
+      flag ? `«${item.description}» помечено «${FLAG_LABELS_RU[flag] || flag}»` : `С «${item.description}» снята пометка`);
+    return item;
   }
 };
 
@@ -1220,18 +1373,26 @@ const zonesRepo = {
       INSERT INTO plan_zones (floor_plan_id, name, cells, label_x, label_y, label_rotation, label_visible)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(floor_plan_id, name, JSON.stringify(cells), label_x, label_y, label_rotation, label_visible ? 1 : 0);
-    return getDb().prepare('SELECT * FROM plan_zones WHERE id = ?').get(info.lastInsertRowid);
+    const zone = getDb().prepare('SELECT * FROM plan_zones WHERE id = ?').get(info.lastInsertRowid);
+    auditLogRepo.log('zone', zone.id, 'create', `Зона «${zone.name}» создана на плане`);
+    return zone;
   },
   /** Правит название/позицию и поворот подписи/видимость — форма геометрии (cells) не меняется */
   updateLabel(id, { name, label_x = null, label_y = null, label_rotation = 0, label_visible = 1 }) {
+    const before = getDb().prepare('SELECT name FROM plan_zones WHERE id = ?').get(id);
     getDb().prepare(`
       UPDATE plan_zones SET name = ?, label_x = ?, label_y = ?, label_rotation = ?, label_visible = ?
       WHERE id = ?
     `).run(name, label_x, label_y, label_rotation, label_visible ? 1 : 0, id);
+    if (before && before.name !== name) {
+      auditLogRepo.log('zone', id, 'update', `Зона «${before.name}» переименована в «${name}»`);
+    }
     return getDb().prepare('SELECT * FROM plan_zones WHERE id = ?').get(id);
   },
   remove(id) {
+    const zone = getDb().prepare('SELECT * FROM plan_zones WHERE id = ?').get(id);
     getDb().prepare('DELETE FROM plan_zones WHERE id = ?').run(id);
+    if (zone) auditLogRepo.log('zone', id, 'delete', `Зона «${zone.name}» удалена с плана`);
     return { id };
   }
 };
@@ -1240,6 +1401,42 @@ const zonesRepo = {
  *  1) уже нарисованные кабели (в пределах одного этажа, откуда обе стороны кабеля),
  *  2) ручной аплинк devices.uplink_device_id (может связывать устройства с разных этажей,
  *     когда кабель физически провести нельзя). Оба источника объединяются в одно дерево. */
+const AUDIT_LOG_LIMIT = 10000;
+
+const auditLogRepo = {
+  /** Пишет одну запись в журнал и обрезает старые сверх лимита. Вызывается из других
+   *  репозиториев при значимых действиях — сама по себе не публичный IPC-метод записи
+   *  (запись происходит как побочный эффект самого действия, не отдельным вызовом). */
+  log(entityType, entityId, action, summary) {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO audit_log (entity_type, entity_id, action, summary) VALUES (?, ?, ?, ?)
+    `).run(entityType, entityId, action, summary);
+    const count = db.prepare('SELECT COUNT(*) AS c FROM audit_log').get().c;
+    if (count > AUDIT_LOG_LIMIT) {
+      db.prepare(`
+        DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log ORDER BY id ASC LIMIT ?)
+      `).run(count - AUDIT_LOG_LIMIT);
+    }
+  },
+  /** Список записей, новые сверху. from/to — границы created_at (включительно, формат
+   *  'YYYY-MM-DD' или полный datetime), entityType — необязательный фильтр по типу сущности. */
+  list({ from = null, to = null, entityType = null, limit = 500 } = {}) {
+    const db = getDb();
+    const conditions = [];
+    const params = [];
+    if (from) { conditions.push('created_at >= ?'); params.push(from); }
+    if (to) { conditions.push('created_at <= ?'); params.push(to); }
+    if (entityType) { conditions.push('entity_type = ?'); params.push(entityType); }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(limit);
+    return db.prepare(`SELECT * FROM audit_log ${where} ORDER BY id DESC LIMIT ?`).all(...params);
+  },
+  count() {
+    return getDb().prepare('SELECT COUNT(*) AS c FROM audit_log').get().c;
+  }
+};
+
 const networkRepo = {
   /** Кандидаты в корень дерева — роутеры и свитчи */
   listRoots() {
@@ -1334,6 +1531,6 @@ module.exports = {
   initDatabase, getDb, usersRepo, devicesRepo, pingRepo,
   floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
-  softwareRepo, warehouseRepo, zonesRepo, networkRepo,
+  softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath
 };

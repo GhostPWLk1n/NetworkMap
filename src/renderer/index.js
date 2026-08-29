@@ -10,6 +10,7 @@ function initTabs() {
       btn.classList.add('active');
       document.getElementById(`tab-${btn.dataset.tab}`).classList.add('active');
       if (btn.dataset.tab === 'network') renderNetworkTab();
+      if (btn.dataset.tab === 'audit') loadAuditLog();
     });
   });
 }
@@ -155,6 +156,190 @@ function promptModal(title, defaultValue = '') {
   });
 }
 
+/** Модальное подтверждение — замена window.confirm(). Нативный confirm() в Electron
+ *  периодически оставляет интерфейс намертво заблокированным (все клики "проваливаются",
+ *  помогает только перезапуск приложения) — именно так проявлял себя баг после увольнения
+ *  пользователя. Возвращает Promise<boolean> вместо синхронного значения — вызывающий код
+ *  должен быть async и делать await. */
+function confirmModal(message) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('confirm-modal');
+    const okBtn = document.getElementById('confirm-modal-ok');
+    const cancelBtn = document.getElementById('confirm-modal-cancel');
+    document.getElementById('confirm-modal-title').textContent = message;
+    overlay.classList.remove('hidden');
+    okBtn.focus();
+
+    const cleanup = (result) => {
+      overlay.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      overlay.removeEventListener('keydown', onKeydown);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onKeydown = (e) => {
+      if (e.key === 'Enter') onOk();
+      if (e.key === 'Escape') onCancel();
+    };
+
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    overlay.addEventListener('keydown', onKeydown);
+  });
+}
+
+/** Модальное уведомление — замена window.alert(), по той же причине. */
+function alertModal(message) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('alert-modal');
+    const okBtn = document.getElementById('alert-modal-ok');
+    document.getElementById('alert-modal-title').textContent = message;
+    overlay.classList.remove('hidden');
+    okBtn.focus();
+
+    const cleanup = () => {
+      overlay.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      overlay.removeEventListener('keydown', onKeydown);
+      resolve();
+    };
+    const onOk = () => cleanup();
+    const onKeydown = (e) => { if (e.key === 'Enter' || e.key === 'Escape') onOk(); };
+
+    okBtn.addEventListener('click', onOk);
+    overlay.addEventListener('keydown', onKeydown);
+  });
+}
+
+/** Модалка разрешения расхождений при импорте сведений о ПК (см. scripts/collect-pc-info.ps1).
+ *  position/total — номер файла и всего файлов для прогресса в пакетном импорте (null/null
+ *  для одиночного импорта из карточки устройства). Возвращает Promise<{action, fieldChoices}>,
+ *  где action: 'apply' | 'skip' | 'apply-all-old' | 'apply-all-new' (два последних — только
+ *  в пакетном режиме, задают политику для всех оставшихся конфликтов без повторного вопроса). */
+function showPcImportConflictModal(parsed, position, total) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('pc-import-modal');
+    const progressEl = document.getElementById('pc-import-modal-progress');
+    const warningEl = document.getElementById('pc-import-modal-hostname-warning');
+    const fieldsEl = document.getElementById('pc-import-modal-fields');
+    const skipBtn = document.getElementById('pc-import-modal-skip');
+    const allOldBtn = document.getElementById('pc-import-modal-all-old');
+    const allNewBtn = document.getElementById('pc-import-modal-all-new');
+    const applyBtn = document.getElementById('pc-import-modal-apply');
+
+    document.getElementById('pc-import-modal-title').textContent =
+      `${parsed.isNew ? 'Новое устройство' : 'Обновление устройства'} «${parsed.hostname}» (${parsed.fileName})`;
+    progressEl.textContent = (position && total) ? `Файл ${position} из ${total}` : '';
+
+    if (parsed.hostnameMismatch) {
+      warningEl.classList.remove('hidden');
+      warningEl.textContent = `В файле hostname «${parsed.hostname}» — отличается от карточки. Hostname карточки не меняем, импортируем только остальные поля.`;
+    } else {
+      warningEl.classList.add('hidden');
+    }
+
+    fieldsEl.innerHTML = '';
+    parsed.fields.forEach((f) => {
+      const row = document.createElement('div');
+      row.className = `pc-import-field${f.conflict ? '' : ' no-conflict'}`;
+      const label = document.createElement('div');
+      label.className = 'pc-import-field-label';
+      label.textContent = f.label;
+      row.appendChild(label);
+
+      if (f.conflict) {
+        const options = document.createElement('div');
+        options.className = 'pc-import-field-options';
+        const groupName = `pc-import-field-${f.key}`;
+        const newLabel = document.createElement('label');
+        const newRadio = document.createElement('input');
+        newRadio.type = 'radio'; newRadio.name = groupName; newRadio.value = 'new'; newRadio.checked = true;
+        newLabel.append(newRadio, document.createTextNode(` Из файла: ${f.newValue}`));
+        const oldLabel = document.createElement('label');
+        const oldRadio = document.createElement('input');
+        oldRadio.type = 'radio'; oldRadio.name = groupName; oldRadio.value = 'old';
+        oldLabel.append(oldRadio, document.createTextNode(` Оставить: ${f.oldValue}`));
+        options.append(newLabel, oldLabel);
+        row.appendChild(options);
+      } else {
+        const info = document.createElement('div');
+        info.textContent = f.newValue;
+        row.appendChild(info);
+      }
+      fieldsEl.appendChild(row);
+    });
+
+    const showBulkButtons = !!(total && total > 1);
+    allOldBtn.classList.toggle('hidden', !showBulkButtons);
+    allNewBtn.classList.toggle('hidden', !showBulkButtons);
+
+    const collectChoices = (forcedValue) => {
+      const choices = {};
+      parsed.fields.forEach((f) => {
+        if (!f.conflict) return;
+        if (forcedValue) { choices[f.key] = forcedValue; return; }
+        const checked = fieldsEl.querySelector(`input[name="pc-import-field-${f.key}"]:checked`);
+        choices[f.key] = checked ? checked.value : 'new';
+      });
+      return choices;
+    };
+
+    const cleanup = (result) => {
+      overlay.classList.add('hidden');
+      skipBtn.onclick = null;
+      allOldBtn.onclick = null;
+      allNewBtn.onclick = null;
+      applyBtn.onclick = null;
+      resolve(result);
+    };
+
+    skipBtn.onclick = () => cleanup({ action: 'skip' });
+    allOldBtn.onclick = () => cleanup({ action: 'apply-all-old', fieldChoices: collectChoices('old') });
+    allNewBtn.onclick = () => cleanup({ action: 'apply-all-new', fieldChoices: collectChoices('new') });
+    applyBtn.onclick = () => cleanup({ action: 'apply', fieldChoices: collectChoices() });
+
+    overlay.classList.remove('hidden');
+  });
+}
+
+/** Применяет список уже разобранных файлов: без конфликтов — сразу, с конфликтами —
+ *  по очереди через модалку (кроме случая, когда пользователь выбрал "для всех
+ *  оставшихся" — тогда дальше решается автоматически по этой политике, без вопросов). */
+async function resolveAndApplyPcImports(parsedList) {
+  const summary = { created: 0, updated: 0, softwareAdded: 0, skipped: 0 };
+  let bulkPolicy = null; // null | 'old' | 'new'
+
+  const applyOne = async (p, fieldChoices) => {
+    const r = await window.api.importPcInfo.apply(p, fieldChoices);
+    if (r.isNew) summary.created++; else summary.updated++;
+    summary.softwareAdded += r.softwareAdded;
+  };
+
+  const clean = parsedList.filter((p) => !p.hasConflicts);
+  const conflicting = parsedList.filter((p) => p.hasConflicts);
+
+  for (const p of clean) await applyOne(p, {});
+
+  for (let i = 0; i < conflicting.length; i++) {
+    const p = conflicting[i];
+    if (bulkPolicy) {
+      const fieldChoices = {};
+      p.fields.forEach((f) => { if (f.conflict) fieldChoices[f.key] = bulkPolicy; });
+      await applyOne(p, fieldChoices);
+      continue;
+    }
+    const result = await showPcImportConflictModal(p, i + 1, conflicting.length);
+    if (result.action === 'skip') { summary.skipped++; continue; }
+    if (result.action === 'apply-all-old') bulkPolicy = 'old';
+    if (result.action === 'apply-all-new') bulkPolicy = 'new';
+    await applyOne(p, result.fieldChoices);
+  }
+
+  return summary;
+}
+
 // ============================================================
 // Каркас поиска с расширенными фильтрами (общий для листов Пользователи/Устройства)
 // ============================================================
@@ -273,7 +458,7 @@ function buildUserCard(u) {
       }),
       {
         label: 'Удалить', danger: true, onClick: async () => {
-          if (!confirm(`Удалить пользователя «${u.full_name}»?`)) return;
+          if (!(await confirmModal(`Удалить пользователя «${u.full_name}»?`))) return;
           await window.api.users.remove(u.id);
           renderUsers();
           fillUserDragList();
@@ -310,7 +495,7 @@ function buildUserCard(u) {
   statusToggleBtn.textContent = u.status === 'dismissed' ? '♻️ Восстановить в правах' : '🚪 Уволить';
   statusToggleBtn.onclick = async () => {
     const newStatus = u.status === 'dismissed' ? 'active' : 'dismissed';
-    if (newStatus === 'dismissed' && !confirm(`Отметить «${u.full_name}» как уволенного? Карточка скроется из общего списка (её можно будет включить обратно через «показать уволенных»).`)) return;
+    if (newStatus === 'dismissed' && !(await confirmModal(`Отметить «${u.full_name}» как уволенного? Карточка скроется из общего списка (её можно будет включить обратно через «показать уволенных»).`))) return;
     const updated = await window.api.users.setStatus(u.id, newStatus);
     Object.assign(u, updated);
     fillUserDragList();
@@ -572,7 +757,7 @@ function buildDeviceCard(d) {
       }),
       {
         label: 'Удалить', danger: true, onClick: async () => {
-          if (!confirm(`Удалить устройство «${d.hostname}»?`)) return;
+          if (!(await confirmModal(`Удалить устройство «${d.hostname}»?`))) return;
           await window.api.devices.remove(d.id);
           renderDevices();
           fillDevicePicker();
@@ -610,6 +795,24 @@ function buildDeviceCard(d) {
   findBtn.type = 'button';
   findBtn.textContent = '📍 Найти на плане';
   findBtn.onclick = () => findDeviceOnPlan(d.id);
+  const importBtn = document.createElement('button');
+  importBtn.type = 'button';
+  importBtn.textContent = '📥 Импорт из файла';
+  importBtn.title = 'Импортировать сведения из JSON-файла (см. scripts/collect-pc-info.ps1)';
+  importBtn.onclick = async () => {
+    const parsed = await window.api.importPcInfo.pickFile(d.id);
+    if (!parsed) return; // отмена выбора файла
+    let fieldChoices = {};
+    if (parsed.hasConflicts) {
+      const result = await showPcImportConflictModal(parsed, null, null);
+      if (result.action === 'skip') return;
+      fieldChoices = result.fieldChoices;
+    }
+    const applyResult = await window.api.importPcInfo.apply(parsed, fieldChoices);
+    await renderDevices(); // полный перерендер с бэкенда — надёжнее, чем точечно патчить карточку
+    applyDevicesFilter();
+    await alertModal(`Импортировано. Установленного ПО добавлено: ${applyResult.softwareAdded}.`);
+  };
   const pingBtn = document.createElement('button');
   pingBtn.type = 'button';
   pingBtn.textContent = 'Пинговать';
@@ -635,7 +838,7 @@ function buildDeviceCard(d) {
   lifecycleBtn.onclick = async () => {
     const newStatus = d.status === 'decommissioned' ? 'active' : 'decommissioned';
     if (newStatus === 'decommissioned') {
-      if (!confirm(`Списать «${d.hostname}»? Карточка скроется из общего списка (её можно будет включить обратно через «показать списанные»).`)) return;
+      if (!(await confirmModal(`Списать «${d.hostname}»? Карточка скроется из общего списка (её можно будет включить обратно через «показать списанные»).`))) return;
       const note = await promptModal('Комментарий к списанию (необязательно)', '');
       const updated = await window.api.devices.setStatus(d.id, 'decommissioned', note);
       Object.assign(d, updated);
@@ -657,7 +860,7 @@ function buildDeviceCard(d) {
     updatePingBadgeByDeviceId(d.id, result.status);
   };
 
-  actions.append(saveBtn, findBtn, pingBtn, serviceBtn, lifecycleBtn, statusNote);
+  actions.append(saveBtn, findBtn, importBtn, pingBtn, serviceBtn, lifecycleBtn, statusNote);
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -732,7 +935,7 @@ document.getElementById('devices-filter-no-owner').addEventListener('change', ap
 async function findDeviceOnPlan(deviceId) {
   const placements = await window.api.planItems.findByDeviceRef(deviceId);
   if (placements.length === 0) {
-    alert('Это устройство пока не размещено ни на одном плане.');
+    await alertModal('Это устройство пока не размещено ни на одном плане.');
     return;
   }
   const target = placements[0]; // на нескольких этажах сразу — берём первый найденный
@@ -745,7 +948,7 @@ async function findDeviceOnPlan(deviceId) {
 /** То же самое, но для кабеля — переход из вкладки "Сеть" по клику на подпись "🔌 Кабель №..." */
 async function findCableOnPlan(cableId) {
   const cable = await window.api.cables.get(cableId);
-  if (!cable) { alert('Этот кабель не найден — возможно, был удалён.'); return; }
+  if (!cable) { await alertModal('Этот кабель не найден — возможно, был удалён.'); return; }
   document.querySelector('.tab-btn[data-tab="plan"]').click();
   await switchFloorPlan(cable.floor_plan_id);
   const node = planState.cablesById.get(cableId);
@@ -813,6 +1016,41 @@ document.getElementById('import-excel-btn').addEventListener('click', async () =
 
     // Импорт мог добавить и устройства, и пользователей — обновляем все зависимые списки
     await Promise.all([renderUsers(), renderDevices(), fillDevicePicker(), fillUserDragList()]);
+  } catch (err) {
+    status.textContent = `Ошибка импорта: ${err.message || err}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('import-pc-info-folder-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('import-pc-info-folder-btn');
+  const status = document.getElementById('import-pc-info-status');
+
+  btn.disabled = true;
+  status.textContent = 'Читаю папку…';
+
+  try {
+    const batch = await window.api.importPcInfo.pickFolder();
+    if (!batch) { status.textContent = ''; return; } // диалог отменён
+    if (batch.results.length === 0 && batch.errors.length === 0) {
+      status.textContent = 'В папке нет .json-файлов.';
+      return;
+    }
+
+    status.textContent = `Разобрано ${batch.results.length} файлов${batch.errors.length ? `, ошибок: ${batch.errors.length}` : ''}. Применяю…`;
+    const summary = await resolveAndApplyPcImports(batch.results);
+
+    const parts = [`создано ${summary.created}`, `обновлено ${summary.updated}`, `ПО добавлено ${summary.softwareAdded}`];
+    if (summary.skipped) parts.push(`пропущено ${summary.skipped}`);
+    status.textContent = `Готово: ${parts.join(', ')}.`;
+
+    if (batch.errors.length > 0) {
+      await alertModal(`Не удалось разобрать ${batch.errors.length} файл(ов):\n${batch.errors.join('\n')}`);
+    }
+
+    await renderDevices();
+    applyDevicesFilter();
   } catch (err) {
     status.textContent = `Ошибка импорта: ${err.message || err}`;
   } finally {
@@ -906,7 +1144,7 @@ function buildWarehouseCard(w) {
     }
     items.push({
       label: 'Удалить запись безвозвратно', danger: true, onClick: async () => {
-        if (!confirm(`Удалить запись «${w.description}» насовсем? Действие необратимо.`)) return;
+        if (!(await confirmModal(`Удалить запись «${w.description}» насовсем? Действие необратимо.`))) return;
         await window.api.warehouse.remove(w.id);
         renderWarehouse();
         fillWarehouseDragList();
@@ -1143,7 +1381,7 @@ function buildSoftwareCard(s) {
       items.push({ label: '📍 Найти на плане', onClick: () => findDeviceOnPlan(s.device_id) });
       items.push({
         label: 'Снять и на склад', danger: true, onClick: async () => {
-          if (!confirm(`Снять «${s.name}» с «${s.device_hostname}» и отправить на склад?`)) return;
+          if (!(await confirmModal(`Снять «${s.name}» с «${s.device_hostname}» и отправить на склад?`))) return;
           await window.api.warehouse.receiveSoftware(s.id);
           renderSoftwareRegistry();
           renderWarehouse();
@@ -1153,7 +1391,7 @@ function buildSoftwareCard(s) {
     } else {
       items.push({
         label: 'Удалить запись', danger: true, onClick: async () => {
-          if (!confirm(`Удалить «${s.name}» со склада насовсем?`)) return;
+          if (!(await confirmModal(`Удалить «${s.name}» со склада насовсем?`))) return;
           await window.api.warehouse.remove(s.id);
           renderSoftwareRegistry();
           renderWarehouse();
@@ -1268,15 +1506,16 @@ let planState = {
   // 0=зоны, 1=стены/мебель, 2=кабели, 3=оборудование; глобально, не сбрасывается по этажам.
   // 'visible' — видно и редактируется; 'locked' — видно, но нельзя двигать/удалять/рисовать
   // на этом слое; 'hidden' — не видно (и, соответственно, тоже нельзя взаимодействовать)
-  layerState: { 0: 'visible', 1: 'visible', 2: 'visible', 3: 'visible' }
+  layerState: { 0: 'visible', 1: 'visible', 2: 'visible', 3: 'visible', 4: 'visible' }
 };
 
 /** К какому логическому слою относится тип объекта плана — используется и при отрисовке
  *  (сразу выставить видимость/блокировку), и переключателями слоёв.
  *  Зоны — слой 0, самый нижний (под стенами); кабели (отдельная сущность, не plan_item) — слой 2. */
 function planLayerFor(itemType) {
-  if (itemType === 'device') return 3;
-  if (itemType === 'wall' || itemType === 'door' || itemType === 'stairs' || itemType === 'desk') return 1;
+  if (itemType === 'device') return 4;
+  if (itemType === 'desk') return 2;
+  if (itemType === 'wall' || itemType === 'door' || itemType === 'stairs') return 1;
   return null;
 }
 
@@ -1413,10 +1652,10 @@ async function renderFloorTabs() {
           label: 'Удалить этаж', danger: true, onClick: async () => {
             const current = await window.api.floorPlans.list();
             if (current.length <= 1) {
-              alert('Нельзя удалить последний план — должен остаться хотя бы один.');
+              await alertModal('Нельзя удалить последний план — должен остаться хотя бы один.');
               return;
             }
-            if (!confirm(`Удалить план «${f.name}» вместе со всеми объектами на нём? Действие необратимо.`)) return;
+            if (!(await confirmModal(`Удалить план «${f.name}» вместе со всеми объектами на нём? Действие необратимо.`))) return;
 
             const wasActive = planState.floorPlan.id === f.id;
             await window.api.floorPlans.remove(f.id);
@@ -1724,6 +1963,95 @@ document.getElementById('network-ping-tree-btn').addEventListener('click', async
   btn.textContent = original;
   btn.disabled = false;
   renderNetworkTreeContainer(); // перерисовать с новыми статусами и каскадной подсветкой
+});
+
+// ------------------------------------------------------------
+// Лист "Журнал": лог значимых действий (см. auditLogRepo на бэкенде) с фильтром по датам и типу
+// ------------------------------------------------------------
+
+const AUDIT_ENTITY_LABELS = {
+  user: 'Пользователи', device: 'Устройства', plan_item: 'Объекты плана', cable: 'Кабели',
+  cable_connection: 'Подключения к кабелю', zone: 'Зоны', warehouse_item: 'Склад',
+  software: 'ПО', component: 'Комплектующие', peripheral: 'Периферия',
+  ownership: 'Владение устройством', floor_plan: 'Планы'
+};
+const AUDIT_ACTION_ICONS = { create: '➕', update: '✏️', delete: '🗑', status_change: '🔄' };
+
+/** 'YYYY-MM-DD HH:MM:SS' (формат SQLite datetime('now')) -> 'ДД.ММ.ГГГГ ЧЧ:ММ' */
+function formatAuditTimestamp(sqliteDatetime) {
+  const [datePart, timePart] = sqliteDatetime.split(' ');
+  const [y, m, d] = datePart.split('-');
+  const [hh, mm] = (timePart || '00:00').split(':');
+  return `${d}.${m}.${y} ${hh}:${mm}`;
+}
+
+/** Заполняет выпадающий список типов сущностей один раз при старте */
+function renderAuditFilterOptions() {
+  const select = document.getElementById('audit-filter-type');
+  Object.entries(AUDIT_ENTITY_LABELS).forEach(([value, label]) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    select.appendChild(opt);
+  });
+}
+
+async function loadAuditLog() {
+  const container = document.getElementById('audit-log-list');
+  container.textContent = 'Загрузка…';
+
+  const fromValue = document.getElementById('audit-filter-from').value; // 'YYYY-MM-DD' или ''
+  const toValue = document.getElementById('audit-filter-to').value;
+  const entityType = document.getElementById('audit-filter-type').value;
+  const filters = { limit: 500 };
+  if (fromValue) filters.from = fromValue; // сравнение строк 'YYYY-MM-DD' <= 'YYYY-MM-DD HH:MM:SS' работает верно как нижняя граница
+  if (toValue) filters.to = `${toValue} 23:59:59`; // включаем весь день целиком, а не только 00:00:00
+  if (entityType) filters.entityType = entityType;
+
+  const entries = await window.api.auditLog.list(filters);
+  container.innerHTML = '';
+  if (entries.length === 0) {
+    container.appendChild(smallListNote('Записей не найдено'));
+    return;
+  }
+  entries.forEach((e) => {
+    const row = document.createElement('div');
+    row.className = 'audit-row';
+
+    const icon = document.createElement('span');
+    icon.className = 'audit-icon';
+    icon.textContent = AUDIT_ACTION_ICONS[e.action] || '•';
+    row.appendChild(icon);
+
+    const time = document.createElement('span');
+    time.className = 'audit-time';
+    time.textContent = formatAuditTimestamp(e.created_at);
+    row.appendChild(time);
+
+    const type = document.createElement('span');
+    type.className = 'audit-type';
+    type.textContent = AUDIT_ENTITY_LABELS[e.entity_type] || e.entity_type;
+    row.appendChild(type);
+
+    const summary = document.createElement('span');
+    summary.className = 'audit-summary';
+    summary.textContent = e.summary;
+    row.appendChild(summary);
+
+    container.appendChild(row);
+  });
+}
+
+renderAuditFilterOptions();
+document.getElementById('audit-filter-from').addEventListener('change', loadAuditLog);
+document.getElementById('audit-filter-to').addEventListener('change', loadAuditLog);
+document.getElementById('audit-filter-type').addEventListener('change', loadAuditLog);
+document.getElementById('audit-refresh-btn').addEventListener('click', loadAuditLog);
+document.getElementById('audit-clear-filters-btn').addEventListener('click', () => {
+  document.getElementById('audit-filter-from').value = '';
+  document.getElementById('audit-filter-to').value = '';
+  document.getElementById('audit-filter-type').value = '';
+  loadAuditLog();
 });
 
 // ------------------------------------------------------------
@@ -2178,7 +2506,7 @@ function renderLineItem(item) {
 }
 
 function handleLineToolClick(x, y) {
-  if (isLayerLocked(1)) { flashModeWarning('Слой "стены и мебель" заблокирован'); return; }
+  if (isLayerLocked(1)) { flashModeWarning('Слой "стены" заблокирован'); return; }
   if (!planState.pendingLine) {
     planState.pendingLine = { x, y, type: planState.mode };
   } else {
@@ -2272,7 +2600,7 @@ function doorSegmentFromWall(data, t) {
 }
 
 function handleDoorToolClick(cellXFloat, cellYFloat) {
-  if (isLayerLocked(1)) { flashModeWarning('Слой "стены и мебель" заблокирован'); return; }
+  if (isLayerLocked(1)) { flashModeWarning('Слой "стены" заблокирован'); return; }
   const nearest = findNearestWall(cellXFloat, cellYFloat);
   if (!nearest || nearest.dist > DOOR_SNAP_THRESHOLD) {
     flashModeWarning('Кликните ближе к стене — дверь встраивается только в неё');
@@ -2402,8 +2730,8 @@ function renderCable(cable) {
   line.setAttr('kind', 'cable');
   line.setAttr('recordId', cable.id);
   line.setAttr('cableData', cable);
-  line.setAttr('planLayer', 2);
-  line.visible(planState.layerState[2] !== 'hidden');
+  line.setAttr('planLayer', 3);
+  line.visible(planState.layerState[3] !== 'hidden');
 
   line.on('click', async (e) => {
     if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая — средняя занята панорамой
@@ -2470,7 +2798,7 @@ async function insertPointOnCable(cableId, cellPoint) {
  *  накопленным путём этого кабеля; следующие клики нарастят ЕГО, а не создадут новый
  *  (см. extendingCableId в finishCableDraft). */
 function startExtendingCable(cableId) {
-  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
+  if (isLayerLocked(3)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
   const line = planState.cablesById.get(cableId);
   const cable = line.getAttr('cableData');
   const path = JSON.parse(cable.path || '[]');
@@ -2581,14 +2909,14 @@ function findNearestCablePoint(cellPoint) {
 /** Начинает рисование кабеля с указанной точки (в клетках, дробные координаты —
  *  путь кабеля не обязан лежать строго на сетке, это условная трасса реальной проводки). */
 function startCableDraft(cellX, cellY) {
-  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
+  if (isLayerLocked(3)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
   planState.cableDraft = { path: [{ x: cellX, y: cellY }] };
 }
 
 /** Добавляет точку к уже начатому пути, либо начинает новый, если рисование ещё не шло —
  *  единая точка входа что для клика по пустому месту, что по устройству/столу. */
 function addCablePoint(cellX, cellY) {
-  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
+  if (isLayerLocked(3)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
   if (!planState.cableDraft) { startCableDraft(cellX, cellY); return; }
   planState.cableDraft.path.push({ x: cellX, y: cellY });
 }
@@ -2611,14 +2939,11 @@ function updateCablePreview(pointer) {
 
 /** Завершает рисование кабеля тем путём, что уже накопился — вызывается правым кликом
  *  по канве в режиме "Кабель" (см. stage.on('contextmenu', ...) в initPlan). Устройства
- *  на концах больше не обязательны: связь с сетью даёт не сам кабель, а сокеты на нём. */
-/** Завершает рисование кабеля тем путём, что уже накопился — вызывается правым кликом
- *  по канве в режиме "Кабель" (см. stage.on('contextmenu', ...) в initPlan). Устройства
  *  на концах больше не обязательны: связь с сетью даёт не сам кабель, а прямое
  *  подключение к нему. Если draft.extendingCableId задан (режим "Продолжить из
  *  последней точки") — дорисовывает СУЩЕСТВУЮЩИЙ кабель, а не создаёт новый. */
 async function finishCableDraft() {
-  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
+  if (isLayerLocked(3)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
   const draft = planState.cableDraft;
   if (!draft || draft.path.length < 2) {
     flashModeWarning('Нужно минимум 2 точки — кликните ещё раз перед завершением');
@@ -2996,7 +3321,7 @@ async function removePlanItem(id) {
 }
 
 async function placeNewItem(x, y) {
-  if (isLayerLocked(1)) { flashModeWarning('Слой "стены и мебель" заблокирован'); return; }
+  if (isLayerLocked(2)) { flashModeWarning('Слой "столы" заблокирован'); return; }
   if (planState.mode === 'desk') {
     const item = await window.api.planItems.create({ floor_plan_id: planState.floorPlan.id, item_type: 'desk', x, y });
     renderPointItem(item);
@@ -3005,7 +3330,7 @@ async function placeNewItem(x, y) {
 
 /** Размещает устройство на плане в указанной клетке — вызывается из drop-обработчика кармана "Устройства" */
 async function placeDeviceItem(deviceId, x, y) {
-  if (isLayerLocked(3)) { flashModeWarning('Слой "оборудование" заблокирован'); return; }
+  if (isLayerLocked(4)) { flashModeWarning('Слой "оборудование" заблокирован'); return; }
   const item = await window.api.planItems.create({
     floor_plan_id: planState.floorPlan.id, item_type: 'device', ref_id: deviceId, x, y
   });
@@ -3316,7 +3641,7 @@ function bindZoomButtons() {
   });
 }
 
-const LAYER_NAMES = { 0: 'зоны', 1: 'стены и мебель', 2: 'кабель-менеджмент', 3: 'оборудование' };
+const LAYER_NAMES = { 0: 'зоны', 1: 'стены', 2: 'столы', 3: 'кабель-менеджмент', 4: 'оборудование' };
 const LAYER_STATE_RU = { visible: 'видимый', locked: 'заблокирован', hidden: 'скрыт' };
 
 /** Кнопки слоёв (0=зоны, 1=стены/мебель, 2=кабели, 3=оборудование) — три состояния:
@@ -3373,14 +3698,17 @@ function updateLayerToggleButtons() {
 /** Кнопки тулбара, привязанные к конкретному слою, сереют и перестают работать,
  *  если этот слой заблокирован — отдельно от глобального view-mode-locked. */
 function updateToolbarLockedState() {
-  const wallsLocked = planState.layerState[1] === 'locked';
-  const cablesLocked = planState.layerState[2] === 'locked';
-  const devicesLocked = planState.layerState[3] === 'locked';
   const zonesLocked = planState.layerState[0] === 'locked';
-  ['mode-desk', 'mode-wall', 'mode-door', 'mode-stairs'].forEach((id) => {
+  const wallsLocked = planState.layerState[1] === 'locked';
+  const desksLocked = planState.layerState[2] === 'locked';
+  const cablesLocked = planState.layerState[3] === 'locked';
+  const devicesLocked = planState.layerState[4] === 'locked';
+  ['mode-wall', 'mode-door', 'mode-stairs'].forEach((id) => {
     const btn = document.getElementById(id);
     if (btn) btn.disabled = wallsLocked;
   });
+  const deskBtn = document.getElementById('mode-desk');
+  if (deskBtn) deskBtn.disabled = desksLocked;
   const cableBtn = document.getElementById('mode-cable');
   if (cableBtn) cableBtn.disabled = cablesLocked;
   const deviceList = document.getElementById('device-drag-list');
@@ -3400,7 +3728,7 @@ function applyLayerStates() {
     if (node.getAttr('kind') === 'point') node.draggable(!isNodeLocked(node));
   });
   planState.cablesById.forEach((line) => {
-    line.visible(planState.layerState[2] !== 'hidden');
+    line.visible(planState.layerState[3] !== 'hidden');
   });
   planState.zonesById.forEach((node) => {
     node.visible(planState.layerState[0] !== 'hidden');
@@ -4423,7 +4751,7 @@ function bindDbSettingsModal() {
   document.getElementById('db-settings-close').addEventListener('click', () => overlay.classList.add('hidden'));
 
   async function connectAndRelaunch(filePath, confirmText) {
-    if (!confirm(confirmText)) return;
+    if (!(await confirmModal(confirmText))) return;
     statusNote.textContent = 'Подключение…';
     const result = await window.api.settings.connectDb(filePath);
     // При успехе главный процесс перезапускает приложение сам — сюда управление не вернётся.
@@ -4446,7 +4774,7 @@ function bindDbSettingsModal() {
   });
 
   document.getElementById('db-reset-btn').addEventListener('click', async () => {
-    if (!confirm('Вернуться к локальной базе данных по умолчанию? Приложение перезапустится.')) return;
+    if (!(await confirmModal('Вернуться к локальной базе данных по умолчанию? Приложение перезапустится.'))) return;
     statusNote.textContent = 'Переключение…';
     const result = await window.api.settings.resetDb();
     if (result && result.success === false) {
@@ -4471,4 +4799,5 @@ renderDevices();
 renderWarehouse();
 renderSoftwareRegistry();
 renderNetworkTab();
+loadAuditLog();
 initPlan();
