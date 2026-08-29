@@ -279,6 +279,8 @@ body {
 .network-node-row .net-type-icon { font-size: 14px; }
 .network-node-row .net-hostname { font-weight: 500; }
 .network-node-row .net-via { font-size: 11px; color: #888; }
+.net-clickable { cursor: pointer; }
+.net-clickable:hover { text-decoration: underline; color: #2a6fc9; }
 .network-node-row .net-role { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 500; }
 .network-node-row .net-role-primary { background: #d1f2dd; color: #1a7a41; }
 .network-node-row .net-role-backup { background: #fde3cf; color: #9c4a15; }

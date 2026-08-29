@@ -742,6 +742,16 @@ async function findDeviceOnPlan(deviceId) {
   if (node) { selectNode(node); focusOnNode(node); blinkNode(node); }
 }
 
+/** То же самое, но для кабеля — переход из вкладки "Сеть" по клику на подпись "🔌 Кабель №..." */
+async function findCableOnPlan(cableId) {
+  const cable = await window.api.cables.get(cableId);
+  if (!cable) { alert('Этот кабель не найден — возможно, был удалён.'); return; }
+  document.querySelector('.tab-btn[data-tab="plan"]').click();
+  await switchFloorPlan(cable.floor_plan_id);
+  const node = planState.cablesById.get(cableId);
+  if (node) { selectNode(node); focusOnNode(node); blinkNode(node); }
+}
+
 /** Переключает на лист "Устройства", сбрасывает фильтры (чтобы карточка точно попала в выдачу),
  *  разворачивает нужную карточку и прокручивает к ней. Используется из инспектора плана и из зон. */
 function openDeviceCard(deviceId) {
@@ -1245,7 +1255,6 @@ let planState = {
   selectedNode: null,
   itemsById: new Map(),   // plan_item.id -> Konva.Group (desk/device/wall/door/stairs)
   cablesById: new Map(),  // cable.id -> Konva.Line
-  socketsById: new Map(), // cable_socket.id -> Konva.Circle
   cableEditHandles: null, // [Konva.Circle, ...] — точки редактирования выделенного кабеля, либо null
   zonesById: new Map(),   // zone.id -> Konva.Group (заливка + подпись)
   pendingLine: null,      // { x, y, type } — первая точка стены/двери/лестницы
@@ -1445,7 +1454,6 @@ async function buildStageForCurrentFloor() {
 
   planState.itemsById = new Map();
   planState.cablesById = new Map();
-  planState.socketsById = new Map();
   planState.cableEditHandles = null;
   planState.zonesById = new Map();
   planState.selectedNode = null;
@@ -1517,8 +1525,6 @@ async function loadPlanItems() {
   const cables = await window.api.cables.list(planState.floorPlan.id);
   cables.forEach(renderCable);
 
-  const sockets = await window.api.sockets.listByPlan(planState.floorPlan.id);
-  sockets.forEach(renderSocket);
 
   resortPlanLayerZOrder(); // страховка: гарантированно верный z-порядок для всего, что уже отрисовано
 }
@@ -1608,8 +1614,10 @@ function renderNetworkTreeNode(node, isRoot, ancestorDown) {
   row.appendChild(icon);
 
   const hostname = document.createElement('span');
-  hostname.className = 'net-hostname';
+  hostname.className = 'net-hostname net-clickable';
   hostname.textContent = node.hostname || '(без имени)';
+  hostname.title = 'Открыть карточку устройства';
+  hostname.onclick = () => openDeviceCard(node.id);
   row.appendChild(hostname);
 
   if (node.status && node.status !== 'active') {
@@ -1632,7 +1640,16 @@ function renderNetworkTreeNode(node, isRoot, ancestorDown) {
   if (!isRoot && node.via) {
     const via = document.createElement('span');
     via.className = 'net-via';
-    via.textContent = node.via === 'socket' ? '🔌 по сокету' : '🔗 по аплинку';
+    if (node.via === 'cable') {
+      const cableLink = document.createElement('span');
+      cableLink.className = 'net-clickable';
+      cableLink.textContent = `🔌 Кабель №${node.via_cable_id}${node.via_cable_label ? ` (${node.via_cable_label})` : ''}`;
+      cableLink.title = 'Найти этот кабель на плане';
+      cableLink.onclick = () => findCableOnPlan(node.via_cable_id);
+      via.appendChild(cableLink);
+    } else {
+      via.textContent = '🔗 по аплинку';
+    }
     row.appendChild(via);
   }
 
@@ -2399,6 +2416,18 @@ function renderCable(cable) {
     selectNode(line);
   });
 
+  line.on('contextmenu', (e) => {
+    e.evt.preventDefault();
+    e.cancelBubble = true;
+    if (isNodeLocked(line)) { flashModeWarning('Слой заблокирован'); return; }
+    const pointer = planState.stage.getRelativePointerPosition();
+    const cellPoint = { x: pointer.x / CELL_PX, y: pointer.y / CELL_PX };
+    showContextMenu(e.evt.clientX, e.evt.clientY, [
+      { label: '➕ Добавить точку', onClick: () => insertPointOnCable(cable.id, cellPoint) },
+      { label: '➡️ Продолжить из последней точки', onClick: () => startExtendingCable(cable.id) }
+    ]);
+  });
+
   planState.layer.add(line);
   enforceLayerZOrder(line);
   planState.layer.draw();
@@ -2409,15 +2438,44 @@ function renderCable(cable) {
 /** Пересобирает линию кабеля после правки path — тот же паттерн, что и у остальных
  *  типов объектов (refreshLineItemVisual/refreshPointItemVisual): проще полностью
  *  переотрисовать, чем точечно чинить существующий Konva.Line. */
-function refreshCableVisual(cableId) {
+function refreshCableVisual(cableId, freshCableData) {
   const old = planState.cablesById.get(cableId);
   const wasSelected = planState.selectedNode === old;
   if (old) { old.destroy(); planState.cablesById.delete(cableId); }
-  const cable = old ? old.getAttr('cableData') : null;
+  const cable = freshCableData || (old ? old.getAttr('cableData') : null);
   if (!cable) return;
   const fresh = renderCable(cable);
   if (wasSelected && fresh) { planState.selectedNode = fresh; highlight(fresh); showCableEditHandles(fresh); }
   planState.layer.draw();
+}
+
+/** Вставляет новую точку на БЛИЖАЙШЕМ сегменте пути (не просто ближайшую точку вообще —
+ *  важно найти именно сегмент, чтобы точка встала в правильное место массива) */
+async function insertPointOnCable(cableId, cellPoint) {
+  const line = planState.cablesById.get(cableId);
+  const cable = line.getAttr('cableData');
+  const path = JSON.parse(cable.path || '[]');
+  let bestSegIndex = 0, bestDist = Infinity, bestPoint = null;
+  for (let i = 0; i < path.length - 1; i++) {
+    const closest = closestPointOnSegment(cellPoint, path[i], path[i + 1]);
+    const dist = Math.hypot(closest.x - cellPoint.x, closest.y - cellPoint.y);
+    if (dist < bestDist) { bestDist = dist; bestSegIndex = i; bestPoint = closest; }
+  }
+  path.splice(bestSegIndex + 1, 0, bestPoint);
+  const updated = await window.api.cables.updatePath(cableId, path);
+  refreshCableVisual(cableId, updated);
+}
+
+/** "Продолжить из последней точки" — переходит в режим рисования кабеля с уже
+ *  накопленным путём этого кабеля; следующие клики нарастят ЕГО, а не создадут новый
+ *  (см. extendingCableId в finishCableDraft). */
+function startExtendingCable(cableId) {
+  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
+  const line = planState.cablesById.get(cableId);
+  const cable = line.getAttr('cableData');
+  const path = JSON.parse(cable.path || '[]');
+  planState.setToolMode('cable'); // переключает режим, попутно сбрасывает cableDraft в null
+  planState.cableDraft = { path: [...path], extendingCableId: cableId };
 }
 
 /** Точки редактирования path выделенного кабеля — перетащить, чтобы перенести трассу;
@@ -2486,17 +2544,13 @@ function clearCableEditHandles() {
 }
 
 // ------------------------------------------------------------
-// Сокеты — точки подключения устройства к кабелю. Устройство, стоящее на сокете,
-// становится частью сетевого сегмента этого кабеля (см. networkRepo.buildTree).
+// Подключение устройства к кабелю напрямую — без промежуточного сокета. Устройство,
+// подключённое к кабелю, становится частью его сетевого сегмента (см. networkRepo.buildTree).
+// Роутер/свитч — многопортовые (могут быть подключены к нескольким кабелям сразу),
+// остальные устройства — только к одному (правило внутри cableConnectionsRepo на бэкенде).
 // ------------------------------------------------------------
 
-const SOCKET_SNAP_THRESHOLD = 0.5; // клеток — насколько близко к кабелю нужно кликнуть, чтобы поставить на него сокет
-const DEVICE_SOCKET_ATTACH_THRESHOLD = 2.0; // клеток — авто-подключение при размещении, "на глаз".
-                                             // Не единственный способ подключиться: в инспекторе
-                                             // всегда доступен явный выбор из ВСЕХ сокетов этажа —
-                                             // два устройства физически не могут стоять в одной
-                                             // клетке рядом с одним сокетом, так что дистанционный
-                                             // подбор при точном попадании — лишь бонус, не гарантия
+const NEAREST_CABLE_THRESHOLD = 0.5; // клеток — по сути "та же клетка"; так и должно быть
 
 /** Ближайшая точка к p на отрезке [a,b] — в тех же координатах, что и сам путь (клетки) */
 function closestPointOnSegment(p, a, b) {
@@ -2508,9 +2562,8 @@ function closestPointOnSegment(p, a, b) {
   return { x: a.x + t * dx, y: a.y + t * dy };
 }
 
-/** Ближайшая точка на ЛЮБОМ уже нарисованном кабеле к точке cellPoint (в клетках) —
- *  используется и инструментом "Сокет", и авто-подключением устройства при размещении.
- *  Снэпится к настоящему (не визуально сдвинутому) пути кабеля. */
+/** Ближайший уже нарисованный кабель к точке cellPoint (в клетках) — используется при
+ *  размещении устройства (авто-подключение) и в инспекторе (подсветка ближайшего в списке). */
 function findNearestCablePoint(cellPoint) {
   let best = null;
   planState.cablesById.forEach((line, cableId) => {
@@ -2523,56 +2576,6 @@ function findNearestCablePoint(cellPoint) {
     }
   });
   return best;
-}
-
-async function handleSocketToolClick(cellX, cellY) {
-  if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
-  const nearest = findNearestCablePoint({ x: cellX, y: cellY });
-  if (!nearest || nearest.dist > SOCKET_SNAP_THRESHOLD) {
-    flashModeWarning('Кликните ближе к кабелю — сокет ставится только на линию');
-    return;
-  }
-  const socket = await window.api.sockets.create({ cable_id: nearest.cableId, x: nearest.x, y: nearest.y });
-  renderSocket(socket);
-}
-
-function renderSocket(socket) {
-  const node = new Konva.Circle({
-    x: socket.x * CELL_PX, y: socket.y * CELL_PX, radius: 5,
-    fill: '#fff', stroke: '#333', strokeWidth: 2
-  });
-  node.setAttr('kind', 'socket');
-  node.setAttr('recordId', socket.id);
-  node.setAttr('cableId', socket.cable_id);
-  node.setAttr('socketData', socket);
-  node.setAttr('planLayer', 2); // тот же логический слой, что и сам кабель-менеджмент
-  node.visible(planState.layerState[2] !== 'hidden');
-
-  node.on('click', async (e) => {
-    if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return;
-    e.cancelBubble = true;
-    if (planState.mode === 'delete') {
-      if (isNodeLocked(node)) { flashModeWarning('Слой заблокирован'); return; }
-      await removeSocket(socket.id);
-      return;
-    }
-    selectNode(node);
-  });
-
-  planState.layer.add(node);
-  enforceLayerZOrder(node);
-  planState.layer.draw();
-  planState.socketsById.set(socket.id, node);
-  return node;
-}
-
-async function removeSocket(id) {
-  if (planState.viewMode) return;
-  await window.api.sockets.remove(id);
-  const node = planState.socketsById.get(id);
-  if (node) { node.destroy(); planState.socketsById.delete(id); }
-  if (planState.selectedNode === node) { planState.selectedNode = null; renderInspector(null); }
-  planState.layer.draw();
 }
 
 /** Начинает рисование кабеля с указанной точки (в клетках, дробные координаты —
@@ -2609,6 +2612,11 @@ function updateCablePreview(pointer) {
 /** Завершает рисование кабеля тем путём, что уже накопился — вызывается правым кликом
  *  по канве в режиме "Кабель" (см. stage.on('contextmenu', ...) в initPlan). Устройства
  *  на концах больше не обязательны: связь с сетью даёт не сам кабель, а сокеты на нём. */
+/** Завершает рисование кабеля тем путём, что уже накопился — вызывается правым кликом
+ *  по канве в режиме "Кабель" (см. stage.on('contextmenu', ...) в initPlan). Устройства
+ *  на концах больше не обязательны: связь с сетью даёт не сам кабель, а прямое
+ *  подключение к нему. Если draft.extendingCableId задан (режим "Продолжить из
+ *  последней точки") — дорисовывает СУЩЕСТВУЮЩИЙ кабель, а не создаёт новый. */
 async function finishCableDraft() {
   if (isLayerLocked(2)) { flashModeWarning('Слой "кабель-менеджмент" заблокирован'); return; }
   const draft = planState.cableDraft;
@@ -2616,12 +2624,17 @@ async function finishCableDraft() {
     flashModeWarning('Нужно минимум 2 точки — кликните ещё раз перед завершением');
     return;
   }
-  const cable = await window.api.cables.create({
-    floor_plan_id: planState.floorPlan.id,
-    cable_type: 'network',
-    path: draft.path
-  });
-  renderCable(cable);
+  if (draft.extendingCableId) {
+    const updated = await window.api.cables.updatePath(draft.extendingCableId, draft.path);
+    refreshCableVisual(draft.extendingCableId, updated);
+  } else {
+    const cable = await window.api.cables.create({
+      floor_plan_id: planState.floorPlan.id,
+      cable_type: 'network',
+      path: draft.path
+    });
+    renderCable(cable);
+  }
   cancelCableDraft();
 }
 
@@ -2636,11 +2649,8 @@ async function removeCable(id) {
   await window.api.cables.remove(id);
   const line = planState.cablesById.get(id);
   if (line) { line.destroy(); planState.cablesById.delete(id); }
-  // Сокеты этого кабеля удалятся каскадом на сервере (cable_sockets.cable_id ON DELETE CASCADE) —
-  // убираем и их визуальные метки с канвы
-  planState.socketsById.forEach((socketNode, socketId) => {
-    if (socketNode.getAttr('cableId') === id) { socketNode.destroy(); planState.socketsById.delete(socketId); }
-  });
+  // Подключения устройств к этому кабелю удалятся каскадом на сервере
+  // (cable_connections.cable_id ON DELETE CASCADE)
   if (planState.selectedNode === line) { planState.selectedNode = null; renderInspector(null); }
   planState.layer.draw();
 }
@@ -2940,11 +2950,6 @@ function handleStageClick(e) {
     return;
   }
 
-  if (planState.mode === 'socket') {
-    handleSocketToolClick(pointer.x / CELL_PX, pointer.y / CELL_PX);
-    return;
-  }
-
   if (e.target === planState.stage && planState.mode === 'desk') {
     placeNewItem(cellX, cellY);
   } else if (e.target === planState.stage) {
@@ -2999,19 +3004,6 @@ async function placeNewItem(x, y) {
 }
 
 /** Размещает устройство на плане в указанной клетке — вызывается из drop-обработчика кармана "Устройства" */
-/** Ближайший уже поставленный сокет к точке (в клетках) — используется при размещении
- *  устройства на плане: если попало рядом с сокетом, устройство сразу считается
- *  подключённым к сети этого кабеля. */
-function findNearestSocket(cellPoint) {
-  let best = null;
-  planState.socketsById.forEach((node, socketId) => {
-    const socket = node.getAttr('socketData');
-    const dist = Math.hypot(socket.x - cellPoint.x, socket.y - cellPoint.y);
-    if (!best || dist < best.dist) best = { socketId, dist };
-  });
-  return best;
-}
-
 async function placeDeviceItem(deviceId, x, y) {
   if (isLayerLocked(3)) { flashModeWarning('Слой "оборудование" заблокирован'); return; }
   const item = await window.api.planItems.create({
@@ -3028,10 +3020,12 @@ async function placeDeviceItem(deviceId, x, y) {
   item.device_flag = device?.flag;
   item.owner_status = device?.owner_status;
 
-  const nearestSocket = findNearestSocket({ x: x + 0.5, y: y + 0.5 });
-  if (nearestSocket && nearestSocket.dist <= DEVICE_SOCKET_ATTACH_THRESHOLD) {
-    await window.api.planItems.setSocket(item.id, nearestSocket.socketId);
-    item.socket_id = nearestSocket.socketId;
+  // Авто-подключение к ближайшему кабелю — только если реально попали в ту же клетку
+  // (порог 0.5 клетки), иначе тихо ничего не подключаем — в инспекторе всегда доступен
+  // явный выбор из всех кабелей этажа, дистанционный подбор тут лишь удобство при точном попадании
+  const nearestCable = findNearestCablePoint({ x: x + 0.5, y: y + 0.5 });
+  if (nearestCable && nearestCable.dist <= NEAREST_CABLE_THRESHOLD) {
+    await window.api.cableConnections.connect(item.id, nearestCable.cableId);
   }
 
   renderPointItem(item);
@@ -3049,7 +3043,6 @@ function bindPlanToolbar() {
     door: document.getElementById('mode-door'),
     stairs: document.getElementById('mode-stairs'),
     cable: document.getElementById('mode-cable'),
-    socket: document.getElementById('mode-socket'),
     delete: document.getElementById('mode-delete')
   };
   const cancelBtn = document.getElementById('mode-cancel');
@@ -3061,7 +3054,6 @@ function bindPlanToolbar() {
     door: 'клик рядом со стеной — дверь встроится в неё',
     stairs: 'клик — точка начала подъёма, ещё клик — направление (стрелка)',
     cable: 'клик — точки маршрута (по устройству или пустому месту); правый клик — завершить линию',
-    socket: 'клик рядом с уже нарисованным кабелем поставит на него точку подключения',
     delete: 'клик по элементу на плане удалит его'
   };
 
@@ -3796,70 +3788,19 @@ function renderInspector(node) {
       if (item.review_note) el.appendChild(field('⚠️ На проверку', item.review_note));
       if (item.device_ip) appendPingButton(el, item);
 
-      // Подключение к сокету — устройство на сокете становится частью сетевого сегмента
-      // этого кабеля (вкладка "Сеть"). Не обязательно: устройство может стоять и без сокета.
-      // Список — ВСЕ сокеты этажа, а не только ближайший: два устройства физически не могут
-      // стоять в одной клетке возле одного сокета, поэтому дистанционный автоподбор
-      // ненадёжен как единственный способ — здесь всегда доступен явный выбор.
-      const socketWrap = document.createElement('div');
-      socketWrap.className = 'inspector-field';
-      const socketLabel = document.createElement('label');
-      socketLabel.textContent = 'Подключение к сети (сокет)';
-      socketWrap.appendChild(socketLabel);
-
-      const socketSelect = document.createElement('select');
-      const noneOpt = document.createElement('option');
-      noneOpt.value = '';
-      noneOpt.textContent = '— не подключено —';
-      socketSelect.appendChild(noneOpt);
-      const deviceCenter = { x: item.x + 0.5, y: item.y + 0.5 };
-      [...planState.socketsById.values()]
-        .map((sNode) => sNode.getAttr('socketData'))
-        .map((socket) => ({ socket, dist: Math.hypot(socket.x - deviceCenter.x, socket.y - deviceCenter.y) }))
-        .sort((a, b) => a.dist - b.dist)
-        .forEach(({ socket, dist }) => {
-          const opt = document.createElement('option');
-          opt.value = socket.id;
-          opt.textContent = `Сокет №${socket.id} (кабель №${socket.cable_id}, ~${dist.toFixed(1)} кл.)`;
-          socketSelect.appendChild(opt);
-        });
-      socketSelect.value = item.socket_id || '';
-      socketSelect.title = 'Список отсортирован по расстоянию от устройства — ближайший сверху';
-      socketSelect.onchange = async () => {
-        const socketId = socketSelect.value ? Number(socketSelect.value) : null;
-        await window.api.planItems.setSocket(item.id, socketId);
-        item.socket_id = socketId;
-        node.setAttr('itemData', item);
-        renderInspector(node); // перерисовать — например, чтобы появился/исчез выбор роли для роутера
-      };
-      socketWrap.appendChild(socketSelect);
-      el.appendChild(socketWrap);
-
-      // Роль в сети — только осмысленна, если устройство реально на сокете (часть сегмента)
-      if ((item.device_type === 'router' || item.device_type === 'switch') && item.socket_id) {
-        const roleWrap = document.createElement('div');
-        roleWrap.className = 'inspector-field';
-        const roleLabel = document.createElement('label');
-        roleLabel.textContent = 'Роль в сети (если на сегменте несколько роутеров)';
-        const roleSelect = document.createElement('select');
-        [['', '— не задана —'], ['primary', 'Главный'], ['backup', 'Резервный'], ['satellite', 'Сателлит']]
-          .forEach(([value, text]) => {
-            const opt = document.createElement('option');
-            opt.value = value;
-            opt.textContent = text;
-            roleSelect.appendChild(opt);
-          });
-        roleSelect.value = item.network_role || '';
-        roleSelect.onchange = async () => {
-          const role = roleSelect.value || null;
-          await window.api.planItems.setNetworkRole(item.id, role);
-          item.network_role = role;
-          node.setAttr('itemData', item);
-        };
-        roleWrap.appendChild(roleLabel);
-        roleWrap.appendChild(roleSelect);
-        el.appendChild(roleWrap);
-      }
+      // Подключение к кабелю напрямую (без сокета) — устройство становится частью
+      // сетевого сегмента этого кабеля (вкладка "Сеть"). Роутер/свитч — многопортовые,
+      // остальные устройства — только один кабель разом (правило на бэкенде).
+      const cableConnWrap = document.createElement('div');
+      cableConnWrap.className = 'inspector-field';
+      const cableConnLabel = document.createElement('label');
+      cableConnLabel.textContent = 'Подключение к сети (кабель)';
+      cableConnWrap.appendChild(cableConnLabel);
+      const cableConnBody = document.createElement('div');
+      cableConnBody.textContent = 'Загрузка…';
+      cableConnWrap.appendChild(cableConnBody);
+      el.appendChild(cableConnWrap);
+      renderDeviceCableConnectionsSection(cableConnBody, item, node);
 
       if (item.device_type === 'router' || item.device_type === 'switch') {
         const pingConnectedBtn = document.createElement('button');
@@ -3973,8 +3914,26 @@ function renderInspector(node) {
     appendDeleteButton(el, () => removePlanItem(item.id));
   } else if (kind === 'cable') {
     const cable = node.getAttr('cableData');
-    el.appendChild(field('Тип', 'Сетевой кабель'));
-    el.appendChild(field('Точек маршрута', String(JSON.parse(cable.waypoints || '[]').length)));
+    const path = JSON.parse(cable.path || '[]');
+    el.appendChild(field('Кабель', `№${cable.id}`));
+    el.appendChild(field('Точек маршрута', String(path.length)));
+
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'inspector-field';
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = 'Имя (необязательно)';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.value = cable.label || '';
+    nameInput.placeholder = 'например, «Магистраль А»';
+    nameInput.onchange = async () => {
+      const updated = await window.api.cables.setLabel(cable.id, nameInput.value);
+      node.setAttr('cableData', updated);
+    };
+    nameWrap.appendChild(nameLabel);
+    nameWrap.appendChild(nameInput);
+    el.appendChild(nameWrap);
+
     appendDeleteButton(el, () => removeCable(cable.id));
   } else if (kind === 'zone') {
     renderZoneInspector(el, node);
@@ -4095,6 +4054,102 @@ function field(label, value) {
 // ------------------------------------------------------------
 // Инспектор устройства: история владения, комплектующие, периферия
 // ------------------------------------------------------------
+
+/** Список текущих подключений устройства к кабелям + форма добавления нового +
+ *  роль в сети (для роутера/свитча). Асинхронно, т.к. нужен IPC-запрос — используется
+ *  в инспекторе плана сразу после выделения точечного объекта типа "устройство". */
+async function renderDeviceCableConnectionsSection(container, item, node) {
+  const [connections, allCables] = await Promise.all([
+    window.api.cableConnections.listByPlanItem(item.id),
+    window.api.cables.list(planState.floorPlan.id)
+  ]);
+  container.innerHTML = '';
+
+  const cableLabelText = (cable) => `Кабель №${cable.id}${cable.label ? ` (${cable.label})` : ''}`;
+
+  if (connections.length === 0) {
+    container.appendChild(smallListNote('Не подключено'));
+  } else {
+    const ul = document.createElement('ul');
+    ul.className = 'mini-list';
+    connections.forEach((conn) => {
+      const cable = allCables.find((c) => c.id === conn.cable_id);
+      const li = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = cable ? cableLabelText(cable) : `Кабель №${conn.cable_id}`;
+      li.appendChild(label);
+      const disconnectBtn = document.createElement('button');
+      disconnectBtn.textContent = 'Отключить';
+      disconnectBtn.onclick = async () => {
+        await window.api.cableConnections.disconnect(item.id, conn.cable_id);
+        renderInspector(node);
+      };
+      li.appendChild(disconnectBtn);
+      ul.appendChild(li);
+    });
+    container.appendChild(ul);
+  }
+
+  // Форма добавления — только кабели, к которым ЕЩЁ не подключены; ближайший к
+  // устройству — сверху списка, для удобства выбора
+  const connectedIds = new Set(connections.map((c) => c.cable_id));
+  const available = allCables.filter((c) => !connectedIds.has(c.id));
+  if (available.length > 0) {
+    const deviceCenter = { x: item.x + 0.5, y: item.y + 0.5 };
+    const addForm = document.createElement('div');
+    addForm.className = 'inspector-add-form';
+    const select = document.createElement('select');
+    available
+      .map((c) => {
+        const path = JSON.parse(c.path || '[]');
+        const dist = path.length === 0 ? Infinity : Math.min(...path.map((p) => Math.hypot(p.x - deviceCenter.x, p.y - deviceCenter.y)));
+        return { c, dist };
+      })
+      .sort((a, b) => a.dist - b.dist)
+      .forEach(({ c }) => {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = cableLabelText(c);
+        select.appendChild(opt);
+      });
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '🔌 Подключить';
+    addBtn.title = 'Роутер/свитч — можно подключить сразу к нескольким кабелям; остальные устройства — только к одному, старое подключение снимется само';
+    addBtn.onclick = async () => {
+      await window.api.cableConnections.connect(item.id, Number(select.value));
+      renderInspector(node);
+    };
+    addForm.appendChild(select);
+    addForm.appendChild(addBtn);
+    container.appendChild(addForm);
+  }
+
+  // Роль в сети — только для роутера/свитча, только если реально подключён хотя бы к одному кабелю
+  if ((item.device_type === 'router' || item.device_type === 'switch') && connections.length > 0) {
+    const roleWrap = document.createElement('div');
+    roleWrap.className = 'inspector-field';
+    const roleLabel = document.createElement('label');
+    roleLabel.textContent = 'Роль в сети (если на сегменте несколько роутеров)';
+    const roleSelect = document.createElement('select');
+    [['', '— не задана —'], ['primary', 'Главный'], ['backup', 'Резервный'], ['satellite', 'Сателлит']]
+      .forEach(([value, text]) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = text;
+        roleSelect.appendChild(opt);
+      });
+    roleSelect.value = item.network_role || '';
+    roleSelect.onchange = async () => {
+      const role = roleSelect.value || null;
+      await window.api.planItems.setNetworkRole(item.id, role);
+      item.network_role = role;
+      node.setAttr('itemData', item);
+    };
+    roleWrap.appendChild(roleLabel);
+    roleWrap.appendChild(roleSelect);
+    container.appendChild(roleWrap);
+  }
+}
 
 async function renderDeviceExtras(container, deviceId, onChanged = () => renderInspector(planState.selectedNode)) {
   const [history, components, peripherals, software, statusHistory] = await Promise.all([

@@ -1,6 +1,6 @@
 {
   "name": "network-map-app",
-  "version": "1.20.0",
+  "version": "1.21.0",
   "description": "Учёт компьютеров/устройств и планов размещения",
   "main": "src/main/index.js",
   "author": "",
@@ -11,6 +11,7 @@
     "start": "electron .",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
+    "build:win:portable": "electron-builder --win portable",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux"
   },
@@ -34,7 +35,7 @@
     "directories": {
       "output": "dist"
     },
-    "win": { "target": "nsis" },
+    "win": { "target": ["nsis", "portable"] },
     "mac": { "target": "dmg" },
     "linux": { "target": "AppImage" }
   }

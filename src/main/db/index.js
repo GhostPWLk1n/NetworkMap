@@ -7,7 +7,7 @@ let db;
 let currentDbPath = null;
 let lastConnectWarning = null; // строка предупреждения, если пришлось откатиться на локальную БД
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 
 function getDefaultDbPath() {
@@ -98,6 +98,7 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 10) migrateToV10();
   if (db.pragma('user_version', { simple: true }) < 11) migrateToV11();
   if (db.pragma('user_version', { simple: true }) < 12) migrateToV12();
+  if (db.pragma('user_version', { simple: true }) < 13) migrateToV13();
 }
 
 /**
@@ -479,6 +480,35 @@ function migrateToV12() {
   tx();
 }
 
+/**
+ * v12 -> v13: отказ от сокетов как отдельной сущности — устройство подключается
+ * напрямую к кабелю (условному сетевому пучку). Многие-ко-многим: многопортовый
+ * роутер/свитч может быть подключён к нескольким кабелям сразу, конечное устройство —
+ * только к одному (обеспечивается в коде репозитория, не ограничением схемы).
+ * Старые сокетные подключения НЕ переносятся — по явной договорённости, сеть на момент
+ * миграции ещё не была спроектирована всерьёз.
+ */
+function migrateToV13() {
+  console.log('[db] миграция схемы v12 -> v13 (кабель без сокетов — прямое подключение устройства к кабелю)');
+  const tx = db.transaction(() => {
+    db.exec(`DROP TABLE IF EXISTS cable_sockets;`);
+    db.exec(`ALTER TABLE plan_items DROP COLUMN socket_id;`);
+    db.exec(`
+      CREATE TABLE cable_connections (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          plan_item_id  INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+          cable_id      INTEGER NOT NULL REFERENCES cables(id) ON DELETE CASCADE,
+          created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(plan_item_id, cable_id)
+      );
+      CREATE INDEX idx_cable_connections_item ON cable_connections(plan_item_id);
+      CREATE INDEX idx_cable_connections_cable ON cable_connections(cable_id);
+    `);
+    db.pragma('user_version = 13');
+  });
+  tx();
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -770,12 +800,6 @@ const planItemsRepo = {
     getDb().prepare('UPDATE plan_items SET review_note = ? WHERE id = ?').run(clean, id);
     return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
   },
-  /** Подключает/отключает устройство от сокета на кабеле — socketId=null отключает.
-   *  Все устройства на сокетах одного кабеля образуют один сетевой сегмент. */
-  setSocket(id, socketId) {
-    getDb().prepare('UPDATE plan_items SET socket_id = ? WHERE id = ?').run(socketId, id);
-    return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
-  },
   /** Роль устройства (обычно роутера) в сети сегмента — если их несколько на одном
    *  кабеле, разграничивает Главный/Резервный/Сателлит. role=null снимает роль. */
   setNetworkRole(id, role) {
@@ -816,8 +840,13 @@ const cablesRepo = {
   listByPlan(floorPlanId) {
     return getDb().prepare('SELECT * FROM cables WHERE floor_plan_id = ?').all(floorPlanId);
   },
+  /** Один кабель по id, с floor_plan_id — нужен для перехода "найти на плане" из
+   *  вкладки "Сеть", где неизвестно заранее, на каком этаже находится кабель. */
+  get(id) {
+    return getDb().prepare('SELECT * FROM cables WHERE id = ?').get(id);
+  },
   /** from_item_id/to_item_id необязательны — кабель можно провести и без устройств на
-   *  концах (устройства подключаются через сокеты, см. socketsRepo). path — полный путь
+   *  концах (устройства подключаются напрямую к кабелю, см. cableConnectionsRepo). path — полный путь
    *  линии в клетках (точки редактирования); color назначается автоматически из палитры,
    *  если не передан явно. */
   create({ floor_plan_id, from_item_id = null, to_item_id = null, cable_type = 'network',
@@ -838,6 +867,13 @@ const cablesRepo = {
     getDb().prepare('UPDATE cables SET path = ? WHERE id = ?').run(JSON.stringify(path), id);
     return getDb().prepare('SELECT * FROM cables WHERE id = ?').get(id);
   },
+  /** Пользовательское имя кабеля — номер (#id) всегда автоматический, имя необязательно.
+   *  Отображение: "Кабель №42 (Магистраль А)". null/пусто снимает имя. */
+  setLabel(id, label) {
+    const clean = label && label.trim() ? label.trim() : null;
+    getDb().prepare('UPDATE cables SET label = ? WHERE id = ?').run(clean, id);
+    return getDb().prepare('SELECT * FROM cables WHERE id = ?').get(id);
+  },
   remove(id) {
     getDb().prepare('DELETE FROM cables WHERE id = ?').run(id);
     return { id };
@@ -849,25 +885,41 @@ const cablesRepo = {
 // одного кабеля образуют один сетевой сегмент (см. networkRepo.buildTree).
 // ------------------------------------------------------------
 
-const socketsRepo = {
-  /** Все сокеты на всех кабелях этажа одним запросом — удобно для отрисовки канвы */
+const cableConnectionsRepo = {
+  /** Все подключения на всех кабелях этажа одним запросом */
   listByPlan(floorPlanId) {
     return getDb().prepare(`
-      SELECT s.* FROM cable_sockets s JOIN cables c ON c.id = s.cable_id WHERE c.floor_plan_id = ?
+      SELECT cc.* FROM cable_connections cc JOIN cables c ON c.id = cc.cable_id WHERE c.floor_plan_id = ?
     `).all(floorPlanId);
   },
+  listByPlanItem(planItemId) {
+    return getDb().prepare('SELECT * FROM cable_connections WHERE plan_item_id = ?').all(planItemId);
+  },
   listByCable(cableId) {
-    return getDb().prepare('SELECT * FROM cable_sockets WHERE cable_id = ?').all(cableId);
+    return getDb().prepare('SELECT * FROM cable_connections WHERE cable_id = ?').all(cableId);
   },
-  create({ cable_id, x, y, label = null }) {
-    const info = getDb().prepare(
-      'INSERT INTO cable_sockets (cable_id, x, y, label) VALUES (?, ?, ?, ?)'
-    ).run(cable_id, x, y, label);
-    return getDb().prepare('SELECT * FROM cable_sockets WHERE id = ?').get(info.lastInsertRowid);
+  /** Подключает устройство к кабелю. Роутер/свитч — многопортовые: подключение
+   *  добавляется, не трогая уже существующие. Любое другое устройство — только один
+   *  кабель разом: предыдущее подключение автоматически снимается. */
+  connect(planItemId, cableId) {
+    const db = getDb();
+    const item = db.prepare(`
+      SELECT pi.id, d.device_type FROM plan_items pi JOIN devices d ON d.id = pi.ref_id WHERE pi.id = ?
+    `).get(planItemId);
+    const isMultiPort = item && (item.device_type === 'router' || item.device_type === 'switch');
+    if (!isMultiPort) {
+      db.prepare('DELETE FROM cable_connections WHERE plan_item_id = ?').run(planItemId);
+    }
+    db.prepare('INSERT OR IGNORE INTO cable_connections (plan_item_id, cable_id) VALUES (?, ?)').run(planItemId, cableId);
+    return cableConnectionsRepo.listByPlanItem(planItemId);
   },
-  remove(id) {
-    getDb().prepare('DELETE FROM cable_sockets WHERE id = ?').run(id);
-    return { id };
+  disconnect(planItemId, cableId) {
+    getDb().prepare('DELETE FROM cable_connections WHERE plan_item_id = ? AND cable_id = ?').run(planItemId, cableId);
+    return { planItemId, cableId };
+  },
+  disconnectAll(planItemId) {
+    getDb().prepare('DELETE FROM cable_connections WHERE plan_item_id = ?').run(planItemId);
+    return { planItemId };
   }
 };
 
@@ -1197,48 +1249,74 @@ const networkRepo = {
       ORDER BY hostname
     `).all();
   },
-  /** Строит дерево от заданного устройства. visited защищает от циклов
-   *  (в т.ч. случайно созданных вручную через uplink_device_id). */
-  buildTree(rootDeviceId, visited = new Set()) {
-    if (visited.has(rootDeviceId)) return null;
-    visited.add(rootDeviceId);
+  /** Строит дерево от заданного устройства. */
+  buildTree(rootDeviceId) {
+    return networkRepo._buildNode(rootDeviceId, new Set([rootDeviceId]));
+  },
+  /** Внутренний рекурсивный помощник. Важен ДВУХФАЗНЫЙ порядок обработки прямых пиров
+   *  (все на одном сегменте — общая шина, "линия" в терминах ТЗ): сначала ВСЕ прямые
+   *  пиры пемечаются visited и запоминаются, и только ПОТОМ для каждого достраивается
+   *  поддерево. Если делать это одним проходом (пометить и сразу рекурсировать), первый
+   *  пир успевает утащить второго себе в children раньше, чем внешний цикл до него
+   *  дойдёт — вместо трёх устройств рядом под общим свитчом получается цепочка
+   *  ПК1 -> ПК2 -> ПК3, как будто каждый подключён к предыдущему. */
+  _buildNode(deviceId, visited) {
     const db = getDb();
     const device = db.prepare(`
       SELECT d.*, dlp.status AS last_ping_status
       FROM devices d LEFT JOIN device_latest_ping dlp ON dlp.device_id = d.id
       WHERE d.id = ?
-    `).get(rootDeviceId);
+    `).get(deviceId);
     if (!device) return null;
 
-    const children = [];
+    // Кабели, к которым подключено это устройство (обычно один; у многопортовых
+    // роутеров/свитчей — может быть несколько сразу)
+    const myConnections = db.prepare(`
+      SELECT cc.cable_id, pi.network_role FROM cable_connections cc
+      JOIN plan_items pi ON pi.id = cc.plan_item_id
+      WHERE pi.ref_id = ? AND pi.item_type = 'device'
+    `).all(deviceId);
 
-    // 1) Сокетная связь — устройство подключено к сокету(ам) на кабеле; все устройства
-    //    на сокетах ТОГО ЖЕ кабеля образуют один сетевой сегмент (общая шина, а не цепочка)
-    const myPlacements = db.prepare(`
-      SELECT id, socket_id, network_role FROM plan_items
-      WHERE ref_id = ? AND item_type = 'device' AND socket_id IS NOT NULL
-    `).all(rootDeviceId);
-    myPlacements.forEach((placement) => {
-      const socket = db.prepare('SELECT * FROM cable_sockets WHERE id = ?').get(placement.socket_id);
-      if (!socket) return;
+    // Все уникальные пиры по ВСЕМ этим кабелям сразу — с указанием, через какой именно
+    // кабель нашлась связь (для подписи в дереве и перехода по клику на кабель)
+    const peerMap = new Map(); // device_id -> { cableId, cableLabel }
+    myConnections.forEach(({ cable_id }) => {
+      const cable = db.prepare('SELECT id, label FROM cables WHERE id = ?').get(cable_id);
+      if (!cable) return;
       const peers = db.prepare(`
-        SELECT pi.ref_id AS device_id FROM plan_items pi
-        JOIN cable_sockets s ON s.id = pi.socket_id
-        WHERE s.cable_id = ? AND pi.item_type = 'device' AND pi.ref_id != ?
-      `).all(socket.cable_id, rootDeviceId);
-      peers.forEach((peer) => {
-        if (!visited.has(peer.device_id)) {
-          const childNode = networkRepo.buildTree(peer.device_id, visited);
-          if (childNode) { childNode.via = 'socket'; children.push(childNode); }
-        }
+        SELECT DISTINCT pi.ref_id AS device_id FROM cable_connections cc
+        JOIN plan_items pi ON pi.id = cc.plan_item_id
+        WHERE cc.cable_id = ? AND pi.item_type = 'device' AND pi.ref_id != ?
+      `).all(cable_id, deviceId);
+      peers.forEach((p) => {
+        if (!peerMap.has(p.device_id)) peerMap.set(p.device_id, { cableId: cable.id, cableLabel: cable.label });
       });
     });
 
-    // 2) Ручные аплинки — устройства, которые указали ЭТОТ узел как свой аплинк
-    const uplinkChildren = db.prepare('SELECT id FROM devices WHERE uplink_device_id = ?').all(rootDeviceId);
+    // ФАЗА 1: сразу помечаем visited и запоминаем ВСЕХ прямых пиров — до рекурсии в любого
+    const freshPeers = [];
+    peerMap.forEach((info, peerId) => {
+      if (!visited.has(peerId)) { visited.add(peerId); freshPeers.push({ peerId, ...info }); }
+    });
+
+    const children = [];
+    // ФАЗА 2: теперь достраиваем поддерево каждого пира — они уже не смогут утащить
+    // друг друга (все прямые пиры этого сегмента уже отмечены visited)
+    freshPeers.forEach(({ peerId, cableId, cableLabel }) => {
+      const childNode = networkRepo._buildNode(peerId, visited);
+      if (childNode) {
+        childNode.via = 'cable';
+        childNode.via_cable_id = cableId;
+        childNode.via_cable_label = cableLabel;
+        children.push(childNode);
+      }
+    });
+
+    // Ручные аплинки — отдельный механизм (явная иерархия, не общий сегмент)
+    const uplinkChildren = db.prepare('SELECT id FROM devices WHERE uplink_device_id = ?').all(deviceId);
     uplinkChildren.forEach((row) => {
       if (!visited.has(row.id)) {
-        const childNode = networkRepo.buildTree(row.id, visited);
+        const childNode = networkRepo._buildNode(row.id, visited);
         if (childNode) { childNode.via = 'uplink'; children.push(childNode); }
       }
     });
@@ -1246,15 +1324,15 @@ const networkRepo = {
     return {
       id: device.id, hostname: device.hostname, device_type: device.device_type,
       status: device.status, flag: device.flag, last_ping_status: device.last_ping_status,
-      network_role: (myPlacements[0] && myPlacements[0].network_role) || null,
-      via: null, children
+      network_role: (myConnections[0] && myConnections[0].network_role) || null,
+      via: null, via_cable_id: null, via_cable_label: null, children
     };
   }
 };
 
 module.exports = {
   initDatabase, getDb, usersRepo, devicesRepo, pingRepo,
-  floorPlansRepo, planItemsRepo, cablesRepo, socketsRepo,
+  floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
   softwareRepo, warehouseRepo, zonesRepo, networkRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath

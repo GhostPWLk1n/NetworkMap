@@ -168,12 +168,11 @@ CREATE TABLE plan_items (
     label          TEXT,
     z_index        INTEGER NOT NULL DEFAULT 0,
     review_note    TEXT,   -- ручной комментарий "на проверку" — независим от пометок сущностей
-    socket_id      INTEGER REFERENCES cable_sockets(id) ON DELETE SET NULL,
-                    -- устройство "подключено" к сокету на кабеле — все устройства на сокетах
-                    -- одного кабеля образуют один сетевой сегмент (вкладка "Сеть")
     network_role   TEXT CHECK (network_role IN ('primary','backup','satellite'))
-                    -- роль устройства (обычно роутера) в сети сегмента, если на сегменте
-                    -- несколько роутеров — выбирается вручную
+                    -- роль устройства (обычно роутера) в сетевом сегменте кабеля, если на
+                    -- сегменте несколько роутеров — выбирается вручную. Подключение к
+                    -- кабелю само по себе — в отдельной таблице cable_connections
+                    -- (многие-ко-многим: многопортовый роутер может быть на нескольких)
 );
 
 CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
@@ -207,16 +206,23 @@ CREATE INDEX idx_cables_to ON cables(to_item_id);
 -- Сокеты на кабеле — точки, где устройство "подключается" к линии.
 -- Все устройства на сокетах одного кабеля образуют один сетевой сегмент.
 -- ------------------------------------------------------------
-CREATE TABLE cable_sockets (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    cable_id    INTEGER NOT NULL REFERENCES cables(id) ON DELETE CASCADE,
-    x           REAL NOT NULL,  -- координаты в клетках (могут быть дробными — сокет лежит на пути кабеля)
-    y           REAL NOT NULL,
-    label       TEXT,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+-- ------------------------------------------------------------
+-- Подключения устройств к кабелям — устройство подключается напрямую к кабелю
+-- (условному сетевому пучку), без промежуточного сокета. Многие-ко-многим:
+-- роутер/свитч может быть подключён к нескольким кабелям сразу (многопортовый),
+-- конечное устройство (ПК и т.п.) — только к одному (обеспечивается в коде,
+-- а не ограничением схемы, т.к. правило зависит от device_type).
+-- ------------------------------------------------------------
+CREATE TABLE cable_connections (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_item_id  INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+    cable_id      INTEGER NOT NULL REFERENCES cables(id) ON DELETE CASCADE,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(plan_item_id, cable_id)
 );
 
-CREATE INDEX idx_sockets_cable ON cable_sockets(cable_id);
+CREATE INDEX idx_cable_connections_item ON cable_connections(plan_item_id);
+CREATE INDEX idx_cable_connections_cable ON cable_connections(cable_id);
 
 -- ------------------------------------------------------------
 -- История владельцев устройства (кто и когда был закреплён/откреплён)

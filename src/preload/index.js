@@ -50,19 +50,21 @@ contextBridge.exposeInMainWorld('api', {
     findByDeviceRef: (deviceId) => ipcRenderer.invoke('planItems:findByDeviceRef', deviceId),
     listPlacedDeviceIds: () => ipcRenderer.invoke('planItems:listPlacedDeviceIds'),
     setReviewNote: (id, note) => ipcRenderer.invoke('planItems:setReviewNote', { id, note }),
-    setSocket: (id, socketId) => ipcRenderer.invoke('planItems:setSocket', { id, socketId }),
     setNetworkRole: (id, role) => ipcRenderer.invoke('planItems:setNetworkRole', { id, role })
   },
   cables: {
     list: (floorPlanId) => ipcRenderer.invoke('cables:list', floorPlanId),
+    get: (id) => ipcRenderer.invoke('cables:get', id),
     create: (payload) => ipcRenderer.invoke('cables:create', payload),
     updatePath: (id, path) => ipcRenderer.invoke('cables:updatePath', { id, path }),
+    setLabel: (id, label) => ipcRenderer.invoke('cables:setLabel', { id, label }),
     remove: (id) => ipcRenderer.invoke('cables:remove', id)
   },
-  sockets: {
-    listByPlan: (floorPlanId) => ipcRenderer.invoke('sockets:listByPlan', floorPlanId),
-    create: (payload) => ipcRenderer.invoke('sockets:create', payload),
-    remove: (id) => ipcRenderer.invoke('sockets:remove', id)
+  cableConnections: {
+    listByPlan: (floorPlanId) => ipcRenderer.invoke('cableConnections:listByPlan', floorPlanId),
+    listByPlanItem: (planItemId) => ipcRenderer.invoke('cableConnections:listByPlanItem', planItemId),
+    connect: (planItemId, cableId) => ipcRenderer.invoke('cableConnections:connect', { planItemId, cableId }),
+    disconnect: (planItemId, cableId) => ipcRenderer.invoke('cableConnections:disconnect', { planItemId, cableId })
   },
   ownership: {
     history: (deviceId) => ipcRenderer.invoke('ownership:history', deviceId),

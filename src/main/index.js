@@ -1,7 +1,7 @@
 const path = require('path');
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const {
-  initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, socketsRepo,
+  initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath
 } = require('./db');
@@ -71,19 +71,21 @@ function registerIpcHandlers() {
   ipcMain.handle('planItems:findByDeviceRef', (_event, deviceId) => planItemsRepo.findByDeviceRef(deviceId));
   ipcMain.handle('planItems:listPlacedDeviceIds', () => planItemsRepo.listPlacedDeviceIds());
   ipcMain.handle('planItems:setReviewNote', (_event, { id, note }) => planItemsRepo.setReviewNote(id, note));
-  ipcMain.handle('planItems:setSocket', (_event, { id, socketId }) => planItemsRepo.setSocket(id, socketId));
   ipcMain.handle('planItems:setNetworkRole', (_event, { id, role }) => planItemsRepo.setNetworkRole(id, role));
 
   // --- cables ---
   ipcMain.handle('cables:list', (_event, floorPlanId) => cablesRepo.listByPlan(floorPlanId));
+  ipcMain.handle('cables:get', (_event, id) => cablesRepo.get(id));
   ipcMain.handle('cables:create', (_event, payload) => cablesRepo.create(payload));
   ipcMain.handle('cables:updatePath', (_event, { id, path }) => cablesRepo.updatePath(id, path));
+  ipcMain.handle('cables:setLabel', (_event, { id, label }) => cablesRepo.setLabel(id, label));
   ipcMain.handle('cables:remove', (_event, id) => cablesRepo.remove(id));
 
-  // --- сокеты на кабеле ---
-  ipcMain.handle('sockets:listByPlan', (_event, floorPlanId) => socketsRepo.listByPlan(floorPlanId));
-  ipcMain.handle('sockets:create', (_event, payload) => socketsRepo.create(payload));
-  ipcMain.handle('sockets:remove', (_event, id) => socketsRepo.remove(id));
+  // --- подключения устройств к кабелям (многие-ко-многим; правило "один/несколько" внутри репозитория) ---
+  ipcMain.handle('cableConnections:listByPlan', (_event, floorPlanId) => cableConnectionsRepo.listByPlan(floorPlanId));
+  ipcMain.handle('cableConnections:listByPlanItem', (_event, planItemId) => cableConnectionsRepo.listByPlanItem(planItemId));
+  ipcMain.handle('cableConnections:connect', (_event, { planItemId, cableId }) => cableConnectionsRepo.connect(planItemId, cableId));
+  ipcMain.handle('cableConnections:disconnect', (_event, { planItemId, cableId }) => cableConnectionsRepo.disconnect(planItemId, cableId));
 
   // --- владение устройством (закрепление пользователя + история) ---
   ipcMain.handle('ownership:history', (_event, deviceId) => ownershipRepo.history(deviceId));
