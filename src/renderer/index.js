@@ -308,13 +308,14 @@ function showPcImportConflictModal(parsed, position, total) {
  *  по очереди через модалку (кроме случая, когда пользователь выбрал "для всех
  *  оставшихся" — тогда дальше решается автоматически по этой политике, без вопросов). */
 async function resolveAndApplyPcImports(parsedList) {
-  const summary = { created: 0, updated: 0, softwareAdded: 0, skipped: 0 };
+  const summary = { created: 0, updated: 0, softwareAdded: 0, componentsAdded: 0, skipped: 0 };
   let bulkPolicy = null; // null | 'old' | 'new'
 
   const applyOne = async (p, fieldChoices) => {
     const r = await window.api.importPcInfo.apply(p, fieldChoices);
     if (r.isNew) summary.created++; else summary.updated++;
     summary.softwareAdded += r.softwareAdded;
+    summary.componentsAdded += r.componentsAdded;
   };
 
   const clean = parsedList.filter((p) => !p.hasConflicts);
@@ -811,7 +812,7 @@ function buildDeviceCard(d) {
     const applyResult = await window.api.importPcInfo.apply(parsed, fieldChoices);
     await renderDevices(); // полный перерендер с бэкенда — надёжнее, чем точечно патчить карточку
     applyDevicesFilter();
-    await alertModal(`Импортировано. Установленного ПО добавлено: ${applyResult.softwareAdded}.`);
+    await alertModal(`Импортировано. Установленного ПО добавлено: ${applyResult.softwareAdded}. Комплектующих добавлено: ${applyResult.componentsAdded}.`);
   };
   const pingBtn = document.createElement('button');
   pingBtn.type = 'button';
@@ -1041,7 +1042,7 @@ document.getElementById('import-pc-info-folder-btn').addEventListener('click', a
     status.textContent = `Разобрано ${batch.results.length} файлов${batch.errors.length ? `, ошибок: ${batch.errors.length}` : ''}. Применяю…`;
     const summary = await resolveAndApplyPcImports(batch.results);
 
-    const parts = [`создано ${summary.created}`, `обновлено ${summary.updated}`, `ПО добавлено ${summary.softwareAdded}`];
+    const parts = [`создано ${summary.created}`, `обновлено ${summary.updated}`, `ПО добавлено ${summary.softwareAdded}`, `комплектующих добавлено ${summary.componentsAdded}`];
     if (summary.skipped) parts.push(`пропущено ${summary.skipped}`);
     status.textContent = `Готово: ${parts.join(', ')}.`;
 
@@ -2213,6 +2214,14 @@ function renderPointItem(item) {
         }
       });
     }
+    items.push({
+      label: '⬆️ Поднять поверх всего', onClick: () => {
+        // Ручной способ решить визуальное перекрытие, если автоматическая логика слоёв
+        // почему-то не сработала — поднимает буквально на самый верх, в обход layerFor
+        group.moveToTop();
+        planState.layer.draw();
+      }
+    });
     showContextMenu(e.evt.clientX, e.evt.clientY, items);
   });
 
@@ -2228,6 +2237,7 @@ function renderPointItem(item) {
     data.x = cellX; data.y = cellY;
     group.setAttr('itemData', data);
     await window.api.planItems.move(item.id, cellX, cellY);
+    enforceLayerZOrder(group); // защитная мера — перетаскивание не должно ломать порядок слоёв
     if (planState.selectedNode === group) renderInspector(group);
     planState.layer.draw();
   });
@@ -2660,6 +2670,54 @@ function updateDeskPreview(pointer) {
 
 function clearDeskPreview() {
   if (planState.deskPreviewRect) { planState.deskPreviewRect.destroy(); planState.deskPreviewRect = null; planState.layer.draw(); }
+}
+
+/** Точка старта стены/лестницы под курсором — до первого клика, чтобы было видно,
+ *  куда именно снапнется начало линии (тот же паттерн, что и у стола/двери). */
+function updateLineStartPreview(pointer) {
+  const cellX = Math.round(pointer.x / CELL_PX);
+  const cellY = Math.round(pointer.y / CELL_PX);
+  const x = cellX * CELL_PX;
+  const y = cellY * CELL_PX;
+  if (!planState.lineStartPreviewDot) {
+    planState.lineStartPreviewDot = new Konva.Circle({
+      x, y, radius: 5, fill: '#333', opacity: 0.55, listening: false
+    });
+    planState.layer.add(planState.lineStartPreviewDot);
+  } else {
+    planState.lineStartPreviewDot.position({ x, y });
+  }
+  planState.layer.draw();
+}
+
+function clearLineStartPreview() {
+  if (planState.lineStartPreviewDot) { planState.lineStartPreviewDot.destroy(); planState.lineStartPreviewDot = null; planState.layer.draw(); }
+}
+
+/** Полупрозрачный контур клетки под курсором при перетаскивании чего-либо на план
+ *  (устройство/пользователь/склад/зона) — dataTransfer.getData() при dragover ненадёжен
+ *  почти во всех браузерах (отдаёт пустую строку до самого drop), поэтому превью общее,
+ *  без уточнения конкретного типа — просто "сюда попадёт", той же клетки, что и сам drop. */
+function updateDropTargetPreview(point) {
+  const cellX = Math.round(point.x / CELL_PX);
+  const cellY = Math.round(point.y / CELL_PX);
+  const x = cellX * CELL_PX + 2;
+  const y = cellY * CELL_PX + 2;
+  if (!planState.dropTargetPreviewRect) {
+    planState.dropTargetPreviewRect = new Konva.Rect({
+      x, y, width: CELL_PX - 4, height: CELL_PX - 4,
+      fill: '#4a90d9', opacity: 0.35, stroke: '#4a90d9', strokeWidth: 1.5,
+      cornerRadius: 4, listening: false
+    });
+    planState.layer.add(planState.dropTargetPreviewRect);
+  } else {
+    planState.dropTargetPreviewRect.position({ x, y });
+  }
+  planState.layer.draw();
+}
+
+function clearDropTargetPreview() {
+  if (planState.dropTargetPreviewRect) { planState.dropTargetPreviewRect.destroy(); planState.dropTargetPreviewRect = null; planState.layer.draw(); }
 }
 
 function flashModeWarning(msg) {
@@ -3286,11 +3344,28 @@ function handleStageMouseMove() {
   const pointer = planState.stage.getRelativePointerPosition();
   if (!pointer) return;
 
-  if (planState.pendingLine) updateLinePreview(pointer);
-  else if (planState.cableDraft) updateCablePreview(pointer);
-  else if (planState.mode === 'door') updateDoorPreview(pointer);
-  else if (planState.mode === 'desk') updateDeskPreview(pointer);
-  else clearDeskPreview();
+  if (planState.pendingLine) {
+    updateLinePreview(pointer);
+    clearLineStartPreview();
+  } else if (planState.cableDraft) {
+    updateCablePreview(pointer);
+  } else if (planState.mode === 'door') {
+    updateDoorPreview(pointer);
+    clearDeskPreview();
+    clearLineStartPreview();
+  } else if (planState.mode === 'desk') {
+    updateDeskPreview(pointer);
+    clearDoorPreview();
+    clearLineStartPreview();
+  } else if (planState.mode === 'wall' || planState.mode === 'stairs') {
+    updateLineStartPreview(pointer);
+    clearDeskPreview();
+    clearDoorPreview();
+  } else {
+    clearDeskPreview();
+    clearDoorPreview();
+    clearLineStartPreview();
+  }
 }
 
 async function deleteSelected() {
@@ -3391,6 +3466,7 @@ function bindPlanToolbar() {
     cancelCableDraft();
     clearDoorPreview();
     clearDeskPreview();
+    clearLineStartPreview();
   }
 
   Object.entries(buttons).forEach(([key, btn]) => {
@@ -3551,9 +3627,14 @@ function bindUserDragDrop() {
   container.addEventListener('dragover', (e) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
+    updateDropTargetPreview(clientToStagePoint(e.clientX, e.clientY));
+  });
+  container.addEventListener('dragleave', () => {
+    clearDropTargetPreview();
   });
   container.addEventListener('drop', async (e) => {
     e.preventDefault();
+    clearDropTargetPreview();
     if (planState.viewMode) { flashModeWarning('Режим просмотра — переключитесь на «✏️ Рисование», чтобы вносить изменения'); return; }
     let payload;
     try { payload = JSON.parse(e.dataTransfer.getData('application/json')); } catch { return; }

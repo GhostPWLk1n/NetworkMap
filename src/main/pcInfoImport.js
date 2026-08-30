@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { getDb, devicesRepo, softwareRepo } = require('./db');
+const { getDb, devicesRepo, softwareRepo, componentsRepo } = require('./db');
 
 /**
  * Импорт сведений о ПК из JSON-файлов, собранных scripts/collect-pc-info.ps1.
@@ -65,8 +65,32 @@ function parsePcInfoFile(filePath, forceDeviceId = null) {
   const sys = hw.System || {};
   const processors = asArray(hw.Processor);
   const disks = asArray(hw.Disks);
+  const memoryModules = asArray(hw.MemoryModules);
+  const videoControllers = asArray(hw.Video);
   const networkAdapters = asArray(data.Network);
   const softwareList = asArray(data.Software);
+
+  // Комплектующие отдельными позициями (для device_components) — планки памяти,
+  // диски, видеокарты. Отдельно от newValues.ram/disk (те — просто текстовая сводка
+  // в самой карточке устройства, эти — самостоятельный инвентарь со своей историей).
+  const components = [];
+  memoryModules.forEach((m) => {
+    if (!m.Size_GB) return;
+    const parts = [`RAM ${Math.round(m.Size_GB)} GB`];
+    if (m.Speed_MHz) parts.push(`${m.Speed_MHz} MHz`);
+    if (m.Manufacturer) parts.push(m.Manufacturer);
+    components.push({ type: 'ram', description: parts.join(', ') });
+  });
+  disks.forEach((d) => {
+    if (!d.Model) return;
+    components.push({ type: 'disk', description: `${d.Model}${d.Size_GB ? ` (${Math.round(d.Size_GB)} GB)` : ''}` });
+  });
+  videoControllers.forEach((v) => {
+    if (!v.Name) return;
+    const parts = [v.Name];
+    if (v.Memory_MB) parts.push(`${Math.round(v.Memory_MB / 1024)} GB VRAM`);
+    components.push({ type: 'gpu', description: parts.join(', ') });
+  });
 
   // Основной адаптер — тот, у которого есть шлюз по умолчанию (интернет-facing),
   // иначе первый попавшийся с известным IP
@@ -102,6 +126,7 @@ function parsePcInfoFile(filePath, forceDeviceId = null) {
     model: sys.Model || null,
     serialNumber: sys.SerialNumber || null,
     software: softwareList.filter((s) => s && s.Name).map((s) => ({ name: s.Name, version: s.Version || null, publisher: s.Publisher || null })),
+    components,
     fields,
     hasConflicts: fields.some((f) => f.conflict)
   };
@@ -198,7 +223,38 @@ function applyPcInfoImport(parsed, fieldChoices = {}) {
     softwareAdded++;
   });
 
-  return { device, isNew: parsed.isNew, softwareAdded };
+  // Комплектующие — "количественная" защита от дублей: считаем, сколько уже есть
+  // каждой позиции (по типу+описанию) СРЕДИ УЖЕ СУЩЕСТВУЮЩИХ, и на каждую совпадающую
+  // из файла гасим по одной из этого счётчика. Если в файле пришло БОЛЬШЕ одинаковых
+  // позиций, чем уже в базе (например, две одинаковые планки памяти — обычный случай
+  // для парных комплектов), лишние всё равно добавляются, а не считаются дублями.
+  // Простая булева проверка "видели ли мы такое описание" этого не различала бы —
+  // словила бы вторую одинаковую планку как дубль первой уже при самом первом импорте.
+  const existingComponentCounts = new Map();
+  db.prepare('SELECT component_type, description FROM device_components WHERE device_id = ? AND detached_at IS NULL')
+    .all(device.id).forEach((r) => {
+      const key = `${r.component_type}::${r.description.toLowerCase()}`;
+      existingComponentCounts.set(key, (existingComponentCounts.get(key) || 0) + 1);
+    });
+  let componentsAdded = 0;
+  (parsed.components || []).forEach((c) => {
+    if (!c.description) return;
+    const key = `${c.type}::${c.description.toLowerCase()}`;
+    const remaining = existingComponentCounts.get(key) || 0;
+    if (remaining > 0) {
+      existingComponentCounts.set(key, remaining - 1); // уже есть такая же — считаем её "той же", не дублируем
+      return;
+    }
+    componentsRepo.add({
+      device_id: device.id,
+      component_type: c.type,
+      description: c.description,
+      note: 'импортировано из JSON'
+    });
+    componentsAdded++;
+  });
+
+  return { device, isNew: parsed.isNew, softwareAdded, componentsAdded };
 }
 
 module.exports = { parsePcInfoFile, parsePcInfoFolder, applyPcInfoImport, classifySoftwareType };

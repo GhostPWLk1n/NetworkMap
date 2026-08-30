@@ -106,6 +106,22 @@ $systemInfo = [PSCustomObject]@{
                 Interface = $_.InterfaceType
             }
         })
+        # Отдельные планки памяти — каждая своей позицией в "Комплектующих" при импорте
+        MemoryModules = @(Get-WmiObject -Class Win32_PhysicalMemory | ForEach-Object {
+            [PSCustomObject]@{
+                Size_GB      = [math]::Round($_.Capacity / 1GB, 2)
+                Speed_MHz    = $_.Speed
+                Manufacturer = $_.Manufacturer
+            }
+        })
+        # Видеокарта(ы) — тоже отдельной позицией; исключаем виртуальные/удалённые адаптеры
+        Video = @(Get-WmiObject -Class Win32_VideoController | Where-Object { $_.Name -notlike "*Remote*" } | ForEach-Object {
+            [PSCustomObject]@{
+                Name          = $_.Name
+                Memory_MB     = if ($_.AdapterRAM) { [math]::Round($_.AdapterRAM / 1MB, 0) } else { $null }
+                DriverVersion = $_.DriverVersion
+            }
+        })
     }
     Network  = $networkAdapters
     Software = $software
