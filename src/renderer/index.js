@@ -2719,7 +2719,7 @@ async function finalizeStairs(x, y, x2, y2) {
 function clearPendingLine() {
   planState.pendingLine = null;
   if (planState.previewLine) { planState.previewLine.destroy(); planState.previewLine = null; }
-  planState.layer.draw();
+  if (planState.layer) planState.layer.draw();
 }
 
 function updateLinePreview(pointer) {
@@ -3187,7 +3187,7 @@ async function finishCableDraft() {
 function cancelCableDraft() {
   planState.cableDraft = null;
   if (planState.cablePreviewLine) { planState.cablePreviewLine.destroy(); planState.cablePreviewLine = null; }
-  planState.layer.draw();
+  if (planState.layer) planState.layer.draw();
 }
 
 async function removeCable(id) {
@@ -4066,17 +4066,22 @@ function bindModeSwitch() {
     planState.viewMode = !planState.viewMode;
     updateModeSwitchUI();
   });
-  updateModeSwitchUI(); // выставляем подпись кнопки сразу при старте
+  // initial=true — при самой первой привязке канва (planState.layer) ещё не создана
+  // (buildStageForCurrentFloor выполнится позже в initPlan), поэтому чистить инструменты
+  // здесь физически нечего и не из чего — попытка это сделать падала с "Cannot read
+  // properties of null (reading 'draw')" именно в клиентском режиме, где planState.viewMode
+  // уже true к этому моменту (выставляется до initPlan, см. startup-код).
+  updateModeSwitchUI(true);
 }
 
-function updateModeSwitchUI() {
+function updateModeSwitchUI(initial = false) {
   const btn = document.getElementById('mode-switch-btn');
   const toolsAside = document.getElementById('plan-tools');
   if (planState.viewMode) {
     btn.textContent = '🔒 Просмотр';
     btn.classList.add('view-mode');
     toolsAside.classList.add('view-mode-locked');
-    if (planState.setToolMode) planState.setToolMode(null); // текущий инструмент всё равно недоступен
+    if (!initial && planState.setToolMode) planState.setToolMode(null); // текущий инструмент всё равно недоступен
   } else {
     btn.textContent = '✏️ Рисование';
     btn.classList.remove('view-mode');
@@ -5500,29 +5505,61 @@ async function refreshDbSettingsInfo() {
 
   const sharedStatusEl = document.getElementById('db-shared-access-status');
   sharedStatusEl.classList.remove('is-host', 'is-client');
+  const clientsEl = document.getElementById('db-connected-clients');
   if (info.mode === 'host') {
     sharedStatusEl.textContent = `🖧 Вы — хост. Порт ${info.hostPort}. Остальные подключаются по вашему IP-адресу и этому порту.`;
     sharedStatusEl.classList.add('is-host');
+    await refreshConnectedClients();
   } else if (info.mode === 'client') {
     sharedStatusEl.textContent = `🔌 Вы подключены как клиент к ${info.remoteHost} — только просмотр.`;
     sharedStatusEl.classList.add('is-client');
+    clientsEl.classList.add('hidden');
   } else {
     sharedStatusEl.textContent = 'Обычный режим — БД открыта только этим приложением.';
+    clientsEl.classList.add('hidden');
   }
 
   return info;
 }
 
+/** Живой список подключённых клиентов — раньше хост формально их не видел, только
+ *  раздавал данные по запросу. Каждый пинг клиента (см. heartbeat в main/index.js)
+ *  обновляет список на стороне хоста; здесь просто читаем текущее состояние. */
+async function refreshConnectedClients() {
+  const clientsEl = document.getElementById('db-connected-clients');
+  const clients = await window.api.settings.getConnectedClients();
+  if (clients.length === 0) {
+    clientsEl.textContent = '👥 Подключённых клиентов нет.';
+  } else {
+    clientsEl.innerHTML = `👥 Подключено (${clients.length}):`;
+    const ul = document.createElement('ul');
+    clients.forEach((c) => {
+      const li = document.createElement('li');
+      li.textContent = `${c.hostname} — виден ${c.secondsAgo} сек назад`;
+      ul.appendChild(li);
+    });
+    clientsEl.appendChild(ul);
+  }
+  clientsEl.classList.remove('hidden');
+}
+
 function bindDbSettingsModal() {
   const overlay = document.getElementById('db-settings-modal');
   const statusNote = document.getElementById('db-status-note');
+  let clientsRefreshTimer = null;
 
   document.getElementById('db-settings-btn').addEventListener('click', async () => {
     statusNote.textContent = '';
-    await refreshDbSettingsInfo();
+    const info = await refreshDbSettingsInfo();
     overlay.classList.remove('hidden');
+    if (info.mode === 'host') {
+      clientsRefreshTimer = setInterval(refreshConnectedClients, 5000); // список живой, пока модалка открыта
+    }
   });
-  document.getElementById('db-settings-close').addEventListener('click', () => overlay.classList.add('hidden'));
+  document.getElementById('db-settings-close').addEventListener('click', () => {
+    overlay.classList.add('hidden');
+    if (clientsRefreshTimer) { clearInterval(clientsRefreshTimer); clientsRefreshTimer = null; }
+  });
 
   async function connectAndRelaunch(filePath, confirmText) {
     if (confirmText && !(await confirmModal(confirmText))) return;
@@ -5635,6 +5672,7 @@ function showToast(message, type = 'error', durationMs = 5000) {
     toast.classList.add('toast-fading');
     setTimeout(() => toast.remove(), 300);
   }, durationMs);
+  return toast;
 }
 
 /** Обновляет баннер "только просмотр" под актуальный статус связи с хостом —
@@ -5717,6 +5755,37 @@ window.addEventListener('api-error', (e) => {
       if (now - lastStaleCacheToastAt < 4000) return;
       lastStaleCacheToastAt = now;
       showToast('📦 Показаны сохранённые ранее данные — сети нет', 'warning', 6000);
+    });
+
+    // Кто-то ДРУГОЙ (хост) что-то изменил, пока мы подключены как клиент — переиспользует
+    // уже существующий журнал изменений (audit_log) вместо отдельного механизма
+    // уведомлений: heartbeat в main/index.js периодически проверяет новые записи и
+    // присылает их сюда. Списки на других вкладках обновляем в фоне сразу (дёшево —
+    // просто перерисовка DOM карточек), план — только карманы автоматически, саму канву
+    // не трогаем без явного согласия пользователя (не хотим сбросить выделение, зум
+    // или незавершённое рисование посреди работы одним неожиданным сообщением с хоста).
+    window.api.events.onDataChanged((changes) => {
+      if (!changes || changes.length === 0) return;
+      renderUsers();
+      renderDevices();
+      renderWarehouse();
+      renderSoftwareRegistry();
+      const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
+      if (activeTab === 'network') renderNetworkTab();
+      if (activeTab === 'audit') loadAuditLog();
+      if (isPlanTabActive()) { fillDevicePicker(); fillUserDragList(); fillWarehouseDragList(); }
+
+      const summaryText = changes.length === 1
+        ? changes[0].summary
+        : `${changes.length} изменени${changes.length < 5 ? 'я' : 'й'}: ${changes[changes.length - 1].summary}`;
+      const toast = showToast(`🔄 ${summaryText}`, 'success', 9000);
+      if (isPlanTabActive() && toast) {
+        const refreshBtn = document.createElement('button');
+        refreshBtn.type = 'button';
+        refreshBtn.textContent = 'Обновить план';
+        refreshBtn.onclick = async () => { closeGroupPanel(); await buildStageForCurrentFloor(); };
+        toast.appendChild(refreshBtn);
+      }
     });
   }
 

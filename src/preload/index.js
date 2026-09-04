@@ -28,7 +28,8 @@ contextBridge.exposeInMainWorld('api', {
     resetDb: () => invoke('settings:resetDb'),
     setHostMode: (dbPath, hostPort, discoveryPath) => invoke('settings:setHostMode', { dbPath, hostPort, discoveryPath }),
     setClientMode: (remoteHost) => invoke('settings:setClientMode', remoteHost),
-    pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost)
+    pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost),
+    getConnectedClients: () => invoke('settings:getConnectedClients')
   },
   users: {
     list: () => invoke('users:list'),
@@ -163,6 +164,12 @@ contextBridge.exposeInMainWorld('api', {
      *  был успешный ответ на этот же запрос) — см. localCache.js. */
     onUsingStaleCache: (callback) => {
       ipcRenderer.on('using-stale-cache', (_event, data) => callback(data));
+    },
+    /** callback(changes) — массив новых записей audit_log с хоста (см. startClientHeartbeat
+     *  в main/index.js) — приходит, когда кто-то ДРУГОЙ (сам хост) что-то изменил, пока
+     *  этот клиент был подключён. Только для режима "клиент". */
+    onDataChanged: (callback) => {
+      ipcRenderer.on('data-changed', (_event, changes) => callback(changes));
     }
   }
 });

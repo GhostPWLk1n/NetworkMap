@@ -1,5 +1,7 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 const { fork } = require('child_process');
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const {
@@ -21,6 +23,15 @@ let rpcServerInstance = null; // держим ссылку, чтобы можн�
 let discoveryHeartbeatTimer = null;
 let ownMarkerPath = null; // путь к СВОЕМУ файлу-маячку (см. discovery.js) — heartbeat/удаление трогают только его
 let connectivityHeartbeatTimer = null; // клиентский режим — периодическая проверка связи с хостом
+// Клиентский режим: собственный id этого инстанса (на всю сессию, не хранится между
+// перезапусками — при следующем запуске сгенерируется новый) — чтобы хост видел, что
+// это тот же самый клиент, а не новый, если несколько раз пинганёт за одну сессию.
+const clientInstanceId = crypto.randomUUID();
+let lastKnownAuditId = null; // с какого id отслеживаем новые записи журнала — сбрасывается при (пере)подключении
+// Режим "хост": кто сейчас пингует — clientId -> { hostname, lastSeenAt }. Без этого
+// хост формально не видел подключённых клиентов, только раздавал им данные по запросу.
+const connectedClients = new Map();
+const CLIENT_STALE_AFTER_MS = 25000; // не пинговал дольше — считаем отключившимся (heartbeat клиента — раз в 10с)
 let hostReachable = true; // актуально только в режиме "клиент"
 // Сообщение о том, что произошло при подключении на старте (например, "хост недоступен,
 // показаны сохранённые данные") — раньше показывалось через dialog.showErrorBox() ДО
@@ -156,7 +167,9 @@ const RPC_HANDLERS = {
   'network:listRoots': { write: false, fn: () => networkRepo.listRoots() },
   'network:buildTree': { write: false, fn: (rootDeviceId) => networkRepo.buildTree(rootDeviceId) },
 
-  'auditLog:list': { write: false, fn: (filters) => auditLogRepo.list(filters) }
+  'auditLog:list': { write: false, fn: (filters) => auditLogRepo.list(filters) },
+  'auditLog:listSince': { write: false, fn: (sinceId) => auditLogRepo.listSince(sinceId) },
+  'auditLog:latestId': { write: false, fn: () => auditLogRepo.latestId() }
 };
 
 const CLIENT_MODE_IMPORT_ERROR = 'Импорт недоступен в режиме клиента — выполните его на компьютере-хосте, у которого есть прямой доступ к базе.';
@@ -355,6 +368,21 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('settings:pingRemoteHost', (_event, remoteHost) => rpcPing(remoteHost, 5000));
+
+  // Список подключённых клиентов — только для собственного UI хоста (не для сети,
+  // поэтому не в RPC_HANDLERS). Раньше хост формально не видел, кто к нему подключён,
+  // только раздавал данные по запросу; теперь каждый пинг клиента (см. rpcClient.js/
+  // rpcServer.js) обновляет connectedClients, а протухшие (давно не пинговали — скорее
+  // всего, клиент закрыт) записи чистятся тут же, при каждом запросе списка.
+  ipcMain.handle('settings:getConnectedClients', () => {
+    const now = Date.now();
+    for (const [id, info] of connectedClients) {
+      if (now - info.lastSeenAt > CLIENT_STALE_AFTER_MS) connectedClients.delete(id);
+    }
+    return [...connectedClients.values()]
+      .map((info) => ({ hostname: info.hostname, secondsAgo: Math.round((now - info.lastSeenAt) / 1000) }))
+      .sort((a, b) => a.hostname.localeCompare(b.hostname));
+  });
 }
 
 /** Пробует открыть БД по сконфигурированному пути в ОТДЕЛЬНОМ процессе с жёстким
@@ -365,6 +393,46 @@ function registerIpcHandlers() {
  *  процесса — поэтому рискованная часть подключения выполняется в одноразовом,
  *  убиваемом снаружи дочернем процессе (см. db-probe.js), а не в основном процессе
  *  Electron, который иначе завис бы насмерть вместе со всем интерфейсом. */
+/** Периодическая проверка связи с хостом (раз в 10 секунд) — единая функция вместо
+ *  двух ранее дублировавшихся мест (offline-with-cache и обычное подключение). Помимо
+ *  самой связи (см. host-connectivity-changed, было и раньше) теперь ещё:
+ *  1) пингует с идентификацией клиента (clientId/hostname) — хост так узнаёт, кто
+ *     подключён, см. connectedClients и onClientPing в startRpcServer;
+ *  2) пока хост доступен, на каждом тике проверяет журнал (audit_log) на новые записи
+ *     с последнего раза и рассылает их в интерфейс событием 'data-changed' — переиспользует
+ *     уже существующий журнал изменений вместо отдельного механизма уведомлений. */
+function startClientHeartbeat(remoteHost) {
+  if (connectivityHeartbeatTimer) clearInterval(connectivityHeartbeatTimer);
+  connectivityHeartbeatTimer = setInterval(async () => {
+    const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+    const stillAlive = await rpcPing(remoteHost, 5000, clientInfo);
+
+    if (stillAlive !== hostReachable) {
+      hostReachable = stillAlive;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('host-connectivity-changed', { reachable: hostReachable, remoteHost });
+      }
+      if (stillAlive) {
+        // Только что переподключились — начинаем отслеживать изменения ЗАНОВО с этой
+        // точки, а не заваливаем клиента всей историей за время отключения
+        try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 5000); } catch { /* попробуем на следующем тике */ }
+      }
+    }
+
+    if (stillAlive && lastKnownAuditId !== null) {
+      try {
+        const changes = await rpcCall(remoteHost, 'auditLog:listSince', lastKnownAuditId, 5000);
+        if (changes.length > 0) {
+          lastKnownAuditId = changes[changes.length - 1].id;
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('data-changed', changes);
+          }
+        }
+      } catch { /* сеть могла на миг подвести именно на этом запросе — попробуем на следующем тике */ }
+    }
+  }, 10000);
+}
+
 function probeDbConnection(userDataPath, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const child = fork(path.join(__dirname, 'db-probe.js'), [userDataPath], { stdio: 'ignore' });
@@ -404,7 +472,8 @@ app.whenReady().then(async () => {
     // штатный JS-таймаут внутри rpcPing вполне безопасен, child-процесс не нужен)
     initLocalCache(app.getPath('userData'));
     const remoteHost = getRemoteHost();
-    const alive = remoteHost ? await rpcPing(remoteHost, 6000) : false;
+    const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+    const alive = remoteHost ? await rpcPing(remoteHost, 6000, clientInfo) : false;
     if (!alive && hasAnyCache()) {
       // Хост недоступен ПРЯМО СЕЙЧАС, но раньше уже был доступен — есть что показать.
       // Раньше в этой ситуации откатывались на заведомо ПУСТУЮ локальную БД, будто
@@ -414,15 +483,7 @@ app.whenReady().then(async () => {
       startupNotice = `Не удалось связаться с хостом ${remoteHost} прямо сейчас. Показаны последние ` +
         'сохранённые данные (могут быть устаревшими) — приложение продолжит пытаться подключиться в фоне.';
       hostReachable = false;
-      connectivityHeartbeatTimer = setInterval(async () => {
-        const stillAlive = await rpcPing(remoteHost, 5000);
-        if (stillAlive !== hostReachable) {
-          hostReachable = stillAlive;
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('host-connectivity-changed', { reachable: hostReachable, remoteHost });
-          }
-        }
-      }, 10000);
+      startClientHeartbeat(remoteHost);
     } else if (!alive) {
       // Хост недоступен, и показать нечего (кэша ещё никогда не было — самый первый
       // запуск в режиме клиента застал хост уже недоступным) — только тогда откатываемся
@@ -433,20 +494,9 @@ app.whenReady().then(async () => {
       initDatabase();
     } else {
       // Хост жив — initDatabase() НЕ вызывается вообще, все запросы уйдут по сети.
-      // Запускаем периодическую проверку связи (heartbeat) — раньше проверка была
-      // только один раз на старте, и если хост пропадал посреди сессии, клиент
-      // узнавал об этом только на следующей попытке что-то сделать, без всякого
-      // предупреждения. Теперь при КАЖДОЙ смене статуса рассылаем событие в интерфейс.
       hostReachable = true;
-      connectivityHeartbeatTimer = setInterval(async () => {
-        const stillAlive = await rpcPing(remoteHost, 5000);
-        if (stillAlive !== hostReachable) {
-          hostReachable = stillAlive;
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('host-connectivity-changed', { reachable: hostReachable, remoteHost });
-          }
-        }
-      }, 10000);
+      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 6000); } catch { /* не критично — просто начнём отслеживать со следующего тика */ }
+      startClientHeartbeat(remoteHost);
     }
   } else {
     const configuredPath = getConfiguredDbPath();
@@ -467,7 +517,9 @@ app.whenReady().then(async () => {
 
     if (mode === 'host') {
       try {
-        rpcServerInstance = await startRpcServer(getHostPort(), RPC_HANDLERS);
+        rpcServerInstance = await startRpcServer(getHostPort(), RPC_HANDLERS, (clientId, hostname) => {
+          connectedClients.set(clientId, { hostname, lastSeenAt: Date.now() });
+        });
 
         const discoveryPath = getDiscoveryPath();
         if (discoveryPath) {

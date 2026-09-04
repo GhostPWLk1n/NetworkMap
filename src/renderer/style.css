@@ -596,6 +596,10 @@ body {
 }
 .db-shared-status.is-host { background: #e3f6e5; color: #1e6b2b; }
 .db-shared-status.is-client { background: #fff3cd; color: #8a6200; }
+#db-connected-clients { font-size: 12px; margin: -4px 0 10px; padding: 6px 10px; background: #f7f7f7; border-radius: 6px; }
+#db-connected-clients.hidden { display: none; }
+#db-connected-clients ul { list-style: none; margin: 4px 0 0; padding: 0; }
+#db-connected-clients li { padding: 2px 0; color: #555; }
 .db-shared-columns { display: flex; gap: 12px; margin-bottom: 6px; }
 .db-shared-column { flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .db-shared-column-title { font-size: 12px; font-weight: 600; color: #555; }

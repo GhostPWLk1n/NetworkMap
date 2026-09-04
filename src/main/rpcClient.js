@@ -61,13 +61,20 @@ function attemptRpcCall(remoteHost, channel, payload, timeoutMs, isRetry) {
 }
 
 /** Быстрая проверка "жив ли хост" — используется при подключении и периодически для
- *  индикатора соединения в интерфейсе, без похода в саму БД. */
-function rpcPing(remoteHost, timeoutMs = 5000) {
+ *  индикатора соединения в интерфейсе, без похода в саму БД. clientInfo (необязательно)
+ *  — { clientId, hostname }: если передан, хост узнаёт о факте подключения этого клиента
+ *  (см. onClientPing в rpcServer.js) — без этого хост "не видит" клиентов формально. */
+function rpcPing(remoteHost, timeoutMs = 5000, clientInfo = null) {
   return new Promise((resolve) => {
     const [hostname, portStr] = remoteHost.split(':');
     const port = Number(portStr) || 80;
+    let path = '/ping';
+    if (clientInfo && clientInfo.clientId) {
+      const params = new URLSearchParams({ clientId: clientInfo.clientId, hostname: clientInfo.hostname || clientInfo.clientId });
+      path = `/ping?${params.toString()}`;
+    }
 
-    const req = http.request({ hostname, port, path: '/ping', method: 'GET', timeout: timeoutMs }, (res) => {
+    const req = http.request({ hostname, port, path, method: 'GET', timeout: timeoutMs }, (res) => {
       resolve(res.statusCode === 200);
       res.resume(); // сливаем тело ответа, чтобы не держать сокет
     });

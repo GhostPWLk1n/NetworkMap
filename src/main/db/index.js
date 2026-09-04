@@ -1795,6 +1795,19 @@ const auditLogRepo = {
   },
   count() {
     return getDb().prepare('SELECT COUNT(*) AS c FROM audit_log').get().c;
+  },
+  /** Записи с id > sinceId, старые сверху (хронологический порядок — клиент применяет
+   *  по порядку) — используется клиентским heartbeat для "что изменилось с прошлой
+   *  проверки", без сравнения меток времени (автоинкрементный id проще и надёжнее). */
+  listSince(sinceId = 0, limit = 200) {
+    return getDb().prepare(`
+      SELECT * FROM audit_log WHERE id > ? ORDER BY id ASC LIMIT ?
+    `).all(sinceId, limit);
+  },
+  /** Самый свежий id на момент вызова — чтобы клиент знал, с чего начинать отслеживание
+   *  (при первом подключении не нужно засыпать пользователя всей историей изменений). */
+  latestId() {
+    return getDb().prepare('SELECT COALESCE(MAX(id), 0) AS id FROM audit_log').get().id;
   }
 };
 

@@ -10,15 +10,29 @@
 // остальные подключаются к этому серверу как клиенты (см. rpcClient.js).
 
 const http = require('http');
+const { URL } = require('url');
 
 /** Запускает RPC-сервер на указанном порту. rpcHandlers — карта { [channel]: { fn, write } },
  *  та же самая, что main/index.js использует для локальных ipcMain.handle(). Слушает на
- *  0.0.0.0, чтобы быть доступным с других машин в локальной сети, не только с localhost. */
-function startRpcServer(port, rpcHandlers) {
+ *  0.0.0.0, чтобы быть доступным с других машин в локальной сети, не только с localhost.
+ *  onClientPing(clientId, hostname) — необязательный колбэк, вызывается на каждый /ping
+ *  с идентификацией клиента (см. rpcClient.js) — хост так узнаёт, кто сейчас подключён;
+ *  без этого колбэка хост "не видит" клиентов формально, только раздаёт им данные. */
+function startRpcServer(port, rpcHandlers, onClientPing) {
   const server = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/ping') {
+    if (req.method === 'GET' && req.url.startsWith('/ping')) {
       // Лёгкая проверка "жив ли хост" — используется клиентом для индикации соединения,
-      // без похода в саму БД
+      // без похода в саму БД. Заодно, если клиент представился (clientId/hostname в
+      // query), сообщаем об этом хосту через колбэк — так хост узнаёт о подключённых
+      // клиентах, не открывая отдельное состояние соединения (RPC остаётся stateless).
+      if (onClientPing) {
+        try {
+          const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+          const clientId = url.searchParams.get('clientId');
+          const hostname = url.searchParams.get('hostname');
+          if (clientId) onClientPing(clientId, hostname || clientId);
+        } catch { /* некорректный query — не критично, просто не узнаем, кто это был */ }
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
       return;
