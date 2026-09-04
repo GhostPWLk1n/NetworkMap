@@ -1105,13 +1105,24 @@ const planItemsRepo = {
     return item;
   },
   move(id, x, y) {
-    getDb().prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, id);
+    const db = getDb();
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    db.prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, id);
+    if (item && (item.x !== x || item.y !== y)) {
+      auditLogRepo.log('plan_item', id, 'update',
+        `${planItemLabelForLog(db, item)} перемещён(а) на плане: (${item.x},${item.y}) → (${x},${y})`);
+    }
     return { id, x, y };
   },
   /** Смена rotation без прочих полей — у двери используется для "Развернуть"/"Отразить" */
   setRotation(id, rotation) {
-    getDb().prepare('UPDATE plan_items SET rotation = ? WHERE id = ?').run(rotation, id);
-    return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    const db = getDb();
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    db.prepare('UPDATE plan_items SET rotation = ? WHERE id = ?').run(rotation, id);
+    if (item && item.rotation !== rotation) {
+      auditLogRepo.log('plan_item', id, 'update', `${planItemLabelForLog(db, item)} повёрнут(а) на плане`);
+    }
+    return db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
   },
   remove(id) {
     const db = getDb();
@@ -1179,7 +1190,12 @@ const planItemsRepo = {
       `).get(floor_plan_id, x, y, oldItemId);
 
       if (!existing) {
+        const before = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(oldItemId);
         db.prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, oldItemId);
+        if (before && (before.x !== x || before.y !== y)) {
+          auditLogRepo.log('plan_item', oldItemId, 'update',
+            `${planItemLabelForLog(db, before)} перемещён(а) на плане: (${before.x},${before.y}) → (${x},${y})`);
+        }
         return { item: db.prepare('SELECT * FROM plan_items WHERE id = ?').get(oldItemId), wasGrouped: false };
       }
 

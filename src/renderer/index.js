@@ -5032,6 +5032,75 @@ function refreshPointItemVisual(item) {
  *  вызывается после сохранения карточки на листе "Устройства". Затрагивает только
  *  текущий открытый этаж (planState.itemsById); остальные этажи и так подгрузят
  *  свежие данные из БД при следующем переключении на них. */
+/** Тихая перестройка текущего этажа — используется, когда изменения с хоста затронули
+ *  саму структуру плана (устройство переместилось/появилось/пропало/образовало группу),
+ *  а не только данные уже существующей иконки. buildStageForCurrentFloor() сама по себе
+ *  сбрасывает зум/панораму/выделение к исходным — здесь они сохраняются и восстанавливаются
+ *  вокруг перестройки, иначе для пользователя это выглядело бы как внезапный "прыжок"
+ *  вида при каждом чужом изменении, а не тихое обновление. */
+async function quietlyReloadCurrentFloor() {
+  const stage = planState.stage;
+  const savedScale = stage ? stage.scaleX() : null;
+  const savedPos = stage ? { x: stage.x(), y: stage.y() } : null;
+  const selectedData = planState.selectedNode ? planState.selectedNode.getAttr('itemData') : null;
+
+  closeGroupPanel();
+  await buildStageForCurrentFloor();
+
+  if (savedScale !== null && planState.stage) {
+    planState.stage.scale({ x: savedScale, y: savedScale });
+    planState.stage.position(savedPos);
+    planState.stage.batchDraw();
+    updateZoomLabel(savedScale);
+  }
+  // Пытаемся восстановить выделение — тот же plan_item id, если он всё ещё существует
+  // после перестройки (устройство никуда не делось, просто его данные обновились)
+  if (selectedData && selectedData.id != null) {
+    const restored = planState.itemsById.get(selectedData.id);
+    if (restored) selectNode(restored);
+  }
+}
+
+/** Применяет изменения с хоста (см. data-changed) на канву плана тихо, без клика
+ *  пользователя. Структурные изменения (entity_type='plan_item' — перемещение,
+ *  размещение, удаление, группировка) требуют полной перестройки этажа — координаты
+ *  и состав могли поменяться как угодно, точечно это не подправить. Изменения только
+ *  данных устройства/владельца (hostname/IP/статус/владелец) — точечное обновление уже
+ *  отрисованных иконок через syncPlanDeviceIcon, без пересборки канвы вообще. */
+async function applyPlanChangesQuietly(changes) {
+  const needsStructuralReload = changes.some((c) => c.entity_type === 'plan_item');
+  if (needsStructuralReload) {
+    await quietlyReloadCurrentFloor();
+    return;
+  }
+
+  const deviceChanges = changes.filter((c) => c.entity_type === 'device' || c.entity_type === 'ownership');
+  if (deviceChanges.length === 0) return;
+  const affectedDeviceIds = [...new Set(deviceChanges.map((c) => c.entity_id).filter((id) => id != null))];
+  if (affectedDeviceIds.length === 0) return;
+
+  const freshDevices = await window.api.devices.list();
+  affectedDeviceIds.forEach((deviceId) => {
+    const fresh = freshDevices.find((d) => d.id === deviceId);
+    if (!fresh) return;
+    const patch = {
+      device_type: fresh.device_type, device_hostname: fresh.hostname, device_ip: fresh.primary_ip,
+      device_status: fresh.status, device_flag: fresh.flag,
+      owner_user_id: fresh.owner_user_id, owner_name: fresh.owner_name, owner_status: fresh.owner_status
+    };
+    syncPlanDeviceIcon(deviceId, patch);
+
+    // То же устройство может быть сейчас показано внутри открытой панели группы —
+    // у неё своя, отдельная от основного плана мини-канва (см. groupPanelState)
+    if (groupPanelState.nodesByDeviceId && groupPanelState.nodesByDeviceId.has(deviceId)) {
+      const node = groupPanelState.nodesByDeviceId.get(deviceId);
+      const freshData = { ...node.getAttr('itemData'), ...patch };
+      refreshGroupPanelIcon(deviceId, freshData);
+      if (planState.selectedNode === node) renderInspector(node); // инспектор сейчас показывает именно её
+    }
+  });
+}
+
 function syncPlanDeviceIcon(deviceId, patch) {
   planState.itemsById.forEach((node) => {
     const data = node.getAttr('itemData');
@@ -5760,11 +5829,10 @@ window.addEventListener('api-error', (e) => {
     // Кто-то ДРУГОЙ (хост) что-то изменил, пока мы подключены как клиент — переиспользует
     // уже существующий журнал изменений (audit_log) вместо отдельного механизма
     // уведомлений: heartbeat в main/index.js периодически проверяет новые записи и
-    // присылает их сюда. Списки на других вкладках обновляем в фоне сразу (дёшево —
-    // просто перерисовка DOM карточек), план — только карманы автоматически, саму канву
-    // не трогаем без явного согласия пользователя (не хотим сбросить выделение, зум
-    // или незавершённое рисование посреди работы одним неожиданным сообщением с хоста).
-    window.api.events.onDataChanged((changes) => {
+    // присылает их сюда. Обновление тихое и без участия пользователя (никакой кнопки
+    // "Обновить" — раньше план требовал явного клика, теперь применяется само), тост
+    // с кратким описанием при этом остаётся.
+    window.api.events.onDataChanged(async (changes) => {
       if (!changes || changes.length === 0) return;
       renderUsers();
       renderDevices();
@@ -5773,19 +5841,16 @@ window.addEventListener('api-error', (e) => {
       const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
       if (activeTab === 'network') renderNetworkTab();
       if (activeTab === 'audit') loadAuditLog();
-      if (isPlanTabActive()) { fillDevicePicker(); fillUserDragList(); fillWarehouseDragList(); }
+      // План обновляется в фоне ВСЕГДА, не только когда эта вкладка сейчас видна —
+      // канва существует независимо от того, какая вкладка активна (просто скрыта CSS),
+      // так что к моменту, когда пользователь на неё переключится, она уже будет свежей
+      fillDevicePicker(); fillUserDragList(); fillWarehouseDragList();
+      await applyPlanChangesQuietly(changes);
 
       const summaryText = changes.length === 1
         ? changes[0].summary
         : `${changes.length} изменени${changes.length < 5 ? 'я' : 'й'}: ${changes[changes.length - 1].summary}`;
-      const toast = showToast(`🔄 ${summaryText}`, 'success', 9000);
-      if (isPlanTabActive() && toast) {
-        const refreshBtn = document.createElement('button');
-        refreshBtn.type = 'button';
-        refreshBtn.textContent = 'Обновить план';
-        refreshBtn.onclick = async () => { closeGroupPanel(); await buildStageForCurrentFloor(); };
-        toast.appendChild(refreshBtn);
-      }
+      showToast(`🔄 ${summaryText}`, 'success', 9000);
     });
   }
 
