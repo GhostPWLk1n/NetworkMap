@@ -51,10 +51,7 @@ CREATE TABLE devices (
     notes             TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    CHECK (
-        (device_type = 'vm' AND host_device_id IS NOT NULL)
-        OR (device_type <> 'vm' AND host_device_id IS NULL)
-    )
+    CHECK (device_type = 'vm' OR host_device_id IS NULL)
 );
 
 CREATE INDEX idx_devices_owner ON devices(owner_user_id);
@@ -152,7 +149,7 @@ CREATE INDEX idx_floorplans_floor ON floor_plans(floor_id);
 CREATE TABLE plan_items (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
-    item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','other')),
+    item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','other','group')),
     ref_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
                     -- заполнено, если item_type = 'device'; на план кладутся только
                     -- физические устройства (device_type <> 'vm') — проверяется в приложении,
@@ -168,16 +165,31 @@ CREATE TABLE plan_items (
     label          TEXT,
     z_index        INTEGER NOT NULL DEFAULT 0,
     review_note    TEXT,   -- ручной комментарий "на проверку" — независим от пометок сущностей
-    network_role   TEXT CHECK (network_role IN ('primary','backup','satellite'))
+    network_role   TEXT CHECK (network_role IN ('primary','backup','satellite')),
                     -- роль устройства (обычно роутера) в сетевом сегменте кабеля, если на
                     -- сегменте несколько роутеров — выбирается вручную. Подключение к
                     -- кабелю само по себе — в отдельной таблице cable_connections
                     -- (многие-ко-многим: многопортовый роутер может быть на нескольких)
+    group_label    TEXT    -- название группы (только для item_type='group'), например "Шкаф А1"
 );
 
 CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
 CREATE INDEX idx_planitems_plan_xy ON plan_items(floor_plan_id, x, y);
 CREATE INDEX idx_planitems_ref ON plan_items(ref_id);
+
+-- Устройства, сгруппированные в одной клетке (например, несколько юнитов в одном
+-- шкафу) — по аналогии с папками на Android: второе устройство на уже занятой клетке
+-- образует группу вместо перекрытия. Сама группа — обычный plan_item (item_type='group'),
+-- эта таблица — её содержимое (многие устройства на одну группу).
+CREATE TABLE plan_item_group_members (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_item_id   INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    added_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(group_item_id, device_id)
+);
+CREATE INDEX idx_group_members_group ON plan_item_group_members(group_item_id);
+CREATE INDEX idx_group_members_device ON plan_item_group_members(device_id);
 
 -- ------------------------------------------------------------
 -- Кабели — условные связи между элементами плана.

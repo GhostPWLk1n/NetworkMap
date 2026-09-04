@@ -1,128 +1,167 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+/** Обёртка над ipcRenderer.invoke — при ЛЮБОЙ ошибке (в т.ч. сетевой, когда хост
+ *  недоступен в режиме клиента) дополнительно рассылает событие 'api-error' в основной
+ *  мир страницы, чтобы можно было показать понятное уведомление, не переписывая все
+ *  ~90 мест вызова по отдельности — единая точка перехвата. Исходное исключение
+ *  пробрасывается дальше как обычно: вызывающий код, у которого уже есть собственная
+ *  обработка (например, в потоках импорта), продолжает работать точно так же, как раньше. */
+async function invoke(channel, ...args) {
+  try {
+    return await ipcRenderer.invoke(channel, ...args);
+  } catch (err) {
+    window.dispatchEvent(new CustomEvent('api-error', { detail: { channel, message: err.message || String(err) } }));
+    throw err;
+  }
+}
+
 contextBridge.exposeInMainWorld('api', {
   app: {
-    version: () => ipcRenderer.invoke('app:version')
+    version: () => invoke('app:version')
   },
   settings: {
-    getDbInfo: () => ipcRenderer.invoke('settings:getDbInfo'),
-    pickExistingDbFile: () => ipcRenderer.invoke('settings:pickExistingDbFile'),
-    pickNewDbLocation: () => ipcRenderer.invoke('settings:pickNewDbLocation'),
-    connectDb: (dbPath) => ipcRenderer.invoke('settings:connectDb', dbPath),
-    resetDb: () => ipcRenderer.invoke('settings:resetDb')
+    getDbInfo: () => invoke('settings:getDbInfo'),
+    pickExistingDbFile: () => invoke('settings:pickExistingDbFile'),
+    pickDiscoveryFolder: () => invoke('settings:pickDiscoveryFolder'),
+    pickNewDbLocation: () => invoke('settings:pickNewDbLocation'),
+    connectDb: (dbPath) => invoke('settings:connectDb', dbPath),
+    resetDb: () => invoke('settings:resetDb'),
+    setHostMode: (dbPath, hostPort, discoveryPath) => invoke('settings:setHostMode', { dbPath, hostPort, discoveryPath }),
+    setClientMode: (remoteHost) => invoke('settings:setClientMode', remoteHost),
+    pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost)
   },
   users: {
-    list: () => ipcRenderer.invoke('users:list'),
-    create: (payload) => ipcRenderer.invoke('users:create', payload),
-    update: (id, payload) => ipcRenderer.invoke('users:update', { id, payload }),
-    setStatus: (id, status) => ipcRenderer.invoke('users:setStatus', { id, status }),
-    setFlag: (id, flag) => ipcRenderer.invoke('users:setFlag', { id, flag }),
-    remove: (id) => ipcRenderer.invoke('users:remove', id)
+    list: () => invoke('users:list'),
+    create: (payload) => invoke('users:create', payload),
+    update: (id, payload) => invoke('users:update', { id, payload }),
+    setStatus: (id, status) => invoke('users:setStatus', { id, status }),
+    setFlag: (id, flag) => invoke('users:setFlag', { id, flag }),
+    remove: (id) => invoke('users:remove', id)
   },
   devices: {
-    list: () => ipcRenderer.invoke('devices:list'),
-    create: (payload) => ipcRenderer.invoke('devices:create', payload),
-    update: (id, payload) => ipcRenderer.invoke('devices:update', { id, payload }),
-    setStatus: (id, status, note) => ipcRenderer.invoke('devices:setStatus', { id, status, note }),
-    setFlag: (id, flag) => ipcRenderer.invoke('devices:setFlag', { id, flag }),
-    setUplink: (id, uplinkDeviceId) => ipcRenderer.invoke('devices:setUplink', { id, uplinkDeviceId }),
-    statusHistory: (id) => ipcRenderer.invoke('devices:statusHistory', id),
-    remove: (id) => ipcRenderer.invoke('devices:remove', id),
-    search: (query) => ipcRenderer.invoke('devices:search', query)
+    list: () => invoke('devices:list'),
+    create: (payload) => invoke('devices:create', payload),
+    update: (id, payload) => invoke('devices:update', { id, payload }),
+    setStatus: (id, status, note) => invoke('devices:setStatus', { id, status, note }),
+    setFlag: (id, flag) => invoke('devices:setFlag', { id, flag }),
+    setUplink: (id, uplinkDeviceId) => invoke('devices:setUplink', { id, uplinkDeviceId }),
+    statusHistory: (id) => invoke('devices:statusHistory', id),
+    remove: (id) => invoke('devices:remove', id),
+    search: (query) => invoke('devices:search', query)
   },
   ping: {
-    run: (deviceId, ip) => ipcRenderer.invoke('ping:run', { deviceId, ip }),
-    history: (deviceId) => ipcRenderer.invoke('ping:history', deviceId)
+    run: (deviceId, ip) => invoke('ping:run', { deviceId, ip }),
+    history: (deviceId) => invoke('ping:history', deviceId)
   },
   floorPlans: {
-    list: () => ipcRenderer.invoke('floorPlans:list'),
-    ensureDefault: () => ipcRenderer.invoke('floorPlans:ensureDefault'),
-    create: (payload) => ipcRenderer.invoke('floorPlans:create', payload),
-    remove: (id) => ipcRenderer.invoke('floorPlans:remove', id),
-    rename: (id, name) => ipcRenderer.invoke('floorPlans:rename', { id, name })
+    list: () => invoke('floorPlans:list'),
+    ensureDefault: () => invoke('floorPlans:ensureDefault'),
+    create: (payload) => invoke('floorPlans:create', payload),
+    remove: (id) => invoke('floorPlans:remove', id),
+    rename: (id, name) => invoke('floorPlans:rename', { id, name })
   },
   planItems: {
-    list: (floorPlanId) => ipcRenderer.invoke('planItems:list', floorPlanId),
-    create: (payload) => ipcRenderer.invoke('planItems:create', payload),
-    move: (id, x, y) => ipcRenderer.invoke('planItems:move', { id, x, y }),
-    setRotation: (id, rotation) => ipcRenderer.invoke('planItems:setRotation', { id, rotation }),
-    remove: (id) => ipcRenderer.invoke('planItems:remove', id),
-    findByDeviceRef: (deviceId) => ipcRenderer.invoke('planItems:findByDeviceRef', deviceId),
-    listPlacedDeviceIds: () => ipcRenderer.invoke('planItems:listPlacedDeviceIds'),
-    setReviewNote: (id, note) => ipcRenderer.invoke('planItems:setReviewNote', { id, note }),
-    setNetworkRole: (id, role) => ipcRenderer.invoke('planItems:setNetworkRole', { id, role })
+    list: (floorPlanId) => invoke('planItems:list', floorPlanId),
+    create: (payload) => invoke('planItems:create', payload),
+    move: (id, x, y) => invoke('planItems:move', { id, x, y }),
+    setRotation: (id, rotation) => invoke('planItems:setRotation', { id, rotation }),
+    remove: (id) => invoke('planItems:remove', id),
+    findByDeviceRef: (deviceId) => invoke('planItems:findByDeviceRef', deviceId),
+    listPlacedDeviceIds: () => invoke('planItems:listPlacedDeviceIds'),
+    listAllDevicePlacements: () => invoke('planItems:listAllDevicePlacements'),
+    setReviewNote: (id, note) => invoke('planItems:setReviewNote', { id, note }),
+    setNetworkRole: (id, role) => invoke('planItems:setNetworkRole', { id, role }),
+    placeDeviceWithGrouping: (floorPlanId, deviceId, x, y) => invoke('planItems:placeDeviceWithGrouping', { floorPlanId, deviceId, x, y }),
+    moveDeviceItemWithGrouping: (oldItemId, floorPlanId, deviceId, x, y) => invoke('planItems:moveDeviceItemWithGrouping', { oldItemId, floorPlanId, deviceId, x, y }),
+    groupMembers: (groupItemId) => invoke('planItems:groupMembers', groupItemId),
+    removeFromGroup: (groupItemId, deviceId) => invoke('planItems:removeFromGroup', { groupItemId, deviceId }),
+    renameGroup: (groupItemId, label) => invoke('planItems:renameGroup', { groupItemId, label })
   },
   cables: {
-    list: (floorPlanId) => ipcRenderer.invoke('cables:list', floorPlanId),
-    get: (id) => ipcRenderer.invoke('cables:get', id),
-    create: (payload) => ipcRenderer.invoke('cables:create', payload),
-    updatePath: (id, path) => ipcRenderer.invoke('cables:updatePath', { id, path }),
-    setLabel: (id, label) => ipcRenderer.invoke('cables:setLabel', { id, label }),
-    remove: (id) => ipcRenderer.invoke('cables:remove', id)
+    list: (floorPlanId) => invoke('cables:list', floorPlanId),
+    get: (id) => invoke('cables:get', id),
+    create: (payload) => invoke('cables:create', payload),
+    updatePath: (id, path) => invoke('cables:updatePath', { id, path }),
+    setLabel: (id, label) => invoke('cables:setLabel', { id, label }),
+    remove: (id) => invoke('cables:remove', id)
   },
   cableConnections: {
-    listByPlan: (floorPlanId) => ipcRenderer.invoke('cableConnections:listByPlan', floorPlanId),
-    listByPlanItem: (planItemId) => ipcRenderer.invoke('cableConnections:listByPlanItem', planItemId),
-    connect: (planItemId, cableId) => ipcRenderer.invoke('cableConnections:connect', { planItemId, cableId }),
-    disconnect: (planItemId, cableId) => ipcRenderer.invoke('cableConnections:disconnect', { planItemId, cableId })
+    listByPlan: (floorPlanId) => invoke('cableConnections:listByPlan', floorPlanId),
+    listByPlanItem: (planItemId) => invoke('cableConnections:listByPlanItem', planItemId),
+    connect: (planItemId, cableId) => invoke('cableConnections:connect', { planItemId, cableId }),
+    disconnect: (planItemId, cableId) => invoke('cableConnections:disconnect', { planItemId, cableId })
   },
   ownership: {
-    history: (deviceId) => ipcRenderer.invoke('ownership:history', deviceId),
-    historyForUser: (userId) => ipcRenderer.invoke('ownership:historyForUser', userId),
-    assign: (deviceId, userId) => ipcRenderer.invoke('ownership:assign', { deviceId, userId }),
-    unassign: (deviceId) => ipcRenderer.invoke('ownership:unassign', deviceId)
+    history: (deviceId) => invoke('ownership:history', deviceId),
+    historyForUser: (userId) => invoke('ownership:historyForUser', userId),
+    assign: (deviceId, userId) => invoke('ownership:assign', { deviceId, userId }),
+    unassign: (deviceId) => invoke('ownership:unassign', deviceId)
   },
   components: {
-    list: (deviceId) => ipcRenderer.invoke('components:list', deviceId),
-    listAllActive: () => ipcRenderer.invoke('components:listAllActive'),
-    add: (payload) => ipcRenderer.invoke('components:add', payload),
-    detach: (id) => ipcRenderer.invoke('components:detach', id),
-    remove: (id) => ipcRenderer.invoke('components:remove', id)
+    list: (deviceId) => invoke('components:list', deviceId),
+    listAllActive: () => invoke('components:listAllActive'),
+    add: (payload) => invoke('components:add', payload),
+    detach: (id) => invoke('components:detach', id),
+    remove: (id) => invoke('components:remove', id)
   },
   peripherals: {
-    list: (deviceId) => ipcRenderer.invoke('peripherals:list', deviceId),
-    listAllActive: () => ipcRenderer.invoke('peripherals:listAllActive'),
-    add: (payload) => ipcRenderer.invoke('peripherals:add', payload),
-    detach: (id) => ipcRenderer.invoke('peripherals:detach', id),
-    remove: (id) => ipcRenderer.invoke('peripherals:remove', id)
+    list: (deviceId) => invoke('peripherals:list', deviceId),
+    listAllActive: () => invoke('peripherals:listAllActive'),
+    add: (payload) => invoke('peripherals:add', payload),
+    detach: (id) => invoke('peripherals:detach', id),
+    remove: (id) => invoke('peripherals:remove', id)
   },
   software: {
-    list: (deviceId) => ipcRenderer.invoke('software:list', deviceId),
-    listActive: () => ipcRenderer.invoke('software:listActive'),
-    add: (payload) => ipcRenderer.invoke('software:add', payload),
-    remove: (id) => ipcRenderer.invoke('software:remove', id),
-    setFlag: (id, flag) => ipcRenderer.invoke('software:setFlag', { id, flag })
+    list: (deviceId) => invoke('software:list', deviceId),
+    listActive: () => invoke('software:listActive'),
+    add: (payload) => invoke('software:add', payload),
+    remove: (id) => invoke('software:remove', id),
+    setFlag: (id, flag) => invoke('software:setFlag', { id, flag })
   },
   warehouse: {
-    list: (category) => ipcRenderer.invoke('warehouse:list', category),
-    add: (payload) => ipcRenderer.invoke('warehouse:add', payload),
-    update: (id, payload) => ipcRenderer.invoke('warehouse:update', { id, payload }),
-    setStatus: (id, status) => ipcRenderer.invoke('warehouse:setStatus', { id, status }),
-    setFlag: (id, flag) => ipcRenderer.invoke('warehouse:setFlag', { id, flag }),
-    receiveComponent: (componentId, note) => ipcRenderer.invoke('warehouse:receiveComponent', { componentId, note }),
-    receiveSoftware: (softwareId, note) => ipcRenderer.invoke('warehouse:receiveSoftware', { softwareId, note }),
-    issueToDevice: (itemId, deviceId) => ipcRenderer.invoke('warehouse:issueToDevice', { itemId, deviceId }),
-    remove: (id) => ipcRenderer.invoke('warehouse:remove', id)
+    list: (category) => invoke('warehouse:list', category),
+    add: (payload) => invoke('warehouse:add', payload),
+    update: (id, payload) => invoke('warehouse:update', { id, payload }),
+    setStatus: (id, status) => invoke('warehouse:setStatus', { id, status }),
+    setFlag: (id, flag) => invoke('warehouse:setFlag', { id, flag }),
+    receiveComponent: (componentId, note) => invoke('warehouse:receiveComponent', { componentId, note }),
+    receiveSoftware: (softwareId, note) => invoke('warehouse:receiveSoftware', { softwareId, note }),
+    issueToDevice: (itemId, deviceId) => invoke('warehouse:issueToDevice', { itemId, deviceId }),
+    remove: (id) => invoke('warehouse:remove', id)
   },
   zones: {
-    list: (floorPlanId) => ipcRenderer.invoke('zones:list', floorPlanId),
-    create: (payload) => ipcRenderer.invoke('zones:create', payload),
-    updateLabel: (id, payload) => ipcRenderer.invoke('zones:updateLabel', { id, payload }),
-    remove: (id) => ipcRenderer.invoke('zones:remove', id)
+    list: (floorPlanId) => invoke('zones:list', floorPlanId),
+    create: (payload) => invoke('zones:create', payload),
+    updateLabel: (id, payload) => invoke('zones:updateLabel', { id, payload }),
+    remove: (id) => invoke('zones:remove', id)
   },
   network: {
-    listRoots: () => ipcRenderer.invoke('network:listRoots'),
-    buildTree: (rootDeviceId) => ipcRenderer.invoke('network:buildTree', rootDeviceId)
+    listRoots: () => invoke('network:listRoots'),
+    buildTree: (rootDeviceId) => invoke('network:buildTree', rootDeviceId)
   },
   auditLog: {
-    list: (filters) => ipcRenderer.invoke('auditLog:list', filters)
+    list: (filters) => invoke('auditLog:list', filters)
   },
   importExcel: {
-    devices: () => ipcRenderer.invoke('import:excelDevices')
+    devices: () => invoke('import:excelDevices')
   },
   importPcInfo: {
-    pickFile: (forceDeviceId) => ipcRenderer.invoke('import:pcInfoPickFile', forceDeviceId),
-    pickFolder: () => ipcRenderer.invoke('import:pcInfoPickFolder'),
-    apply: (parsed, fieldChoices) => ipcRenderer.invoke('import:pcInfoApply', { parsed, fieldChoices })
+    pickFile: (forceDeviceId) => invoke('import:pcInfoPickFile', forceDeviceId),
+    pickFolder: () => invoke('import:pcInfoPickFolder'),
+    apply: (parsed, fieldChoices) => invoke('import:pcInfoApply', { parsed, fieldChoices })
+  },
+  events: {
+    /** callback({ reachable, remoteHost }) — вызывается при КАЖДОЙ смене статуса связи
+     *  с хостом (см. heartbeat в main/index.js), не только при разрыве. Только для
+     *  режима "клиент" — в остальных режимах событие просто не рассылается. */
+    onHostConnectivityChanged: (callback) => {
+      ipcRenderer.on('host-connectivity-changed', (_event, data) => callback(data));
+    },
+    /** callback({ channel, cachedAt }) — вызывается, когда конкретный read-запрос был
+     *  отдан из локального кэша вместо живого ответа хоста (сети сейчас нет, но раньше
+     *  был успешный ответ на этот же запрос) — см. localCache.js. */
+    onUsingStaleCache: (callback) => {
+      ipcRenderer.on('using-stale-cache', (_event, data) => callback(data));
+    }
   }
 });

@@ -7,7 +7,7 @@ let db;
 let currentDbPath = null;
 let lastConnectWarning = null; // строка предупреждения, если пришлось откатиться на локальную БД
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 16;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
 const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
@@ -92,10 +92,60 @@ function initDatabase(explicitPath) {
 function getCurrentDbPath() { return currentDbPath; }
 function getLastConnectWarning() { return lastConnectWarning; }
 
+/** Настроенный (не обязательно доступный сейчас) путь к БД из конфига, если задан —
+ *  дешёвое локальное чтение JSON, без попытки реально открыть файл БД. Используется
+ *  main/index.js перед запуском процесса-пробника (db-probe.js): если сетевой путь
+ *  вообще не настроен, пробник не нужен — открываем локальный файл напрямую. */
+function getConfiguredDbPath() {
+  const cfg = loadDbConfig();
+  if (cfg.mode === 'client') return null; // клиент свою БД не открывает вообще, пробовать нечего
+  return cfg.dbPath || null;
+}
+
 /** Запоминает новый путь в конфиге — вступит в силу после перезапуска приложения
  *  (перезапуск проще и надёжнее, чем на лету переподключать все окна/списки/канву) */
+const DEFAULT_HOST_PORT = 47821;
+
+/** Переключение обратно на обычный режим (свой файл — локальный или сетевой путь,
+ *  как было раньше) — сбрасывает host/client настройки. */
 function setConfiguredDbPath(newPath) {
-  saveDbConfig({ dbPath: newPath || null });
+  saveDbConfig({ mode: 'local', dbPath: newPath || null, hostPort: null, remoteHost: null });
+}
+
+/** Режим работы: 'local' (обычный файл — свой процесс открывает БД напрямую, как и
+ *  было изначально), 'host' (держит файл БД у СЕБЯ локально и раздаёт доступ по сети
+ *  остальным через RPC-сервер, см. rpcServer.js), 'client' (свою БД не открывает
+ *  вообще — все запросы уходят по сети на чужой host, см. rpcClient.js). */
+function getAppMode() {
+  return loadDbConfig().mode || 'local';
+}
+
+function getHostPort() {
+  return loadDbConfig().hostPort || DEFAULT_HOST_PORT;
+}
+
+function getDiscoveryPath() {
+  return loadDbConfig().discoveryPath || null;
+}
+
+function getRemoteHost() {
+  return loadDbConfig().remoteHost || null;
+}
+
+/** dbPath здесь всегда ЛОКАЛЬНЫЙ файл (или null = дефолтный локальный путь) —
+ *  UI обязан предупредить пользователя не указывать сюда сетевой путь, в этом весь
+ *  смысл режима "хост": файл открывает только один процесс, остальные — по сети.
+ *  discoveryPath — необязательный СЕТЕВОЙ путь, куда публикуется маячок с адресом
+ *  хоста (см. discovery.js) — обычно тот самый путь, куда раньше все указывали как
+ *  на общий файл БД в старой схеме прямого доступа по сети, для плавной миграции. */
+function setHostMode(dbPath, hostPort = DEFAULT_HOST_PORT, discoveryPath = null) {
+  saveDbConfig({ mode: 'host', dbPath: dbPath || null, hostPort, remoteHost: null, discoveryPath: discoveryPath || null });
+}
+
+/** remoteHost — строка вида "192.168.1.42:47821". Собственную БД клиент не открывает
+ *  вообще — resolveDbPath()/initDatabase() в этом режиме не вызываются. */
+function setClientMode(remoteHost) {
+  saveDbConfig({ mode: 'client', remoteHost, dbPath: null, hostPort: null });
 }
 
 function runMigrations() {
@@ -113,6 +163,8 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 12) migrateToV12();
   if (db.pragma('user_version', { simple: true }) < 13) migrateToV13();
   if (db.pragma('user_version', { simple: true }) < 14) migrateToV14();
+  if (db.pragma('user_version', { simple: true }) < 15) migrateToV15();
+  if (db.pragma('user_version', { simple: true }) < 16) migrateToV16();
 }
 
 /**
@@ -544,6 +596,122 @@ function migrateToV14() {
   tx();
 }
 
+/**
+ * v14 -> v15: смягчаем ограничение на host_device_id у VM. Раньше СХЕМА требовала,
+ * чтобы у любой VM обязательно был указан физический хост (host_device_id NOT NULL),
+ * но ни быстрая форма создания устройства, ни форма редактирования никогда не давали
+ * способа этот хост выбрать — из-за этого создание VM было в принципе невозможно через
+ * обычный интерфейс (падало на CHECK constraint). Хост по-прежнему МОЖНО указать (в
+ * форме теперь есть поле выбора — см. renderer/index.js), но он больше не обязателен.
+ * Направление ограничения "у НЕ-VM хоста быть не может" сохранено — это по-прежнему
+ * осмысленно (только VM разумно привязывать к физическому серверу).
+ */
+function migrateToV15() {
+  console.log('[db] миграция схемы v14 -> v15 (host_device_id у VM больше не обязателен)');
+  db.pragma('foreign_keys = OFF'); // PRAGMA foreign_keys нельзя менять внутри активной транзакции
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE devices_new (
+          id                INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_type       TEXT NOT NULL CHECK (device_type IN
+                              ('computer','laptop','server','vm','router','switch','printer','other')),
+          inventory_number  TEXT UNIQUE,
+          hostname          TEXT,
+          os                TEXT,
+          cpu               TEXT,
+          ram               TEXT,
+          disk              TEXT,
+          owner_user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+          host_device_id    INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+          uplink_device_id  INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+          status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN
+                              ('active','repair','storage','decommissioned')),
+          flag              TEXT CHECK (flag IN ('problem','attention','error')),
+          purchase_date     TEXT,
+          warranty_until    TEXT,
+          notes             TEXT,
+          created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+          CHECK (device_type = 'vm' OR host_device_id IS NULL)
+      );
+      INSERT INTO devices_new (id, device_type, inventory_number, hostname, os, cpu, ram, disk,
+                                owner_user_id, host_device_id, uplink_device_id, status, flag,
+                                purchase_date, warranty_until, notes, created_at, updated_at)
+      SELECT id, device_type, inventory_number, hostname, os, cpu, ram, disk,
+             owner_user_id, host_device_id, uplink_device_id, status, flag,
+             purchase_date, warranty_until, notes, created_at, updated_at
+      FROM devices;
+      DROP TABLE devices;
+      ALTER TABLE devices_new RENAME TO devices;
+      CREATE INDEX idx_devices_owner ON devices(owner_user_id);
+      CREATE INDEX idx_devices_type ON devices(device_type);
+      CREATE INDEX idx_devices_status ON devices(status);
+      CREATE INDEX idx_devices_host ON devices(host_device_id);
+    `);
+    db.pragma('user_version = 15');
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+}
+
+/**
+ * v15 -> v16: группировка устройств в одной клетке (например, шкаф с несколькими
+ * юнитами) — по аналогии с папками на Android: второе устройство, попавшее на уже
+ * занятую клетку, образует группу вместо перекрытия/конфликта. item_type='group' —
+ * такой же точечный plan_item, как device/desk, только вместо ref_id на одно
+ * устройство ссылается таблица plan_item_group_members (многие устройства на одну
+ * группу). group_label — необязательное название группы (например "Шкаф А1").
+ */
+function migrateToV16() {
+  console.log('[db] миграция схемы v15 -> v16 (группировка устройств в клетке)');
+  db.pragma('foreign_keys = OFF');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE plan_items_new (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
+          item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','other','group')),
+          ref_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+          x              INTEGER NOT NULL,
+          y              INTEGER NOT NULL,
+          x2             INTEGER,
+          y2             INTEGER,
+          rotation       INTEGER NOT NULL DEFAULT 0 CHECK (rotation IN (0,90,180,270)),
+          width_cells    INTEGER NOT NULL DEFAULT 1,
+          height_cells   INTEGER NOT NULL DEFAULT 1,
+          label          TEXT,
+          z_index        INTEGER NOT NULL DEFAULT 0,
+          review_note    TEXT,
+          network_role   TEXT CHECK (network_role IN ('primary','backup','satellite')),
+          group_label    TEXT  -- название группы (только для item_type='group'), например "Шкаф А1"
+      );
+      INSERT INTO plan_items_new (id, floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
+                                   width_cells, height_cells, label, z_index, review_note, network_role)
+      SELECT id, floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
+             width_cells, height_cells, label, z_index, review_note, network_role
+      FROM plan_items;
+      DROP TABLE plan_items;
+      ALTER TABLE plan_items_new RENAME TO plan_items;
+      CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
+      CREATE INDEX idx_planitems_plan_xy ON plan_items(floor_plan_id, x, y);
+      CREATE INDEX idx_planitems_ref ON plan_items(ref_id);
+
+      CREATE TABLE plan_item_group_members (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          group_item_id   INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+          device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+          added_at        TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(group_item_id, device_id)
+      );
+      CREATE INDEX idx_group_members_group ON plan_item_group_members(group_item_id);
+      CREATE INDEX idx_group_members_device ON plan_item_group_members(device_id);
+    `);
+    db.pragma('user_version = 16');
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -659,16 +827,16 @@ const devicesRepo = {
     return { id };
   },
   update(id, { device_type, hostname = null, inventory_number = null, os = null, cpu = null,
-                ram = null, disk = null, status = 'active', notes = null,
+                ram = null, disk = null, status = 'active', notes = null, host_device_id = null,
                 ip_address = undefined, mac_address = undefined }) {
     const db = getDb();
     const tx = db.transaction(() => {
       const before = db.prepare('SELECT status FROM devices WHERE id = ?').get(id);
       db.prepare(`
         UPDATE devices SET device_type = ?, hostname = ?, inventory_number = ?, os = ?, cpu = ?,
-                            ram = ?, disk = ?, status = ?, notes = ?, updated_at = datetime('now')
+                            ram = ?, disk = ?, status = ?, notes = ?, host_device_id = ?, updated_at = datetime('now')
         WHERE id = ?
-      `).run(device_type, hostname, inventory_number, os, cpu, ram, disk, status, notes, id);
+      `).run(device_type, hostname, inventory_number, os, cpu, ram, disk, status, notes, host_device_id, id);
 
       if (before && before.status !== status) {
         db.prepare('INSERT INTO device_status_history (device_id, status) VALUES (?, ?)').run(id, status);
@@ -845,21 +1013,48 @@ const planItemsRepo = {
       ORDER BY pi.z_index, pi.id
     `).all(floorPlanId);
   },
-  /** На каких планах (этажах) размещено устройство — для кнопки "Найти на плане" */
+  /** На каких планах (этажах) размещено устройство — для кнопки "Найти на плане" и
+   *  для поиска. Находит и как одиночный элемент, и как участника ГРУППЫ (устройство
+   *  внутри "шкафа" не имеет своего plan_item, только членство в plan_item_group_members) —
+   *  via_group=1 в результате отличает второй случай, чтобы UI знал открыть модалку группы. */
   findByDeviceRef(deviceId) {
     return getDb().prepare(`
-      SELECT pi.*, fp.name AS floor_plan_name
+      SELECT pi.*, fp.name AS floor_plan_name, 0 AS via_group
       FROM plan_items pi
       JOIN floor_plans fp ON fp.id = pi.floor_plan_id
       WHERE pi.ref_id = ? AND pi.item_type = 'device'
-    `).all(deviceId);
+      UNION ALL
+      SELECT pi.*, fp.name AS floor_plan_name, 1 AS via_group
+      FROM plan_item_group_members gm
+      JOIN plan_items pi ON pi.id = gm.group_item_id
+      JOIN floor_plans fp ON fp.id = pi.floor_plan_id
+      WHERE gm.device_id = ?
+    `).all(deviceId, deviceId);
   },
   /** id устройств, уже размещённых хоть на каком-то этаже — карман "Устройства" на плане
    *  не должен предлагать их повторно (одно физическое устройство — одно место на плане) */
   listPlacedDeviceIds() {
     return getDb().prepare(`
-      SELECT DISTINCT ref_id FROM plan_items WHERE item_type = 'device' AND ref_id IS NOT NULL
+      SELECT ref_id FROM plan_items WHERE item_type = 'device' AND ref_id IS NOT NULL
+      UNION
+      SELECT device_id AS ref_id FROM plan_item_group_members
     `).all().map((r) => r.ref_id);
+  },
+  /** Размещения ВСЕХ устройств сразу (device_id, куда переходить, на каком этаже,
+   *  напрямую или через группу) — для поиска "где это устройство", без отдельного
+   *  запроса на каждое совпадение. Тот же UNION-приём, что и в findByDeviceRef. */
+  listAllDevicePlacements() {
+    return getDb().prepare(`
+      SELECT pi.ref_id AS device_id, pi.id AS item_id, pi.floor_plan_id, fp.name AS floor_plan_name, 0 AS via_group
+      FROM plan_items pi
+      JOIN floor_plans fp ON fp.id = pi.floor_plan_id
+      WHERE pi.item_type = 'device' AND pi.ref_id IS NOT NULL
+      UNION ALL
+      SELECT gm.device_id AS device_id, pi.id AS item_id, pi.floor_plan_id, fp.name AS floor_plan_name, 1 AS via_group
+      FROM plan_item_group_members gm
+      JOIN plan_items pi ON pi.id = gm.group_item_id
+      JOIN floor_plans fp ON fp.id = pi.floor_plan_id
+    `).all();
   },
   /** Ручной комментарий "на проверку" — независимо от пометок Проблема/Внимание/Ошибка
    *  у самого устройства/пользователя. note=null (или пустая строка) снимает пометку. */
@@ -903,6 +1098,140 @@ const planItemsRepo = {
     db.prepare('DELETE FROM plan_items WHERE id = ?').run(id);
     if (item) auditLogRepo.log('plan_item', id, 'delete', `${planItemLabelForLog(db, item)} убран(а) с плана`);
     return { id };
+  },
+  /** Размещает устройство на клетке — если клетка занята одиночным устройством или уже
+   *  существующей группой, вместо перекрытия образует/пополняет группу (по аналогии с
+   *  папками на Android: второй ярлык на ту же клетку создаёт контейнер вместо
+   *  перекрытия первого). Возвращает { item, wasGrouped }. */
+  placeDeviceWithGrouping(floor_plan_id, deviceId, x, y) {
+    const db = getDb();
+    const tx = db.transaction(() => {
+      const existing = db.prepare(`
+        SELECT * FROM plan_items WHERE floor_plan_id = ? AND x = ? AND y = ? AND item_type IN ('device', 'group')
+      `).get(floor_plan_id, x, y);
+
+      if (!existing) {
+        const info = db.prepare(`
+          INSERT INTO plan_items (floor_plan_id, item_type, ref_id, x, y, rotation, width_cells, height_cells, z_index)
+          VALUES (?, 'device', ?, ?, ?, 0, 1, 1, 0)
+        `).run(floor_plan_id, deviceId, x, y);
+        const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(info.lastInsertRowid);
+        auditLogRepo.log('plan_item', item.id, 'create', `${planItemLabelForLog(db, item)} размещён(а) на плане`);
+        return { item, wasGrouped: false };
+      }
+
+      if (existing.item_type === 'group') {
+        db.prepare('INSERT OR IGNORE INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(existing.id, deviceId);
+        const device = db.prepare('SELECT hostname FROM devices WHERE id = ?').get(deviceId);
+        auditLogRepo.log('plan_item', existing.id, 'update',
+          `Устройство «${(device && device.hostname) || deviceId}» добавлено в группу «${existing.group_label || 'без названия'}»`);
+        return { item: db.prepare('SELECT * FROM plan_items WHERE id = ?').get(existing.id), wasGrouped: true };
+      }
+
+      // Клетка занята одиночным устройством — превращаем в группу из двух
+      const otherDeviceId = existing.ref_id;
+      const info = db.prepare(`
+        INSERT INTO plan_items (floor_plan_id, item_type, x, y, rotation, width_cells, height_cells, z_index)
+        VALUES (?, 'group', ?, ?, 0, 1, 1, ?)
+      `).run(floor_plan_id, x, y, existing.z_index);
+      const groupId = info.lastInsertRowid;
+      db.prepare('INSERT INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(groupId, otherDeviceId);
+      db.prepare('INSERT INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(groupId, deviceId);
+      db.prepare('DELETE FROM plan_items WHERE id = ?').run(existing.id);
+      const groupItem = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(groupId);
+      auditLogRepo.log('plan_item', groupId, 'create', 'Создана группа устройств на плане (объединены 2)');
+      return { item: groupItem, wasGrouped: true };
+    });
+    return tx();
+  },
+  /** То же самое, что placeDeviceWithGrouping, но для УЖЕ размещённого устройства,
+   *  которое перетаскивают мышью в новую клетку (см. dragend в renderer/index.js).
+   *  Если целевая клетка занята — устройство "переезжает" туда (создаёт/пополняет
+   *  группу), а его СТАРЫЙ plan_item (oldItemId) удаляется, у него больше нет
+   *  отдельного места на плане. Если клетка пуста (в т.ч. если это та же клетка,
+   *  откуда тащили) — обычное перемещение, как раньше. */
+  moveDeviceItemWithGrouping(oldItemId, floor_plan_id, deviceId, x, y) {
+    const db = getDb();
+    const tx = db.transaction(() => {
+      const existing = db.prepare(`
+        SELECT * FROM plan_items WHERE floor_plan_id = ? AND x = ? AND y = ? AND item_type IN ('device', 'group') AND id <> ?
+      `).get(floor_plan_id, x, y, oldItemId);
+
+      if (!existing) {
+        db.prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, oldItemId);
+        return { item: db.prepare('SELECT * FROM plan_items WHERE id = ?').get(oldItemId), wasGrouped: false };
+      }
+
+      if (existing.item_type === 'group') {
+        db.prepare('INSERT OR IGNORE INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(existing.id, deviceId);
+        db.prepare('DELETE FROM plan_items WHERE id = ?').run(oldItemId);
+        const device = db.prepare('SELECT hostname FROM devices WHERE id = ?').get(deviceId);
+        auditLogRepo.log('plan_item', existing.id, 'update',
+          `Устройство «${(device && device.hostname) || deviceId}» перетащено в группу «${existing.group_label || 'без названия'}»`);
+        return { item: db.prepare('SELECT * FROM plan_items WHERE id = ?').get(existing.id), wasGrouped: true, removedOldItemId: oldItemId };
+      }
+
+      // Целевая клетка занята одиночным устройством — превращаем в группу из двух,
+      // убираем ОБА старых одиночных plan_item (и перетаскиваемого, и целевого)
+      const otherDeviceId = existing.ref_id;
+      const info = db.prepare(`
+        INSERT INTO plan_items (floor_plan_id, item_type, x, y, rotation, width_cells, height_cells, z_index)
+        VALUES (?, 'group', ?, ?, 0, 1, 1, ?)
+      `).run(floor_plan_id, x, y, existing.z_index);
+      const groupId = info.lastInsertRowid;
+      db.prepare('INSERT INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(groupId, otherDeviceId);
+      db.prepare('INSERT INTO plan_item_group_members (group_item_id, device_id) VALUES (?, ?)').run(groupId, deviceId);
+      db.prepare('DELETE FROM plan_items WHERE id = ?').run(existing.id);
+      db.prepare('DELETE FROM plan_items WHERE id = ?').run(oldItemId);
+      const groupItem = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(groupId);
+      auditLogRepo.log('plan_item', groupId, 'create', 'Создана группа устройств на плане (объединены перетаскиванием)');
+      return { item: groupItem, wasGrouped: true, removedOldItemId: oldItemId };
+    });
+    return tx();
+  },
+  /** Состав группы — устройства внутри, с теми же полями, что и обычный список устройств */
+  groupMembers(groupItemId) {
+    return getDb().prepare(`
+      SELECT d.*, ni.ip_address AS primary_ip, dlp.status AS last_ping_status
+      FROM plan_item_group_members gm
+      JOIN devices d ON d.id = gm.device_id
+      LEFT JOIN network_interfaces ni ON ni.device_id = d.id AND ni.is_primary = 1
+      LEFT JOIN device_latest_ping dlp ON dlp.device_id = d.id
+      WHERE gm.group_item_id = ?
+      ORDER BY d.hostname
+    `).all(groupItemId);
+  },
+  /** Убирает устройство из группы. Если останется РОВНО одно — группа автоматически
+   *  "разворачивается" обратно в одиночный device-item (как в Android — папка с одним
+   *  ярлыком снова становится просто ярлыком). Если ноль — группа удаляется вовсе. */
+  removeFromGroup(groupItemId, deviceId) {
+    const db = getDb();
+    const tx = db.transaction(() => {
+      db.prepare('DELETE FROM plan_item_group_members WHERE group_item_id = ? AND device_id = ?').run(groupItemId, deviceId);
+      const remaining = db.prepare('SELECT device_id FROM plan_item_group_members WHERE group_item_id = ?').all(groupItemId);
+
+      if (remaining.length === 0) {
+        db.prepare('DELETE FROM plan_items WHERE id = ?').run(groupItemId);
+        auditLogRepo.log('plan_item', groupItemId, 'delete', 'Группа устройств на плане удалена (опустела)');
+        return { deleted: true };
+      }
+      if (remaining.length === 1) {
+        db.prepare("UPDATE plan_items SET item_type = 'device', ref_id = ?, group_label = NULL WHERE id = ?")
+          .run(remaining[0].device_id, groupItemId);
+        auditLogRepo.log('plan_item', groupItemId, 'update', 'Группа устройств на плане разгруппирована (осталось одно устройство)');
+        return { ungroupedToSingle: true, item: db.prepare('SELECT * FROM plan_items WHERE id = ?').get(groupItemId) };
+      }
+      auditLogRepo.log('plan_item', groupItemId, 'update', 'Устройство убрано из группы на плане');
+      return { removed: true };
+    });
+    return tx();
+  },
+  /** Название группы — необязательное, например "Шкаф А1". null/пусто снимает название. */
+  renameGroup(groupItemId, label) {
+    const clean = label && label.trim() ? label.trim() : null;
+    getDb().prepare('UPDATE plan_items SET group_label = ? WHERE id = ?').run(clean, groupItemId);
+    auditLogRepo.log('plan_item', groupItemId, 'update', clean ? `Группе на плане присвоено название «${clean}»` : 'С группы на плане снято название');
+    return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(groupItemId);
   }
 };
 
@@ -1532,5 +1861,6 @@ module.exports = {
   floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
   softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
-  getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath
+  getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
+  getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath
 };

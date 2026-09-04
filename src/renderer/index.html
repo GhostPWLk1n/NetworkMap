@@ -21,6 +21,9 @@
     <button id="db-settings-btn" type="button" title="Подключение к базе данных">🗄 БД</button>
   </header>
 
+  <div id="read-only-banner" class="hidden"></div>
+  <div id="toast-container"></div>
+
   <!-- ЛИСТ 1: Планы -->
   <div id="tab-plan" class="tab-content active">
     <div id="floor-tabs">
@@ -33,6 +36,7 @@
       <aside id="plan-tools">
         <h3>Поиск (пользователи / устройства / склад)</h3>
         <input id="plan-tools-search" placeholder="Начните вводить…" autocomplete="off" />
+        <div id="plan-search-placed-results" class="hidden"></div>
 
         <h3>Устройства (перетащить на план)</h3>
         <div id="device-drag-list"></div>
@@ -91,6 +95,17 @@
         </div>
         <div id="plan-stage"></div>
       </div>
+
+      <aside id="group-panel" class="hidden">
+        <div id="group-panel-header">
+          <input id="group-panel-label-input" type="text" placeholder="Название группы" />
+          <button id="group-panel-rename-btn" type="button" title="Сохранить название">💾</button>
+          <button id="group-panel-close-btn" type="button" title="Закрыть">✕</button>
+        </div>
+        <div id="group-panel-scroll">
+          <div id="group-panel-stage"></div>
+        </div>
+      </aside>
 
       <aside id="plan-inspector">
         <h3>Инспектор</h3>
@@ -202,6 +217,9 @@
           </select>
           <input name="hostname" placeholder="Hostname" required />
           <input name="ip_address" placeholder="IP-адрес" />
+          <select name="host_device_id" id="device-form-host-select" class="hidden">
+            <option value="">Хост (физический сервер) — необязательно</option>
+          </select>
           <button type="submit">Добавить</button>
         </form>
       </details>
@@ -428,11 +446,48 @@
 
       <div class="db-actions-grid">
         <button id="db-pick-existing-btn" type="button" class="tool-btn">📂 Подключиться к существующему файлу…</button>
+        <button id="db-pick-folder-btn" type="button" class="tool-btn">🔍 Найти маячок хоста в папке…</button>
         <button id="db-pick-new-btn" type="button" class="tool-btn">💾 Создать новую БД в другом месте…</button>
         <button id="db-reset-btn" type="button" class="tool-btn">↩ Вернуться к локальной БД по умолчанию</button>
       </div>
 
       <div id="db-status-note" class="status-note"></div>
+
+      <hr class="db-section-divider" />
+
+      <div class="modal-title">Совместный доступ (несколько компьютеров)</div>
+      <p class="search-advanced-note db-explainer">
+        Один компьютер («хост») держит файл БД у себя локально и раздаёт доступ
+        остальным по сети — так файл никогда не открывают несколько процессов
+        одновременно, и сама причина зависаний/конфликтов устраняется, а не
+        смягчается. Компьютеры-«клиенты» подключаются к хосту по адресу —
+        видят все данные, но <b>не могут редактировать</b> (только просмотр),
+        пока подключены в этом режиме. «Папка для маячка» — необязательно: если
+        раньше все указывали общий сетевой путь напрямую к файлу БД, укажите ту
+        же папку здесь — хост опубликует туда свой адрес отдельным файлом (у
+        каждого хоста — свой, никто не переписывает чужой, поэтому упавший
+        хост никогда не помешает следующему, даже если его файл нельзя удалить
+        из-за прав доступа на сетевой шаре). Тот, кто по привычке попробует
+        «Подключиться к существующему файлу» и укажет эту папку, увидит
+        подсказку с адресом активного хоста вместо невнятной ошибки.
+      </p>
+
+      <div id="db-shared-access-status" class="db-shared-status"></div>
+
+      <div class="db-shared-columns">
+        <div class="db-shared-column">
+          <div class="db-shared-column-title">Стать хостом</div>
+          <label class="db-shared-label">Порт <input id="db-host-port-input" type="number" value="47821" min="1024" max="65535" /></label>
+          <label class="db-shared-label">Папка для маячка (необязательно) <input id="db-host-discovery-input" type="text" placeholder="\\server\share\network-map-hosts" /></label>
+          <button id="db-become-host-btn" type="button" class="tool-btn">🖧 Стать хостом</button>
+        </div>
+        <div class="db-shared-column">
+          <div class="db-shared-column-title">Подключиться к хосту</div>
+          <label class="db-shared-label">Адрес <input id="db-client-host-input" type="text" placeholder="192.168.1.42:47821" /></label>
+          <button id="db-become-client-btn" type="button" class="tool-btn">🔌 Подключиться</button>
+        </div>
+      </div>
+      <div id="db-shared-status-note" class="status-note"></div>
 
       <div class="modal-actions">
         <button id="db-settings-close" type="button">Закрыть</button>
