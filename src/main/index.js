@@ -67,6 +67,7 @@ const RPC_HANDLERS = {
   'devices:setFlag': { write: true, fn: ({ id, flag }) => devicesRepo.setFlag(id, flag) },
   'devices:setUplink': { write: true, fn: ({ id, uplinkDeviceId }) => devicesRepo.setUplink(id, uplinkDeviceId) },
   'devices:statusHistory': { write: false, fn: (id) => devicesRepo.statusHistory(id) },
+  'devices:listVMsByHost': { write: false, fn: (hostDeviceId) => devicesRepo.listVMsByHost(hostDeviceId) },
   'devices:remove': { write: true, fn: (id) => devicesRepo.remove(id) },
   'devices:search': { write: false, fn: (query) => devicesRepo.search(query) },
 
@@ -246,7 +247,10 @@ function registerIpcHandlers() {
       hostPort: mode === 'host' ? getHostPort() : null,
       remoteHost: mode === 'client' ? getRemoteHost() : null,
       hostReachable: mode === 'client' ? hostReachable : null,
-      startupNotice: notice
+      startupNotice: notice,
+      // electron-builder выставляет эту переменную окружения ТОЛЬКО для portable-сборки
+      // (не для обычного установленного приложения) — надёжный способ отличить одно от другого
+      isPortable: !!process.env.PORTABLE_EXECUTABLE_DIR
     };
   });
 

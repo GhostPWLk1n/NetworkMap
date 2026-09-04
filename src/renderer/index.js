@@ -1680,6 +1680,18 @@ async function initPlan() {
   document.getElementById('plan-tools-search').addEventListener('input', applyPlanToolsSearch);
 
   document.getElementById('group-panel-close-btn').addEventListener('click', closeGroupPanel);
+
+  // Drag иконки ИЗ панели группы наружу (на основной план) — глобальные обработчики,
+  // не по одному на иконку: mousedown стартует в renderGroupPanelIcon, а следит за
+  // перемещением и завершением курсора вот этот единственный слушатель на весь документ
+  document.addEventListener('mousemove', (e) => {
+    if (groupPanelDragOutState.active) updateGroupPanelDragGhost(e.clientX, e.clientY);
+  });
+  document.addEventListener('mouseup', (e) => {
+    if (groupPanelDragOutState.active) {
+      finishGroupPanelIconDragOut(e.clientX, e.clientY).catch((err) => console.error('finishGroupPanelIconDragOut упал:', err));
+    }
+  });
   document.getElementById('group-panel-rename-btn').addEventListener('click', async () => {
     if (!groupPanelState.groupItemId) return;
     const label = document.getElementById('group-panel-label-input').value;
@@ -2367,8 +2379,7 @@ function renderPointItem(item) {
       for (const [oldId, node] of planState.itemsById) {
         const d2 = node.getAttr('itemData');
         if (d2 && d2.x === cellX && d2.y === cellY && oldId !== result.item.id && (d2.item_type === 'device' || d2.item_type === 'group')) {
-          node.destroy();
-          planState.itemsById.delete(oldId);
+          destroyPlanItemNode(oldId, node);
         }
       }
 
@@ -3598,8 +3609,7 @@ async function placeDeviceItem(deviceId, x, y) {
   for (const [oldId, node] of planState.itemsById) {
     const data = node.getAttr('itemData');
     if (data && data.x === x && data.y === y && oldId !== item.id && (data.item_type === 'device' || data.item_type === 'group')) {
-      node.destroy();
-      planState.itemsById.delete(oldId);
+      destroyPlanItemNode(oldId, node);
     }
   }
 
@@ -4366,6 +4376,18 @@ function bindPlanSearch() {
 // Инспектор (правая панель)
 // ------------------------------------------------------------
 
+/** Безопасно уничтожает узел плана (устройство/группа), убранный с клетки при
+ *  образовании/пополнении группы (см. placeDeviceItem, dragend, finishGroupPanelIconDragOut).
+ *  Снимает выделение ПЕРЕД уничтожением, если узел был текущим выделением — иначе
+ *  planState.selectedNode остаётся указывать на уже удалённый узел, и следующий клик
+ *  где угодно падает в unhighlight() с "Cannot read properties of undefined (reading
+ *  'stroke')". Этот же класс бага уже чинился точечно в паре мест — теперь один центр. */
+function destroyPlanItemNode(oldId, node) {
+  if (planState.selectedNode === node) selectNode(null);
+  node.destroy();
+  planState.itemsById.delete(oldId);
+}
+
 function selectNode(node) {
   if (planState.selectedNode) unhighlight(planState.selectedNode);
   clearCableEditHandles();
@@ -4382,22 +4404,31 @@ function selectNode(node) {
   }
 }
 
+/** highlight/unhighlight могут вызываться на узле, который к этому моменту уже
+ *  уничтожен (destroy()) — например, при образовании группы старый узел на клетке
+ *  убирается, пока он был текущим выделением; это уже точечно чинилось в паре мест
+ *  (см. destroyPlanItemNode), но каждый раз всплывает в НОВОМ месте, до которого
+ *  точечная защита не дотянулась. Правильнее один раз сделать сами эти функции
+ *  устойчивыми к уничтоженному узлу — findOne()/getChildren()[0] на нём возвращают
+ *  undefined (уничтожение чистит список детей), а .stroke() на undefined падает с
+ *  "Cannot read properties of undefined (reading 'stroke')". Проверка на существование
+ *  перед вызовом делает случайный промах тихим и безвредным, а не крашем интерфейса. */
 function highlight(node) {
   const kind = node.getAttr('kind');
-  if (kind === 'point') node.findOne('Rect').stroke('#ff9900');
-  else if (kind === 'line') node.getChildren()[0].stroke('#ff9900');
-  else if (kind === 'cable') node.stroke('#ff9900');
-  else if (kind === 'socket') node.stroke('#ff9900');
-  else if (kind === 'zone') { const s = node.getAttr('shapeNode'); s.stroke('#ff9900'); s.strokeWidth(2); }
+  if (kind === 'point') { const r = node.findOne('Rect'); if (r) r.stroke('#ff9900'); }
+  else if (kind === 'line') { const c = node.getChildren()[0]; if (c) c.stroke('#ff9900'); }
+  else if (kind === 'cable') { if (node.stroke) node.stroke('#ff9900'); }
+  else if (kind === 'socket') { if (node.stroke) node.stroke('#ff9900'); }
+  else if (kind === 'zone') { const s = node.getAttr('shapeNode'); if (s) { s.stroke('#ff9900'); s.strokeWidth(2); } }
 }
 
 function unhighlight(node) {
   const kind = node.getAttr('kind');
-  if (kind === 'point') node.findOne('Rect').stroke('#333');
-  else if (kind === 'line') node.getChildren()[0].stroke(lineColor(node.getAttr('itemData').item_type));
-  else if (kind === 'cable') node.stroke(node.getAttr('cableData').color || CABLE_COLOR);
-  else if (kind === 'socket') node.stroke('#333');
-  else if (kind === 'zone') { const s = node.getAttr('shapeNode'); s.stroke(undefined); s.strokeWidth(0); }
+  if (kind === 'point') { const r = node.findOne('Rect'); if (r) r.stroke('#333'); }
+  else if (kind === 'line') { const c = node.getChildren()[0]; if (c) c.stroke(lineColor(node.getAttr('itemData').item_type)); }
+  else if (kind === 'cable') { if (node.stroke) node.stroke(node.getAttr('cableData').color || CABLE_COLOR); }
+  else if (kind === 'socket') { if (node.stroke) node.stroke('#333'); }
+  else if (kind === 'zone') { const s = node.getAttr('shapeNode'); if (s) { s.stroke(undefined); s.strokeWidth(0); } }
 }
 
 function renderInspector(node) {
@@ -4763,6 +4794,10 @@ function renderGroupPanelIcon(device, index) {
   }));
 
   node.on('click', () => selectNode(node));
+  node.on('mousedown', (e) => {
+    if (e.evt.button !== 0) return; // только левая кнопка
+    startGroupPanelIconDragOut(device, e.evt.clientX, e.evt.clientY);
+  });
 
   groupPanelState.layer.add(node);
   groupPanelState.nodesByDeviceId.set(device.id, node);
@@ -4785,13 +4820,16 @@ function refreshGroupPanelIcon(deviceId, freshItemData) {
 /** Убрать устройство из группы через кнопку в инспекторе (когда выбрана иконка внутри
  *  панели группы) — та же логика на бэкенде, что и раньше (auto-разгруппирование при
  *  одном оставшемся), но теперь корректно обновляет и панель, и основной план. */
-async function removeDeviceFromGroupPanel(deviceId) {
-  const groupItemId = groupPanelState.groupItemId;
-  if (!groupItemId) return;
-  if (!(await confirmModal('Убрать это устройство из группы?'))) return;
-
-  const result = await window.api.planItems.removeFromGroup(groupItemId, deviceId);
+/** Общая обработка результата removeFromGroup — три исхода (группа опустела,
+ *  разгруппировалась в одиночный элемент, осталась группой). Используется и кнопкой
+ *  "Убрать из группы" в инспекторе, и перетаскиванием иконки из панели на основной план. */
+async function applyRemoveFromGroupResult(result, groupItemId) {
   const groupNode = planState.itemsById.get(groupItemId);
+  // Группа сейчас может быть уничтожена (все три исхода ниже её удаляют/заменяют) —
+  // если она была текущим выделением, снимаем его ДО уничтожения, иначе
+  // planState.selectedNode будет указывать на уже удалённый узел (тот же приём,
+  // что и в closeGroupPanel/openGroupPanel, но здесь для самой группы, а не участника)
+  if (groupNode && planState.selectedNode === groupNode) selectNode(null);
 
   if (result.deleted) {
     if (groupNode) { groupNode.destroy(); planState.itemsById.delete(groupItemId); planState.layer.draw(); }
@@ -4826,6 +4864,105 @@ async function removeDeviceFromGroupPanel(deviceId) {
   fillDevicePicker(); // убранное из группы устройство снова доступно для перетаскивания
 }
 
+/** Общее состояние "призрачного" перетаскивания иконки ИЗ панели группы — Konva не
+ *  умеет перетаскивать узел между двумя РАЗНЫМИ канвами визуально (drag ограничен
+ *  собственным стейджем), поэтому вместо Konva-драга используется плавающий HTML-
+ *  элемент, следующий за курсором через document-уровневые mousemove/mouseup. */
+let groupPanelDragOutState = { active: false, deviceId: null, ghost: null };
+
+function startGroupPanelIconDragOut(device, clientX, clientY) {
+  groupPanelDragOutState.active = true;
+  groupPanelDragOutState.deviceId = device.id;
+  const ghost = document.createElement('div');
+  ghost.className = 'group-drag-ghost';
+  ghost.textContent = `🖥 ${device.hostname || device.device_type}`;
+  document.body.appendChild(ghost);
+  groupPanelDragOutState.ghost = ghost;
+  updateGroupPanelDragGhost(clientX, clientY);
+}
+
+function updateGroupPanelDragGhost(clientX, clientY) {
+  if (!groupPanelDragOutState.ghost) return;
+  groupPanelDragOutState.ghost.style.left = `${clientX + 12}px`;
+  groupPanelDragOutState.ghost.style.top = `${clientY + 12}px`;
+}
+
+/** Отпустили иконку — если это случилось НАД канвой основного плана, убираем
+ *  устройство из группы и размещаем его на этой клетке (переиспользует ту же
+ *  группировку, что и обычное перетаскивание — если клетка занята, присоединится
+ *  или образует новую группу). Если отпустили не над планом — просто отмена,
+ *  панель остаётся как была (устройство никуда не делось). */
+async function finishGroupPanelIconDragOut(clientX, clientY) {
+  const deviceId = groupPanelDragOutState.deviceId;
+  const groupItemId = groupPanelState.groupItemId;
+  if (groupPanelDragOutState.ghost) { groupPanelDragOutState.ghost.remove(); }
+  groupPanelDragOutState = { active: false, deviceId: null, ghost: null };
+  if (!deviceId || !groupItemId || !planState.stage) return;
+
+  // Проверяем попадание именно в ВИДИМУЮ область — сама канва логически огромная
+  // (масштабируется под весь план, например 3840×2160px) и обрезается видимым окном
+  // через overflow на #plan-stage-wrap; getBoundingClientRect() канвы вернул бы полный
+  // логический размер, а не то, что реально видно и куда реально попал курсор
+  const wrapRect = document.getElementById('plan-stage-wrap').getBoundingClientRect();
+  const overMainPlan = clientX >= wrapRect.left && clientX <= wrapRect.right && clientY >= wrapRect.top && clientY <= wrapRect.bottom;
+  if (!overMainPlan) return; // отпущено не над планом — ничего не делаем
+
+  const localPoint = clientToStagePoint(clientX, clientY);
+  const targetX = Math.max(0, Math.round(localPoint.x / CELL_PX - 0.5));
+  const targetY = Math.max(0, Math.round(localPoint.y / CELL_PX - 0.5));
+  const floorPlanId = planState.floorPlan.id;
+
+  const removeResult = await window.api.planItems.removeFromGroup(groupItemId, deviceId);
+  await applyRemoveFromGroupResult(removeResult, groupItemId);
+
+  // Перетаскиваемое устройство (deviceId) после removeFromGroup ВСЕГДА оказывается без
+  // своего plan_item — независимо от того, что произошло с ОСТАЛЬНОЙ группой (опустела/
+  // разгруппировалась в одиночный элемент/осталась группой). removeResult.item, если он
+  // есть, относится к ОСТАВШЕМУСЯ в группе устройству (например, при ungroupedToSingle —
+  // это как раз ДРУГОЕ устройство, ставшее одиночным на месте бывшей группы), а не к
+  // перетаскиваемому — поэтому здесь всегда обычное размещение с нуля, без move-варианта.
+  const placeResult = await window.api.planItems.placeDeviceWithGrouping(floorPlanId, deviceId, targetX, targetY);
+
+  if (!placeResult.wasGrouped) {
+    const device = devicesCache.find((d) => d.id === deviceId);
+    const freshItem = { ...placeResult.item };
+    freshItem.device_type = device?.device_type;
+    freshItem.device_hostname = device?.hostname;
+    freshItem.device_ip = device?.primary_ip;
+    freshItem.last_ping_status = device?.last_ping_status;
+    freshItem.owner_user_id = device?.owner_user_id;
+    freshItem.owner_name = device?.owner_name;
+    freshItem.device_status = device?.status;
+    freshItem.device_flag = device?.flag;
+    freshItem.owner_status = device?.owner_status;
+    renderPointItem(freshItem);
+  } else {
+    for (const [oldId, node] of planState.itemsById) {
+      const data = node.getAttr('itemData');
+      if (data && data.x === targetX && data.y === targetY && oldId !== placeResult.item.id && (data.item_type === 'device' || data.item_type === 'group')) {
+        destroyPlanItemNode(oldId, node);
+      }
+    }
+    const members = await window.api.planItems.groupMembers(placeResult.item.id);
+    const freshGroupItem = { ...placeResult.item, member_count: members.length };
+    if (planState.itemsById.has(placeResult.item.id)) {
+      refreshPointItemVisual(freshGroupItem);
+    } else {
+      renderPointItem(freshGroupItem);
+    }
+  }
+  fillDevicePicker();
+  planState.layer.draw();
+}
+
+async function removeDeviceFromGroupPanel(deviceId) {
+  const groupItemId = groupPanelState.groupItemId;
+  if (!groupItemId) return;
+  if (!(await confirmModal('Убрать это устройство из группы?'))) return;
+  const result = await window.api.planItems.removeFromGroup(groupItemId, deviceId);
+  await applyRemoveFromGroupResult(result, groupItemId);
+}
+
 /** Перетаскивание пользователя (карман слева) прямо на иконку устройства ВНУТРИ панели
  *  группы — работает благодаря тому, что панель теперь не модалка, а обычная боковая
  *  панель: карман с пользователями остаётся на экране и доступен для перетаскивания. */
@@ -4834,10 +4971,29 @@ function bindGroupPanelDragDrop() {
   container.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
   container.addEventListener('drop', async (e) => {
     e.preventDefault();
-    if (!groupPanelState.stage) return;
+    if (!groupPanelState.stage || !groupPanelState.groupItemId) return;
     let payload;
     try { payload = JSON.parse(e.dataTransfer.getData('application/json')); } catch { return; }
-    if (!payload || payload.type !== 'user') return;
+    if (!payload) return;
+
+    if (payload.type === 'device') {
+      // Устройство из кармана "перетащить на план" брошено прямо в открытую панель
+      // группы — добавляем его в ЭТУ группу. Переиспользуем placeDeviceWithGrouping
+      // с координатами самой группы: код там уже умеет "клетка занята группой —
+      // присоединиться к ней", ничего нового на бэкенде не нужно.
+      const groupNode = planState.itemsById.get(groupPanelState.groupItemId);
+      if (!groupNode) return;
+      const groupData = groupNode.getAttr('itemData');
+      await window.api.planItems.placeDeviceWithGrouping(planState.floorPlan.id, payload.id, groupData.x, groupData.y);
+
+      const members = await window.api.planItems.groupMembers(groupPanelState.groupItemId);
+      refreshPointItemVisual({ ...groupData, member_count: members.length });
+      await openGroupPanel(groupPanelState.groupItemId); // пересобираем панель со свежим составом
+      fillDevicePicker(); // добавленное в группу устройство больше не должно предлагаться в кармане
+      return;
+    }
+
+    if (payload.type !== 'user') return;
 
     const stageRect = groupPanelState.stage.container().getBoundingClientRect();
     const localY = e.clientY - stageRect.top + container.scrollTop;
@@ -5051,12 +5207,13 @@ async function renderDeviceCableConnectionsSection(container, item, node, onChan
 }
 
 async function renderDeviceExtras(container, deviceId, onChanged = () => renderInspector(planState.selectedNode)) {
-  const [history, components, peripherals, software, statusHistory] = await Promise.all([
+  const [history, components, peripherals, software, statusHistory, hostedVMs] = await Promise.all([
     window.api.ownership.history(deviceId),
     window.api.components.list(deviceId),
     window.api.peripherals.list(deviceId),
     window.api.software.list(deviceId),
-    window.api.devices.statusHistory(deviceId)
+    window.api.devices.statusHistory(deviceId),
+    window.api.devices.listVMsByHost(deviceId)
   ]);
 
   container.innerHTML = '';
@@ -5083,6 +5240,26 @@ async function renderDeviceExtras(container, deviceId, onChanged = () => renderI
     async (id) => { await window.api.warehouse.receiveComponent(id); fillWarehouseDragList(); renderWarehouse(); },
     { detachLabel: 'На склад', extraText: (r) => (r.cost != null ? ` — ${r.cost}` : ''), onChanged }));
   container.appendChild(buildComponentAddForm(deviceId, onChanged));
+
+  // Виртуальные машины, у которых этот сервер указан хостом (host_device_id) — раньше
+  // эта связь была видна только в обратную сторону, в карточке самой VM; физический
+  // сервер никак не показывал, что на нём работает. Список кликабельный — переход к
+  // карточке VM, как и везде в приложении.
+  container.appendChild(sectionTitle('Виртуальные машины на этом сервере'));
+  if (hostedVMs.length === 0) {
+    container.appendChild(smallNote('Нет данных'));
+  } else {
+    const ul = document.createElement('ul');
+    ul.className = 'mini-list';
+    hostedVMs.forEach((vm) => {
+      const li = document.createElement('li');
+      li.className = 'mini-list-clickable';
+      li.textContent = `🖥 ${vm.hostname || '(без имени)'}${vm.primary_ip ? ' — ' + vm.primary_ip : ''}${vm.owner_name ? ' — ' + vm.owner_name : ''}`;
+      li.onclick = () => openDeviceCard(vm.id);
+      ul.appendChild(li);
+    });
+    container.appendChild(ul);
+  }
 
   container.appendChild(sectionTitle('Периферия'));
   container.appendChild(buildAttachableList(peripherals, PERIPHERAL_TYPE_LABELS,
@@ -5292,8 +5469,21 @@ function buildComponentAddForm(deviceId, onChanged = () => renderInspector(planS
 // Подключение к базе данных (локальный файл или сетевой путь)
 // ============================================================
 
+let cachedIsPortable = false; // обновляется в refreshDbSettingsInfo — используется в предупреждениях перед перезапуском
+
+/** Текст-приписка к сообщениям о перезапуске — portable-версия Electron на Windows
+ *  запускается из временной распакованной папки, и автоматический app.relaunch() там
+ *  не всегда срабатывает надёжно (известное ограничение таких сборок, не баг именно
+ *  этого приложения) — честно предупреждаем вместо того, чтобы молча понадеяться. */
+function portableRelaunchWarning() {
+  return cachedIsPortable
+    ? '\n\n⚠️ Portable-версия: автоматический перезапуск может не сработать — если окно закроется и не откроется само, запустите приложение вручную ещё раз.'
+    : '';
+}
+
 async function refreshDbSettingsInfo() {
   const info = await window.api.settings.getDbInfo();
+  cachedIsPortable = !!info.isPortable;
   document.getElementById('db-current-path').textContent = info.mode === 'client' ? '(на удалённом хосте)' : (info.path || '—');
 
   const badge = document.getElementById('db-current-badge');
@@ -5374,7 +5564,7 @@ function bindDbSettingsModal() {
   document.getElementById('db-pick-existing-btn').addEventListener('click', async () => {
     const filePath = await window.api.settings.pickExistingDbFile();
     if (!filePath) return;
-    await connectAndRelaunch(filePath, `Подключиться к базе данных по пути:\n${filePath}\n\nПриложение перезапустится.`);
+    await connectAndRelaunch(filePath, `Подключиться к базе данных по пути:\n${filePath}\n\nПриложение перезапустится.${portableRelaunchWarning()}`);
   });
 
   document.getElementById('db-pick-folder-btn').addEventListener('click', async () => {
@@ -5389,11 +5579,11 @@ function bindDbSettingsModal() {
   document.getElementById('db-pick-new-btn').addEventListener('click', async () => {
     const filePath = await window.api.settings.pickNewDbLocation();
     if (!filePath) return;
-    await connectAndRelaunch(filePath, `Создать новую пустую базу данных здесь и переключиться на неё:\n${filePath}\n\nПриложение перезапустится.`);
+    await connectAndRelaunch(filePath, `Создать новую пустую базу данных здесь и переключиться на неё:\n${filePath}\n\nПриложение перезапустится.${portableRelaunchWarning()}`);
   });
 
   document.getElementById('db-reset-btn').addEventListener('click', async () => {
-    if (!(await confirmModal('Вернуться к локальной базе данных по умолчанию? Приложение перезапустится.'))) return;
+    if (!(await confirmModal('Вернуться к локальной базе данных по умолчанию? Приложение перезапустится.' + portableRelaunchWarning()))) return;
     statusNote.textContent = 'Переключение…';
     const result = await window.api.settings.resetDb();
     if (result && result.success === false) {
@@ -5408,7 +5598,7 @@ function bindDbSettingsModal() {
     const discoveryPath = document.getElementById('db-host-discovery-input').value.trim() || null;
     if (!(await confirmModal(
       `Стать хостом на порту ${port}? Текущий файл БД останется у вас локально, остальные компьютеры ` +
-      'смогут подключиться и просматривать данные (без редактирования). Приложение перезапустится.'
+      'смогут подключиться и просматривать данные (без редактирования). Приложение перезапустится.' + portableRelaunchWarning()
     ))) return;
     sharedStatusNote.textContent = 'Переключение…';
     const result = await window.api.settings.setHostMode(null, port, discoveryPath);
@@ -5420,7 +5610,7 @@ function bindDbSettingsModal() {
     if (!remoteHost) { sharedStatusNote.textContent = 'Укажите адрес хоста (ip:порт).'; return; }
     if (!(await confirmModal(
       `Подключиться к хосту ${remoteHost}? Собственная БД перестанет использоваться — все данные будут ` +
-      'браться с хоста, редактирование будет недоступно (только просмотр). Приложение перезапустится.'
+      'браться с хоста, редактирование будет недоступно (только просмотр). Приложение перезапустится.' + portableRelaunchWarning()
     ))) return;
     sharedStatusNote.textContent = 'Проверяю подключение…';
     const result = await window.api.settings.setClientMode(remoteHost);

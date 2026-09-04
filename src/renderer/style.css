@@ -77,6 +77,12 @@ body {
 #group-panel-header input { width: 90px; padding: 4px 6px; font-size: 11px; border: 1px solid #ccc; border-radius: 4px; }
 #group-panel-header button { padding: 4px 6px; font-size: 11px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; }
 #group-panel-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; background: #eef0f5; }
+
+.group-drag-ghost {
+  position: fixed; z-index: 500; pointer-events: none;
+  background: #5b4b8a; color: #fff; padding: 4px 10px; border-radius: 6px;
+  font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); white-space: nowrap;
+}
 #plan-inspector {
   /* flex-basis (не width) обычно определяет размер flex-элемента по главной оси —
      нативный resize браузера меняет только inline width, поэтому здесь явно уходим
@@ -290,6 +296,8 @@ body {
 
 .device-card-extras { border-top: 1px solid #eee; margin-top: 10px; padding-top: 2px; }
 .mini-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
+.mini-list-clickable { cursor: pointer; padding: 2px 0; }
+.mini-list-clickable:hover { text-decoration: underline; color: #2a5db0; }
 
 #network-root-bar { display: flex; align-items: center; gap: 8px; padding: 16px 20px 8px; font-size: 13px; }
 
@@ -505,6 +513,13 @@ body {
   align-items: center;
   justify-content: center;
   z-index: 200;
+}
+/* confirm/alert/prompt — служебные диалоги, вызываемые ИЗНУТРИ других модалок (например,
+   подтверждение при подключении к БД поверх открытого окна настроек) — раньше все модалки
+   делили один z-index, и стек определялся порядком в HTML, а не тем, что показано позже;
+   из-за этого служебный диалог мог визуально оказаться ПОД родительской модалкой. */
+#prompt-modal, #confirm-modal, #alert-modal {
+  z-index: 300;
 }
 .modal-overlay.hidden { display: none; }
 .modal-box {

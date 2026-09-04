@@ -1,6 +1,6 @@
 {
   "name": "network-map-app",
-  "version": "1.37.0",
+  "version": "1.39.0",
   "description": "Учёт компьютеров/устройств и планов размещения",
   "main": "src/main/index.js",
   "author": "Pavel Fomin",

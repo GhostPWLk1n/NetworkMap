@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('api', {
     setFlag: (id, flag) => invoke('devices:setFlag', { id, flag }),
     setUplink: (id, uplinkDeviceId) => invoke('devices:setUplink', { id, uplinkDeviceId }),
     statusHistory: (id) => invoke('devices:statusHistory', id),
+    listVMsByHost: (hostDeviceId) => invoke('devices:listVMsByHost', hostDeviceId),
     remove: (id) => invoke('devices:remove', id),
     search: (query) => invoke('devices:search', query)
   },

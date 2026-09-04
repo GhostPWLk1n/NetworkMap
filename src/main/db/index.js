@@ -788,6 +788,27 @@ const devicesRepo = {
       ORDER BY d.hostname
     `).all();
   },
+  /** VM, у которых host_device_id указывает на это устройство — обратная сторона связи
+   *  "у VM есть физический хост" (см. host_device_id в схеме): раньше это было видно
+   *  только В КАРТОЧКЕ VM (какой у неё хост), а сам физический сервер никак не показывал,
+   *  какие VM на нём работают. Те же поля, что и в list(), для единообразия отрисовки. */
+  listVMsByHost(hostDeviceId) {
+    return getDb().prepare(`
+      SELECT d.*,
+             ni.ip_address    AS primary_ip,
+             ni.mac_address   AS primary_mac,
+             dlp.status       AS last_ping_status,
+             dlp.checked_at   AS last_ping_at,
+             u.full_name      AS owner_name,
+             u.status         AS owner_status
+      FROM devices d
+      LEFT JOIN network_interfaces ni ON ni.device_id = d.id AND ni.is_primary = 1
+      LEFT JOIN device_latest_ping dlp ON dlp.device_id = d.id
+      LEFT JOIN users u ON u.id = d.owner_user_id
+      WHERE d.host_device_id = ?
+      ORDER BY d.hostname
+    `).all(hostDeviceId);
+  },
   create({ device_type, hostname = null, inventory_number = null, os = null, cpu = null,
            ram = null, disk = null, owner_user_id = null, host_device_id = null,
            status = 'active', notes = null, ip_address = null, mac_address = null }) {
@@ -1191,12 +1212,23 @@ const planItemsRepo = {
   },
   /** Состав группы — устройства внутри, с теми же полями, что и обычный список устройств */
   groupMembers(groupItemId) {
+    // Тот же набор JOIN'ов, что и в devicesRepo.list() — раньше owner_name/owner_status
+    // не подтягивались вовсе (SELECT d.* без JOIN на users), из-за чего владелец,
+    // назначенный ДО открытия панели группы, не показывался в инспекторе устройства
+    // внутри неё (выглядело так, будто владельца нет вообще, хотя он был назначен).
     return getDb().prepare(`
-      SELECT d.*, ni.ip_address AS primary_ip, dlp.status AS last_ping_status
+      SELECT d.*,
+             ni.ip_address    AS primary_ip,
+             ni.mac_address   AS primary_mac,
+             dlp.status       AS last_ping_status,
+             dlp.checked_at   AS last_ping_at,
+             u.full_name      AS owner_name,
+             u.status         AS owner_status
       FROM plan_item_group_members gm
       JOIN devices d ON d.id = gm.device_id
       LEFT JOIN network_interfaces ni ON ni.device_id = d.id AND ni.is_primary = 1
       LEFT JOIN device_latest_ping dlp ON dlp.device_id = d.id
+      LEFT JOIN users u ON u.id = d.owner_user_id
       WHERE gm.group_item_id = ?
       ORDER BY d.hostname
     `).all(groupItemId);
