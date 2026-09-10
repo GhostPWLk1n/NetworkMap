@@ -617,6 +617,9 @@ document.getElementById('users-filter-show-dismissed').addEventListener('change'
 // ============================================================
 
 let devicesCache = [];
+let clientModeActive = false; // true, если это клиент чужого хоста — формы редактирования требуют явного запроса права (см. requestEditLock)
+let clientAllowWritesFlag = false; // текущее состояние тумблера хоста (см. onLocksStateChanged) — для текста баннера
+let clientHeldLockKeys = new Set(); // "type:id" — объекты, на которые ЭТОТ клиент прямо сейчас имеет право (см. isNodeLocked)
 let devicesSearchState;
 
 let deviceEquipmentIndex = new Map(); // device.id -> "GPU RTX 4090 монитор Dell..." — для поиска по установленному оборудованию
@@ -716,6 +719,8 @@ function buildDeviceCard(d) {
   else if (d.status === 'repair') row.classList.add('status-repair');
   else if (d.status === 'storage') row.classList.add('status-storage');
 
+  let editLockControls = null; // назначается ниже, после создания формы — используется при сворачивании карточки
+
   const conflictReason = detectDeviceConflict(d);
   const effectiveFlag = conflictReason ? 'attention' : d.flag;
 
@@ -740,6 +745,11 @@ function buildDeviceCard(d) {
   header.appendChild(chevron);
   header.addEventListener('click', () => {
     row.classList.toggle('expanded');
+    if (!row.classList.contains('expanded') && editLockControls) {
+      // Свернули карточку — освобождаем право сразу, не дожидаясь протухания за минуту
+      // бездействия, чтобы объект быстрее стал доступен другим (только режим клиента)
+      editLockControls.releaseIfHeld();
+    }
     if (row.classList.contains('expanded') && !extrasLoaded) {
       extrasLoaded = true;
       refreshExtras();
@@ -811,6 +821,11 @@ function buildDeviceCard(d) {
   }
   refreshEditHostField();
   form.device_type.addEventListener('change', refreshEditHostField);
+
+  if (clientModeActive) {
+    editLockControls = createEditLockControls('device', d.id, form);
+    form.insertBefore(editLockControls.wrap, form.firstChild);
+  }
 
   const actions = document.createElement('div');
   actions.className = 'card-body-actions';
@@ -1583,10 +1598,20 @@ function planLayerFor(itemType) {
  *  либо конкретно его логический слой стоит в состоянии "заблокирован". Используется
  *  везде, где раньше проверялся только planState.viewMode (драг, удаление, контекстное меню). */
 function isNodeLocked(node) {
+  if (clientModeActive) {
+    // Персональное право на КОНКРЕТНЫЙ объект — главная проверка для устройств/групп
+    // у клиента, перебивает общий viewMode: получения права на объект достаточно само
+    // по себе, без отдельного переключения в общий "режим рисования" (тот нужен только
+    // для НОВЫХ объектов — стен/столов/кабелей — не покрытых per-object блокировками).
+    const itemData = node.getAttr('itemData');
+    if (itemData && (itemData.item_type === 'device' || itemData.item_type === 'group') && !itemData.via_group) {
+      return !clientHeldLockKeys.has(`plan_item:${itemData.id}`);
+    }
+  }
   if (planState.viewMode) return true;
   const layer = node.getAttr('planLayer');
-  if (layer === null || layer === undefined) return false;
-  return planState.layerState[layer] === 'locked';
+  if (layer !== null && layer !== undefined && planState.layerState[layer] === 'locked') return true;
+  return false;
 }
 
 /** То же самое, но по номеру слоя напрямую — для мест, где узла ещё нет
@@ -4074,6 +4099,23 @@ function bindModeSwitch() {
   updateModeSwitchUI(true);
 }
 
+let clientAllLocks = []; // [{type, id, hostname, isMine}, ...] — что сейчас занято на хосте (только для режима клиента)
+
+/** Кнопка "✏️ Рисование" доступна клиенту, только если хост разрешил запись (тумблер) —
+ *  без этого переключаться в режим редактирования бессмысленно, любое действие всё
+ *  равно отклонит бэкенд. Явно показываем это ДО попытки, а не после непонятной ошибки. */
+function updateClientWritePermissionUI(allowWrites) {
+  const btn = document.getElementById('mode-switch-btn');
+  if (!btn) return;
+  btn.disabled = !allowWrites;
+  btn.title = allowWrites ? '' : 'Хост пока не разрешил изменения клиентам';
+  if (!allowWrites && !planState.viewMode) {
+    // Хост выключил тумблер, пока пользователь уже был в режиме рисования — откатываем
+    planState.viewMode = true;
+    updateModeSwitchUI();
+  }
+}
+
 function updateModeSwitchUI(initial = false) {
   const btn = document.getElementById('mode-switch-btn');
   const toolsAside = document.getElementById('plan-tools');
@@ -4436,6 +4478,59 @@ function unhighlight(node) {
   else if (kind === 'zone') { const s = node.getAttr('shapeNode'); if (s) { s.stroke(undefined); s.strokeWidth(0); } }
 }
 
+/** Кнопка запроса/освобождения права ПЕРЕМЕЩАТЬ конкретный объект на плане —
+ *  структурная блокировка 'plan_item', отдельная от блокировки данных устройства
+ *  'device' (та даётся через карточку на вкладке "Устройства"). Без неё узел просто
+ *  не перетаскивается (см. isNodeLocked). Только для clientModeActive. */
+function appendPlanItemLockButton(el, item) {
+  if (!clientModeActive) return;
+  const key = `plan_item:${item.id}`;
+  const wrap = document.createElement('div');
+  wrap.className = 'edit-lock-controls';
+  const statusEl = document.createElement('span');
+  statusEl.className = 'edit-lock-status';
+  const requestBtn = document.createElement('button');
+  requestBtn.type = 'button';
+  requestBtn.className = 'edit-lock-request-btn';
+  requestBtn.textContent = '🔒 Запросить право перемещения';
+  const releaseBtn = document.createElement('button');
+  releaseBtn.type = 'button';
+  releaseBtn.className = 'edit-lock-release-btn hidden';
+  releaseBtn.textContent = '🔓 Освободить';
+
+  const alreadyHeld = clientHeldLockKeys.has(key);
+  requestBtn.classList.toggle('hidden', alreadyHeld);
+  releaseBtn.classList.toggle('hidden', !alreadyHeld);
+  if (alreadyHeld) statusEl.textContent = '✏️ Вы можете перемещать';
+
+  requestBtn.onclick = async () => {
+    requestBtn.disabled = true;
+    statusEl.textContent = 'Запрашиваем…';
+    const result = await window.api.locks.request('plan_item', item.id);
+    requestBtn.disabled = false;
+    if (result.ok) {
+      clientHeldLockKeys.add(key);
+      applyLayerStates();
+      requestBtn.classList.add('hidden');
+      releaseBtn.classList.remove('hidden');
+      statusEl.textContent = '✏️ Вы можете перемещать';
+    } else {
+      statusEl.textContent = result.error || 'Не удалось получить право';
+    }
+  };
+  releaseBtn.onclick = async () => {
+    await window.api.locks.release('plan_item', item.id);
+    clientHeldLockKeys.delete(key);
+    applyLayerStates();
+    requestBtn.classList.remove('hidden');
+    releaseBtn.classList.add('hidden');
+    statusEl.textContent = '';
+  };
+
+  wrap.append(requestBtn, releaseBtn, statusEl);
+  el.appendChild(wrap);
+}
+
 function renderInspector(node) {
   const el = document.getElementById('inspector-content');
   if (!node) { el.innerHTML = ''; el.className = 'inspector-empty'; el.textContent = 'Ничего не выбрано'; return; }
@@ -4455,6 +4550,7 @@ function renderInspector(node) {
       el.appendChild(field('Название', item.group_label || '(без названия)'));
       el.appendChild(field('Устройств внутри', String(item.member_count ?? '—')));
       el.appendChild(field('Координаты', `x=${item.x}, y=${item.y}`));
+      appendPlanItemLockButton(el, item);
 
       const openPanelBtn = document.createElement('button');
       openPanelBtn.type = 'button';
@@ -4490,6 +4586,7 @@ function renderInspector(node) {
         // группы своего plan_item нет вообще, сеть подключается к самой группе целиком
         // (см. openGroupPanel), а не к отдельным устройствам внутри неё
         el.appendChild(field('Координаты', `x=${item.x}, y=${item.y}`));
+        appendPlanItemLockButton(el, item);
         const itemZone = findZoneForCell(item.x, item.y);
         if (itemZone) el.appendChild(field('Зона', itemZone.name));
         if (item.review_note) el.appendChild(field('⚠️ На проверку', item.review_note));
@@ -5280,6 +5377,77 @@ async function renderDeviceCableConnectionsSection(container, item, node, onChan
   }
 }
 
+/** Единая логика "запросить право редактировать перед тем, как разрешить менять форму"
+ *  — используется в карточке устройства, инспекторе плана, панели группы. type/id —
+ *  что запрашиваем ('device'|'plan_item'), formEl — форма, чьи поля дизейблить/включать
+ *  до/после получения права. Возвращает { wrap, releaseIfHeld } — wrap вставить туда,
+ *  где нужно в конкретной карточке; releaseIfHeld вызвать при закрытии/сворачивании
+ *  карточки, чтобы не держать право впустую, пока никто не смотрит. Только для
+ *  clientModeActive — для хоста/локального режима эта функция не вызывается вообще,
+ *  там как и было: форма сразу доступна без всякого согласования. */
+function createEditLockControls(type, id, formEl, { onGranted, onReleased } = {}) {
+  const wrap = document.createElement('div');
+  wrap.className = 'edit-lock-controls';
+
+  const statusEl = document.createElement('span');
+  statusEl.className = 'edit-lock-status';
+
+  const requestBtn = document.createElement('button');
+  requestBtn.type = 'button';
+  requestBtn.className = 'edit-lock-request-btn';
+  requestBtn.textContent = '🔒 Запросить право редактирования';
+
+  const releaseBtn = document.createElement('button');
+  releaseBtn.type = 'button';
+  releaseBtn.className = 'edit-lock-release-btn hidden';
+  releaseBtn.textContent = '🔓 Освободить';
+
+  function setFormEnabled(enabled) {
+    [...formEl.elements].forEach((el) => { el.disabled = !enabled; });
+  }
+
+  let held = false;
+  setFormEnabled(false); // изначально всегда заблокировано, пока право не получено явно
+
+  async function doRequest() {
+    requestBtn.disabled = true;
+    statusEl.textContent = 'Запрашиваем…';
+    const result = await window.api.locks.request(type, id);
+    requestBtn.disabled = false;
+    if (result.ok) {
+      held = true;
+      clientHeldLockKeys.add(`${type}:${id}`);
+      applyLayerStates(); // немедленно включает draggable у соответствующего узла на плане, если он там есть
+      setFormEnabled(true);
+      requestBtn.classList.add('hidden');
+      releaseBtn.classList.remove('hidden');
+      statusEl.textContent = '✏️ Вы редактируете';
+      if (onGranted) onGranted();
+    } else {
+      statusEl.textContent = result.error || 'Не удалось получить право редактирования';
+    }
+  }
+
+  async function doRelease() {
+    if (!held) return;
+    await window.api.locks.release(type, id);
+    held = false;
+    clientHeldLockKeys.delete(`${type}:${id}`);
+    applyLayerStates();
+    setFormEnabled(false);
+    requestBtn.classList.remove('hidden');
+    releaseBtn.classList.add('hidden');
+    statusEl.textContent = '';
+    if (onReleased) onReleased();
+  }
+
+  requestBtn.onclick = doRequest;
+  releaseBtn.onclick = doRelease;
+
+  wrap.append(requestBtn, releaseBtn, statusEl);
+  return { wrap, releaseIfHeld: doRelease };
+}
+
 async function renderDeviceExtras(container, deviceId, onChanged = () => renderInspector(planState.selectedNode)) {
   const [history, components, peripherals, software, statusHistory, hostedVMs] = await Promise.all([
     window.api.ownership.history(deviceId),
@@ -5575,17 +5743,22 @@ async function refreshDbSettingsInfo() {
   const sharedStatusEl = document.getElementById('db-shared-access-status');
   sharedStatusEl.classList.remove('is-host', 'is-client');
   const clientsEl = document.getElementById('db-connected-clients');
+  const allowWritesRow = document.getElementById('db-allow-writes-row');
   if (info.mode === 'host') {
     sharedStatusEl.textContent = `🖧 Вы — хост. Порт ${info.hostPort}. Остальные подключаются по вашему IP-адресу и этому порту.`;
     sharedStatusEl.classList.add('is-host');
     await refreshConnectedClients();
+    allowWritesRow.classList.remove('hidden');
+    document.getElementById('db-allow-writes-checkbox').checked = await window.api.settings.getAllowClientWrites();
   } else if (info.mode === 'client') {
-    sharedStatusEl.textContent = `🔌 Вы подключены как клиент к ${info.remoteHost} — только просмотр.`;
+    sharedStatusEl.textContent = `🔌 Вы подключены как клиент к ${info.remoteHost}.`;
     sharedStatusEl.classList.add('is-client');
     clientsEl.classList.add('hidden');
+    allowWritesRow.classList.add('hidden');
   } else {
     sharedStatusEl.textContent = 'Обычный режим — БД открыта только этим приложением.';
     clientsEl.classList.add('hidden');
+    allowWritesRow.classList.add('hidden');
   }
 
   return info;
@@ -5628,6 +5801,10 @@ function bindDbSettingsModal() {
   document.getElementById('db-settings-close').addEventListener('click', () => {
     overlay.classList.add('hidden');
     if (clientsRefreshTimer) { clearInterval(clientsRefreshTimer); clientsRefreshTimer = null; }
+  });
+
+  document.getElementById('db-allow-writes-checkbox').addEventListener('change', async (e) => {
+    await window.api.settings.setAllowClientWrites(e.target.checked);
   });
 
   async function connectAndRelaunch(filePath, confirmText) {
@@ -5744,10 +5921,10 @@ function showToast(message, type = 'error', durationMs = 5000) {
   return toast;
 }
 
-/** Обновляет баннер "только просмотр" под актуальный статус связи с хостом —
- *  вызывается и один раз при старте, и при каждой смене статуса (см. подписку
- *  onHostConnectivityChanged ниже). reachable=null — режим клиента, но статус ещё
- *  не проверялся повторно (сразу после старта, до первого heartbeat). */
+/** Обновляет баннер под актуальный статус связи с хостом И текущее разрешение на
+ *  запись — вызывается при старте, при каждой смене статуса связи и при каждом
+ *  изменении тумблера хоста (см. onHostConnectivityChanged/onLocksStateChanged ниже).
+ *  reachable=null — статус ещё не проверялся повторно (сразу после старта). */
 function updateReadOnlyBanner(remoteHost, reachable) {
   const banner = document.getElementById('read-only-banner');
   banner.innerHTML = '';
@@ -5756,9 +5933,11 @@ function updateReadOnlyBanner(remoteHost, reachable) {
   const msg = document.createElement('span');
   if (reachable === false) {
     banner.classList.add('banner-danger');
-    msg.textContent = `⚠️ Связь с хостом ${remoteHost} потеряна — данные могут быть устаревшими. Редактирование по-прежнему недоступно.`;
+    msg.textContent = `⚠️ Связь с хостом ${remoteHost} потеряна — данные могут быть устаревшими. Редактирование недоступно.`;
+  } else if (clientAllowWritesFlag) {
+    msg.textContent = `🔌 Подключено к хосту ${remoteHost}. Хост разрешил изменения — откройте объект и запросите право редактирования.`;
   } else {
-    msg.textContent = `🔌 Только просмотр — подключено к хосту ${remoteHost}. Редактирование недоступно в этом режиме.`;
+    msg.textContent = `🔌 Только просмотр — подключено к хосту ${remoteHost}. Хост пока не разрешил изменения клиентам.`;
   }
   banner.appendChild(msg);
 
@@ -5797,14 +5976,14 @@ window.addEventListener('api-error', (e) => {
   }
 
   if (info.mode === 'client') {
-    // Только просмотр: подключены к чужому хосту по сети — принудительно фиксируем
-    // planState.viewMode (уже полностью реализованная и протестированная блокировка
-    // редактирования плана) ДО initPlan(), чтобы UI плана сразу инициализировался в
-    // правильном состоянии, а не переключался постфактум. Бэкенд в любом случае
+    clientModeActive = true;
+    // Только просмотр по умолчанию, пока не узнаем реальное состояние тумблера хоста
+    // (см. ниже onLocksStateChanged) — безопасный старт. Бэкенд в любом случае
     // отклоняет любые попытки записи независимо от состояния интерфейса (см.
     // main/index.js) — это лишь UX-подсказка поверх уже гарантированной защиты.
     planState.viewMode = true;
     updateReadOnlyBanner(info.remoteHost, info.hostReachable);
+    updateClientWritePermissionUI(false); // кнопка режима задизейблена, пока не узнаем реальное состояние
 
     // Живой статус связи — раньше проверка была только один раз на старте; теперь
     // при КАЖДОЙ смене статуса (хост пропал/вернулся) main-процесс шлёт событие
@@ -5813,6 +5992,27 @@ window.addEventListener('api-error', (e) => {
       updateReadOnlyBanner(remoteHost, reachable);
       if (reachable) showToast('✅ Связь с хостом восстановлена', 'success', 4000);
       else showToast('⚠️ Связь с хостом потеряна — проверьте сеть', 'warning', 8000);
+    });
+
+    // Тумблер "разрешить клиентам менять" (хост) + список занятых объектов — приходит
+    // на каждый heartbeat-тик (первый — сразу при подключении, не через 10 секунд).
+    // Кнопка режима "✏️ Рисование" разблокируется/блокируется по факту — переключаться
+    // в редактирование, когда хост его не разрешил, бессмысленно (любое действие
+    // отклонит бэкенд), лучше явно показать это ДО попытки, а не после.
+    window.api.events.onLocksStateChanged(({ allowWrites, allLocks, rejected }) => {
+      clientAllLocks = allLocks || [];
+      clientAllowWritesFlag = allowWrites;
+      updateClientWritePermissionUI(allowWrites);
+      // Событие приходит только когда связь с хостом реально жива (main-процесс
+      // проверяет это перед отправкой) — reachable=true здесь безопасно
+      updateReadOnlyBanner(info.remoteHost, true);
+      if (rejected && rejected.length > 0) {
+        // Что-то из ранее полученного вдруг отклонено (хост выключил тумблер, или
+        // блокировка протухла на бэкенде по какой-то причине) — синхронизируем канву
+        let changed = false;
+        rejected.forEach((r) => { if (clientHeldLockKeys.delete(`${r.type}:${r.id}`)) changed = true; });
+        if (changed) applyLayerStates();
+      }
     });
 
     // Данные отданы из локального кэша (сети сейчас нет) — троттлим тем же способом,
@@ -5825,34 +6025,35 @@ window.addEventListener('api-error', (e) => {
       lastStaleCacheToastAt = now;
       showToast('📦 Показаны сохранённые ранее данные — сети нет', 'warning', 6000);
     });
-
-    // Кто-то ДРУГОЙ (хост) что-то изменил, пока мы подключены как клиент — переиспользует
-    // уже существующий журнал изменений (audit_log) вместо отдельного механизма
-    // уведомлений: heartbeat в main/index.js периодически проверяет новые записи и
-    // присылает их сюда. Обновление тихое и без участия пользователя (никакой кнопки
-    // "Обновить" — раньше план требовал явного клика, теперь применяется само), тост
-    // с кратким описанием при этом остаётся.
-    window.api.events.onDataChanged(async (changes) => {
-      if (!changes || changes.length === 0) return;
-      renderUsers();
-      renderDevices();
-      renderWarehouse();
-      renderSoftwareRegistry();
-      const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
-      if (activeTab === 'network') renderNetworkTab();
-      if (activeTab === 'audit') loadAuditLog();
-      // План обновляется в фоне ВСЕГДА, не только когда эта вкладка сейчас видна —
-      // канва существует независимо от того, какая вкладка активна (просто скрыта CSS),
-      // так что к моменту, когда пользователь на неё переключится, она уже будет свежей
-      fillDevicePicker(); fillUserDragList(); fillWarehouseDragList();
-      await applyPlanChangesQuietly(changes);
-
-      const summaryText = changes.length === 1
-        ? changes[0].summary
-        : `${changes.length} изменени${changes.length < 5 ? 'я' : 'й'}: ${changes[changes.length - 1].summary}`;
-      showToast(`🔄 ${summaryText}`, 'success', 9000);
-    });
   }
+
+  // Кто-то ДРУГОЙ изменил данные — для клиента это хост (или другой клиент через
+  // хост), для хоста это подключённый клиент, воспользовавшийся правом на запись
+  // (см. writeLocks.js). Переиспользует уже существующий журнал изменений (audit_log)
+  // вместо отдельного механизма уведомлений — для клиента событие приходит через
+  // heartbeat (см. startClientHeartbeat в main/index.js), для хоста — сразу после
+  // успешной записи от клиента (см. notifyHostOfClientWrite). Обновление тихое и без
+  // участия пользователя, тост с кратким описанием при этом остаётся.
+  window.api.events.onDataChanged(async (changes) => {
+    if (!changes || changes.length === 0) return;
+    renderUsers();
+    renderDevices();
+    renderWarehouse();
+    renderSoftwareRegistry();
+    const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
+    if (activeTab === 'network') renderNetworkTab();
+    if (activeTab === 'audit') loadAuditLog();
+    // План обновляется в фоне ВСЕГДА, не только когда эта вкладка сейчас видна —
+    // канва существует независимо от того, какая вкладка активна (просто скрыта CSS),
+    // так что к моменту, когда пользователь на неё переключится, она уже будет свежей
+    fillDevicePicker(); fillUserDragList(); fillWarehouseDragList();
+    await applyPlanChangesQuietly(changes);
+
+    const summaryText = changes.length === 1
+      ? changes[0].summary
+      : `${changes.length} изменени${changes.length < 5 ? 'я' : 'й'}: ${changes[changes.length - 1].summary}`;
+    showToast(`🔄 ${summaryText}`, 'success', 9000);
+  });
 
   renderUsers();
   renderDevices();

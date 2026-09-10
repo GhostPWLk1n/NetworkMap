@@ -132,6 +132,19 @@ function getRemoteHost() {
   return loadDbConfig().remoteHost || null;
 }
 
+/** Глобальный тумблер «разрешить клиентам вносить изменения» — по умолчанию выключен
+ *  (клиенты только просмотр, как и было изначально). Персистентен — переживает
+ *  перезапуск хоста, в отличие от самих блокировок (см. writeLocks.js), которым это
+ *  не нужно: после перезапуска все активные блокировки и так должны сброситься. */
+function getAllowClientWrites() {
+  return !!loadDbConfig().allowClientWrites;
+}
+function setAllowClientWrites(allow) {
+  const cfg = loadDbConfig();
+  cfg.allowClientWrites = !!allow;
+  saveDbConfig(cfg);
+}
+
 /** dbPath здесь всегда ЛОКАЛЬНЫЙ файл (или null = дефолтный локальный путь) —
  *  UI обязан предупредить пользователя не указывать сюда сетевой путь, в этом весь
  *  смысл режима "хост": файл открывает только один процесс, остальные — по сети.
@@ -1923,5 +1936,6 @@ module.exports = {
   ownershipRepo, componentsRepo, peripheralsRepo,
   softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
-  getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath
+  getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
+  getAllowClientWrites, setAllowClientWrites
 };

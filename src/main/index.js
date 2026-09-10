@@ -8,7 +8,8 @@ const {
   initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
-  getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath
+  getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
+  getAllowClientWrites, setAllowClientWrites
 } = require('./db');
 const { pingHost } = require('./ping');
 const { importExcel } = require('./import');
@@ -17,6 +18,7 @@ const { startRpcServer } = require('./rpcServer');
 const { rpcCall, rpcPing } = require('./rpcClient');
 const { publishHostMarker, updateHostMarker, removeHostMarker, readHostMarker, findActiveMarkersInDir, cleanupStaleMarkersInDir } = require('./discovery');
 const { initLocalCache, saveToCache, readFromCache, hasAnyCache, forceFlush } = require('./localCache');
+const writeLocks = require('./writeLocks');
 
 let mainWindow;
 let rpcServerInstance = null; // держим ссылку, чтобы можно было закрыть порт при выходе
@@ -27,7 +29,8 @@ let connectivityHeartbeatTimer = null; // клиентский режим — п
 // перезапусками — при следующем запуске сгенерируется новый) — чтобы хост видел, что
 // это тот же самый клиент, а не новый, если несколько раз пинганёт за одну сессию.
 const clientInstanceId = crypto.randomUUID();
-let lastKnownAuditId = null; // с какого id отслеживаем новые записи журнала — сбрасывается при (пере)подключении
+let lastKnownAuditId = null; // с какого id отслеживаем новые записи журнала — сбрасывается при (пере)подключении (клиентский режим)
+let hostLastNotifiedAuditId = null; // то же самое, но для СОБСТВЕННОГО окна хоста — отслеживает, что уже показано, когда меняет клиент
 // Режим "хост": кто сейчас пингует — clientId -> { hostname, lastSeenAt }. Без этого
 // хост формально не видел подключённых клиентов, только раздавал им данные по запросу.
 const connectedClients = new Map();
@@ -63,6 +66,57 @@ function createWindow() {
  *   - клиент: read-вызовы уходят по сети на хост (rpcClient.js), write — отклоняются
  *     сразу на месте, даже не пытаясь стучаться на хост
  */
+/** Обработчик locks:heartbeat — вызывается клиентом на каждом тике (см.
+ *  startClientHeartbeat), heldKeys — то, что клиент сейчас реально держит открытым
+ *  для редактирования. Если глобальный тумблер выключен — ничего не выдаём и снимаем
+ *  всё, что было (на случай если тумблер выключили ПОКА клиент уже что-то держал). */
+function handleLocksHeartbeat({ clientId, hostname, heldKeys }) {
+  if (!getAllowClientWrites()) {
+    writeLocks.releaseAllForClient(clientId);
+    return { allowWrites: false, acquired: [], rejected: (heldKeys || []).map((k) => ({ ...k, heldBy: null, reason: 'writes-disabled' })), allLocks: [] };
+  }
+  return { allowWrites: true, ...writeLocks.syncClientLocks(clientId, hostname, heldKeys || []) };
+}
+
+/** Проверка прав ПЕРЕД любой write-операцией, пришедшей по сети (см. authorizeWrite в
+ *  startRpcServer) — локальные вызовы самого хоста сюда вообще не попадают, хост всегда
+ *  полный хозяин своих данных. Два уровня: сначала общий тумблер (без него — отказ
+ *  сразу, точечные разрешения на будущее сюда же и добавятся), затем — если у канала
+ *  задан lockEntity — владение конкретным объектом (модель "взялся — ходи"). */
+function authorizeWrite(channel, payload, clientId, hostname) {
+  if (!getAllowClientWrites()) {
+    return { ok: false, error: 'Изменения от клиентов сейчас не разрешены хостом.' };
+  }
+  const entry = RPC_HANDLERS[channel];
+  if (entry && entry.lockEntity) {
+    const entity = entry.lockEntity(payload);
+    if (entity && entity.id != null && !writeLocks.canWrite(clientId, entity.type, entity.id)) {
+      const holder = writeLocks.whoHolds(entity.type, entity.id);
+      return { ok: false, error: `Сейчас редактируется другим клиентом (${holder ? holder.hostname : '?'}) — подождите, пока он закончит.` };
+    }
+  }
+  return { ok: true };
+}
+
+/** Вызывается ПОСЛЕ каждой успешной write-операции, пришедшей по сети от клиента (см.
+ *  onWriteSuccess в startRpcServer) — раньше хост о таких изменениях вообще не узнавал:
+ *  клиент их видел (сам инициировал), а собственное окно хоста просто не было ни на что
+ *  подписано. Переиспользует ТОТ ЖЕ журнал и ТОТ ЖЕ канал 'data-changed', что клиент уже
+ *  использует для отслеживания изменений хоста — рендерер хоста обрабатывает событие
+ *  совершенно одинаково, независимо от того, кто был инициатором. */
+function notifyHostOfClientWrite() {
+  if (hostLastNotifiedAuditId === null) {
+    hostLastNotifiedAuditId = auditLogRepo.latestId(); // первый вызов — точка отсчёта, не заваливаем всей историей
+    return;
+  }
+  const changes = auditLogRepo.listSince(hostLastNotifiedAuditId);
+  if (changes.length === 0) return;
+  hostLastNotifiedAuditId = changes[changes.length - 1].id;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('data-changed', changes);
+  }
+}
+
 const RPC_HANDLERS = {
   'users:list': { write: false, fn: () => usersRepo.list() },
   'users:create': { write: true, fn: (payload) => usersRepo.create(payload) },
@@ -73,10 +127,10 @@ const RPC_HANDLERS = {
 
   'devices:list': { write: false, fn: () => devicesRepo.list() },
   'devices:create': { write: true, fn: (payload) => devicesRepo.create(payload) },
-  'devices:update': { write: true, fn: ({ id, payload }) => devicesRepo.update(id, payload) },
+  'devices:update': { write: true, lockEntity: (p) => ({ type: 'device', id: p.id }), fn: ({ id, payload }) => devicesRepo.update(id, payload) },
   'devices:setStatus': { write: true, fn: ({ id, status, note }) => devicesRepo.setStatus(id, status, note) },
   'devices:setFlag': { write: true, fn: ({ id, flag }) => devicesRepo.setFlag(id, flag) },
-  'devices:setUplink': { write: true, fn: ({ id, uplinkDeviceId }) => devicesRepo.setUplink(id, uplinkDeviceId) },
+  'devices:setUplink': { write: true, lockEntity: (p) => ({ type: 'device', id: p.id }), fn: ({ id, uplinkDeviceId }) => devicesRepo.setUplink(id, uplinkDeviceId) },
   'devices:statusHistory': { write: false, fn: (id) => devicesRepo.statusHistory(id) },
   'devices:listVMsByHost': { write: false, fn: (hostDeviceId) => devicesRepo.listVMsByHost(hostDeviceId) },
   'devices:remove': { write: true, fn: (id) => devicesRepo.remove(id) },
@@ -100,19 +154,19 @@ const RPC_HANDLERS = {
 
   'planItems:list': { write: false, fn: (floorPlanId) => planItemsRepo.listByPlan(floorPlanId) },
   'planItems:create': { write: true, fn: (payload) => planItemsRepo.create(payload) },
-  'planItems:move': { write: true, fn: ({ id, x, y }) => planItemsRepo.move(id, x, y) },
-  'planItems:setRotation': { write: true, fn: ({ id, rotation }) => planItemsRepo.setRotation(id, rotation) },
-  'planItems:remove': { write: true, fn: (id) => planItemsRepo.remove(id) },
+  'planItems:move': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, x, y }) => planItemsRepo.move(id, x, y) },
+  'planItems:setRotation': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, rotation }) => planItemsRepo.setRotation(id, rotation) },
+  'planItems:remove': { write: true, lockEntity: (id) => ({ type: 'plan_item', id }), fn: (id) => planItemsRepo.remove(id) },
   'planItems:findByDeviceRef': { write: false, fn: (deviceId) => planItemsRepo.findByDeviceRef(deviceId) },
   'planItems:listPlacedDeviceIds': { write: false, fn: () => planItemsRepo.listPlacedDeviceIds() },
   'planItems:listAllDevicePlacements': { write: false, fn: () => planItemsRepo.listAllDevicePlacements() },
-  'planItems:setReviewNote': { write: true, fn: ({ id, note }) => planItemsRepo.setReviewNote(id, note) },
-  'planItems:setNetworkRole': { write: true, fn: ({ id, role }) => planItemsRepo.setNetworkRole(id, role) },
+  'planItems:setReviewNote': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, note }) => planItemsRepo.setReviewNote(id, note) },
+  'planItems:setNetworkRole': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, role }) => planItemsRepo.setNetworkRole(id, role) },
   'planItems:placeDeviceWithGrouping': { write: true, fn: ({ floorPlanId, deviceId, x, y }) => planItemsRepo.placeDeviceWithGrouping(floorPlanId, deviceId, x, y) },
   'planItems:moveDeviceItemWithGrouping': { write: true, fn: ({ oldItemId, floorPlanId, deviceId, x, y }) => planItemsRepo.moveDeviceItemWithGrouping(oldItemId, floorPlanId, deviceId, x, y) },
   'planItems:groupMembers': { write: false, fn: (groupItemId) => planItemsRepo.groupMembers(groupItemId) },
-  'planItems:removeFromGroup': { write: true, fn: ({ groupItemId, deviceId }) => planItemsRepo.removeFromGroup(groupItemId, deviceId) },
-  'planItems:renameGroup': { write: true, fn: ({ groupItemId, label }) => planItemsRepo.renameGroup(groupItemId, label) },
+  'planItems:removeFromGroup': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.groupItemId }), fn: ({ groupItemId, deviceId }) => planItemsRepo.removeFromGroup(groupItemId, deviceId) },
+  'planItems:renameGroup': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.groupItemId }), fn: ({ groupItemId, label }) => planItemsRepo.renameGroup(groupItemId, label) },
 
   'cables:list': { write: false, fn: (floorPlanId) => cablesRepo.listByPlan(floorPlanId) },
   'cables:get': { write: false, fn: (id) => cablesRepo.get(id) },
@@ -128,8 +182,8 @@ const RPC_HANDLERS = {
 
   'ownership:history': { write: false, fn: (deviceId) => ownershipRepo.history(deviceId) },
   'ownership:historyForUser': { write: false, fn: (userId) => ownershipRepo.historyForUser(userId) },
-  'ownership:assign': { write: true, fn: ({ deviceId, userId }) => ownershipRepo.assign(deviceId, userId) },
-  'ownership:unassign': { write: true, fn: (deviceId) => ownershipRepo.unassign(deviceId) },
+  'ownership:assign': { write: true, lockEntity: (p) => ({ type: 'device', id: p.deviceId }), fn: ({ deviceId, userId }) => ownershipRepo.assign(deviceId, userId) },
+  'ownership:unassign': { write: true, lockEntity: (id) => ({ type: 'device', id }), fn: (deviceId) => ownershipRepo.unassign(deviceId) },
 
   'components:list': { write: false, fn: (deviceId) => componentsRepo.listByDevice(deviceId) },
   'components:listAllActive': { write: false, fn: () => componentsRepo.listAllActive() },
@@ -169,7 +223,12 @@ const RPC_HANDLERS = {
 
   'auditLog:list': { write: false, fn: (filters) => auditLogRepo.list(filters) },
   'auditLog:listSince': { write: false, fn: (sinceId) => auditLogRepo.listSince(sinceId) },
-  'auditLog:latestId': { write: false, fn: () => auditLogRepo.latestId() }
+  'auditLog:latestId': { write: false, fn: () => auditLogRepo.latestId() },
+
+  // Не бизнес-данные (не БД) — сама проверка прав живёт внутри функции, не через общий
+  // authorizeWrite; см. handleLocksHeartbeat ниже. write:false — вызов разрешён всегда,
+  // а вот РЕЗУЛЬТАТ (что реально выдано) зависит от тумблера и занятости объектов.
+  'locks:heartbeat': { write: false, fn: (p) => handleLocksHeartbeat(p) }
 };
 
 const CLIENT_MODE_IMPORT_ERROR = 'Импорт недоступен в режиме клиента — выполните его на компьютере-хосте, у которого есть прямой доступ к базе.';
@@ -183,11 +242,17 @@ function registerIpcHandlers() {
     const remoteHost = getRemoteHost();
     Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn }]) => {
       ipcMain.handle(channel, async (_event, payload) => {
+        const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
         if (write) {
-          throw new Error('Только просмотр — вы подключены как клиент к общему хосту, редактирование недоступно в этом режиме.');
+          // Решение "можно/нельзя" теперь принимает ИСКЛЮЧИТЕЛЬНО хост (тумблер +
+          // блокировки, см. authorizeWrite) — раньше клиент отказывал сам себе по
+          // жёсткому правилу "запись = нет", без всякой возможности это разрешить.
+          // Кэшировать write-результаты не нужно (не идемпотентные операции) и
+          // повторять из кэша при сбое сети тоже нельзя — просто пробрасываем ошибку.
+          return rpcCall(remoteHost, channel, payload, 10000, clientInfo);
         }
         try {
-          const result = await rpcCall(remoteHost, channel, payload);
+          const result = await rpcCall(remoteHost, channel, payload, 10000, clientInfo);
           saveToCache(channel, payload, result); // свежий успешный ответ — обновляем локальный кэш
           return result;
         } catch (err) {
@@ -212,11 +277,34 @@ function registerIpcHandlers() {
     ['import:excelDevices', 'import:pcInfoPickFile', 'import:pcInfoPickFolder', 'import:pcInfoApply'].forEach((channel) => {
       ipcMain.handle(channel, () => { throw new Error(CLIENT_MODE_IMPORT_ERROR); });
     });
+
+    // Запрос/освобождение права на редактирование конкретного объекта — модель
+    // "взялся — ходи" (см. writeLocks.js). Только клиентский режим: у хоста нет
+    // смысла "запрашивать" разрешение у самого себя, он всегда полный хозяин.
+    ipcMain.handle('locks:requestLock', (_event, { type, id }) => requestLock(type, id));
+    ipcMain.handle('locks:releaseLock', (_event, { type, id }) => releaseLock(type, id));
   } else {
     // local ИЛИ host — как раньше, прямые вызовы репозиториев
-    Object.entries(RPC_HANDLERS).forEach(([channel, { fn }]) => {
-      ipcMain.handle(channel, (_event, payload) => fn(payload));
+    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn }]) => {
+      ipcMain.handle(channel, async (_event, payload) => {
+        const result = await fn(payload);
+        if (write && mode === 'host' && hostLastNotifiedAuditId !== null) {
+          // Собственное локальное действие хоста тоже сдвигает точку отсчёта — иначе
+          // при следующей записи от клиента notifyHostOfClientWrite() заново покажет
+          // хосту его же локальные изменения, сделанные между стартом сервера и этим
+          // моментом (хост их и так уже видит напрямую — обновление UI после ЛОКАЛЬНОГО
+          // действия делает сам вызывающий код, а не data-changed)
+          hostLastNotifiedAuditId = auditLogRepo.latestId();
+        }
+        return result;
+      });
     });
+
+    // Настройка "разрешить клиентам менять" — только для собственного UI хоста
+    // (не через сеть; сами клиенты меняют её тем, что запрашивают/используют право
+    // записи, но включает/выключает тумблер только сам хост локально)
+    ipcMain.handle('settings:getAllowClientWrites', () => getAllowClientWrites());
+    ipcMain.handle('settings:setAllowClientWrites', (_event, allow) => { setAllowClientWrites(allow); return getAllowClientWrites(); });
 
     ipcMain.handle('import:excelDevices', async () => {
       const picked = await dialog.showOpenDialog(mainWindow, {
@@ -401,36 +489,97 @@ function registerIpcHandlers() {
  *  2) пока хост доступен, на каждом тике проверяет журнал (audit_log) на новые записи
  *     с последнего раза и рассылает их в интерфейс событием 'data-changed' — переиспользует
  *     уже существующий журнал изменений вместо отдельного механизма уведомлений. */
+let clientHeldKeys = []; // [{type, id}, ...] — то, что клиент СЕЙЧАС держит открытым для редактирования
+
+/** Немедленный запрос на захват конкретного объекта — не дожидаясь фонового
+ *  heartbeat-тика (иначе пользователь ждал бы до 10 секунд, чтобы узнать, получил ли
+ *  он право редактировать). Переиспользует ту же locks:heartbeat операцию на хосте —
+ *  просто вызывает её сразу, с обновлённым списком held keys, вместо ожидания тика. */
+async function requestLock(type, id) {
+  const remoteHost = getRemoteHost();
+  if (!remoteHost) return { ok: false, error: 'Не подключены к хосту' };
+  const alreadyHeld = clientHeldKeys.some((k) => k.type === type && k.id === id);
+  const nextKeys = alreadyHeld ? clientHeldKeys : [...clientHeldKeys, { type, id }];
+  const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+  let result;
+  try {
+    result = await rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: nextKeys }, 8000);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+  if (!result.allowWrites) return { ok: false, error: 'Изменения от клиентов сейчас не разрешены хостом.' };
+  const rejected = result.rejected.find((r) => r.type === type && r.id === id);
+  if (rejected) {
+    return { ok: false, error: `Сейчас редактируется другим клиентом (${rejected.heldBy || '?'})`, heldBy: rejected.heldBy };
+  }
+  clientHeldKeys = nextKeys; // успешно — запоминаем, чтобы фоновые тики продлевали сами
+  return { ok: true, allLocks: result.allLocks };
+}
+
+/** Немедленное освобождение — тоже не дожидается фонового тика, чтобы объект стал
+ *  доступен другим клиентам сразу после закрытия карточки, а не через 10 секунд.
+ *  Best-effort — не блокируем UI на ответ хоста, локальный список уже обновлён. */
+function releaseLock(type, id) {
+  clientHeldKeys = clientHeldKeys.filter((k) => !(k.type === type && k.id === id));
+  const remoteHost = getRemoteHost();
+  if (!remoteHost) return;
+  const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+  rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000).catch(() => {});
+}
+
+async function heartbeatTick(remoteHost) {
+  const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+  const stillAlive = await rpcPing(remoteHost, 5000, clientInfo);
+
+  if (stillAlive !== hostReachable) {
+    hostReachable = stillAlive;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('host-connectivity-changed', { reachable: hostReachable, remoteHost });
+    }
+    if (stillAlive) {
+      // Только что переподключились — начинаем отслеживать изменения ЗАНОВО с этой
+      // точки, а не заваливаем клиента всей историей за время отключения
+      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 5000); } catch { /* попробуем на следующем тике */ }
+    }
+  }
+
+  if (stillAlive && lastKnownAuditId !== null) {
+    try {
+      const changes = await rpcCall(remoteHost, 'auditLog:listSince', lastKnownAuditId, 5000);
+      if (changes.length > 0) {
+        lastKnownAuditId = changes[changes.length - 1].id;
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('data-changed', changes);
+        }
+      }
+    } catch { /* сеть могла на миг подвести именно на этом запросе — попробуем на следующем тике */ }
+  }
+
+  if (stillAlive) {
+    // Продлеваем то, что реально держим открытым (см. clientHeldKeys/requestLock) —
+    // без этого блокировка протухла бы через минуту бездействия, даже если карточка
+    // всё ещё открыта. Заодно узнаём актуальный тумблер хоста и список ВСЕХ занятых
+    // объектов (не только своих) — интерфейсу нужно показывать, что занято чужим.
+    try {
+      const locksResult = await rpcCall(remoteHost, 'locks:heartbeat',
+        { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000);
+      if (locksResult.rejected && locksResult.rejected.length > 0) {
+        // Что-то из ранее удерживаемого вдруг отклонено (например, хост выключил
+        // тумблер посреди сессии) — синхронизируем локальный список под реальность
+        const rejectedKeys = new Set(locksResult.rejected.map((r) => `${r.type}:${r.id}`));
+        clientHeldKeys = clientHeldKeys.filter((k) => !rejectedKeys.has(`${k.type}:${k.id}`));
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('locks-state-changed', locksResult);
+      }
+    } catch { /* сеть могла на миг подвести именно на этом запросе — попробуем на следующем тике */ }
+  }
+}
+
 function startClientHeartbeat(remoteHost) {
   if (connectivityHeartbeatTimer) clearInterval(connectivityHeartbeatTimer);
-  connectivityHeartbeatTimer = setInterval(async () => {
-    const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-    const stillAlive = await rpcPing(remoteHost, 5000, clientInfo);
-
-    if (stillAlive !== hostReachable) {
-      hostReachable = stillAlive;
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('host-connectivity-changed', { reachable: hostReachable, remoteHost });
-      }
-      if (stillAlive) {
-        // Только что переподключились — начинаем отслеживать изменения ЗАНОВО с этой
-        // точки, а не заваливаем клиента всей историей за время отключения
-        try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 5000); } catch { /* попробуем на следующем тике */ }
-      }
-    }
-
-    if (stillAlive && lastKnownAuditId !== null) {
-      try {
-        const changes = await rpcCall(remoteHost, 'auditLog:listSince', lastKnownAuditId, 5000);
-        if (changes.length > 0) {
-          lastKnownAuditId = changes[changes.length - 1].id;
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('data-changed', changes);
-          }
-        }
-      } catch { /* сеть могла на миг подвести именно на этом запросе — попробуем на следующем тике */ }
-    }
-  }, 10000);
+  heartbeatTick(remoteHost); // немедленно — иначе тумблер/блокировки узнали бы только через 10 секунд
+  connectivityHeartbeatTimer = setInterval(() => heartbeatTick(remoteHost), 10000);
 }
 
 function probeDbConnection(userDataPath, timeoutMs = 8000) {
@@ -517,9 +666,10 @@ app.whenReady().then(async () => {
 
     if (mode === 'host') {
       try {
+        hostLastNotifiedAuditId = auditLogRepo.latestId(); // точка отсчёта сразу — далее синхронизируется на лету после каждого локального действия хоста (см. ветку local/host ниже), поэтому первая же запись клиента покажет только её саму, а не накопленную локальную историю
         rpcServerInstance = await startRpcServer(getHostPort(), RPC_HANDLERS, (clientId, hostname) => {
           connectedClients.set(clientId, { hostname, lastSeenAt: Date.now() });
-        });
+        }, authorizeWrite, notifyHostOfClientWrite);
 
         const discoveryPath = getDiscoveryPath();
         if (discoveryPath) {
@@ -563,5 +713,14 @@ app.on('window-all-closed', () => {
   if (connectivityHeartbeatTimer) clearInterval(connectivityHeartbeatTimer);
   forceFlush(); // последние секунды кэша могли ещё не долететь до диска по дебаунсу
   if (ownMarkerPath) removeHostMarker(ownMarkerPath); // штатный выход — убираем ТОЛЬКО свой маячок, не чужие
+  if (getAppMode() === 'client' && clientHeldKeys.length > 0) {
+    // Best-effort — не ждём ответа и не блокируем выход; если не успеет долететь,
+    // блокировки всё равно сами протухнут на хосте через минуту бездействия
+    const remoteHost = getRemoteHost();
+    if (remoteHost) {
+      const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
+      rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: [] }, 2000).catch(() => {});
+    }
+  }
   if (process.platform !== 'darwin') app.quit();
 });

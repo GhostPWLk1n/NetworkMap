@@ -9,21 +9,28 @@ const http = require('http');
 /** remoteHost — строка вида "192.168.1.42:47821" (без протокола). При сетевом сбое
  *  (таймаут/обрыв соединения — не путать с ответом хоста {ok:false}, там повтор
  *  бессмысленен) делает один повтор через секунду — переживает короткие сетевые
- *  заминки без участия пользователя. */
-function rpcCall(remoteHost, channel, payload, timeoutMs = 10000) {
-  return attemptRpcCall(remoteHost, channel, payload, timeoutMs, false);
+ *  заминки без участия пользователя. clientInfo ({ clientId, hostname }) передаётся в
+ *  теле запроса — хосту нужно знать, ЧЕЙ это запрос, чтобы для write-операций сверить
+ *  с блокировками на редактирование (см. writeLocks.js/authorizeWrite в main/index.js);
+ *  для read-запросов хост его просто не использует, но передаём всегда единообразно. */
+function rpcCall(remoteHost, channel, payload, timeoutMs = 10000, clientInfo = null) {
+  return attemptRpcCall(remoteHost, channel, payload, timeoutMs, false, clientInfo);
 }
 
-function attemptRpcCall(remoteHost, channel, payload, timeoutMs, isRetry) {
+function attemptRpcCall(remoteHost, channel, payload, timeoutMs, isRetry, clientInfo) {
   return new Promise((resolve, reject) => {
     const [hostname, portStr] = remoteHost.split(':');
     const port = Number(portStr) || 80;
-    const body = JSON.stringify({ channel, payload });
+    const body = JSON.stringify({
+      channel, payload,
+      clientId: clientInfo ? clientInfo.clientId : null,
+      hostname: clientInfo ? clientInfo.hostname : null
+    });
 
     const retryOrReject = (err) => {
       if (isRetry) { reject(err); return; }
       setTimeout(() => {
-        attemptRpcCall(remoteHost, channel, payload, timeoutMs, true).then(resolve, reject);
+        attemptRpcCall(remoteHost, channel, payload, timeoutMs, true, clientInfo).then(resolve, reject);
       }, 1000);
     };
 

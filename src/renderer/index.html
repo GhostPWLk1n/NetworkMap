@@ -474,6 +474,11 @@
 
       <div id="db-shared-access-status" class="db-shared-status"></div>
       <div id="db-connected-clients" class="hidden"></div>
+      <label id="db-allow-writes-row" class="hidden db-allow-writes-row">
+        <input type="checkbox" id="db-allow-writes-checkbox" />
+        Разрешить клиентам вносить изменения (модель «взялся — ходи»: кто первый открыл объект для
+        редактирования, тот и держит право на него, пока не закроет или не станет неактивен)
+      </label>
 
       <div class="db-shared-columns">
         <div class="db-shared-column">

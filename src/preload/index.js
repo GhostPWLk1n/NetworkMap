@@ -29,7 +29,15 @@ contextBridge.exposeInMainWorld('api', {
     setHostMode: (dbPath, hostPort, discoveryPath) => invoke('settings:setHostMode', { dbPath, hostPort, discoveryPath }),
     setClientMode: (remoteHost) => invoke('settings:setClientMode', remoteHost),
     pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost),
-    getConnectedClients: () => invoke('settings:getConnectedClients')
+    getConnectedClients: () => invoke('settings:getConnectedClients'),
+    getAllowClientWrites: () => invoke('settings:getAllowClientWrites'),
+    setAllowClientWrites: (allow) => invoke('settings:setAllowClientWrites', allow)
+  },
+  locks: {
+    /** Запрос права редактировать конкретный объект — модель "взялся — ходи".
+     *  type: 'device' | 'plan_item'. Возвращает { ok, error?, heldBy?, allLocks? }. */
+    request: (type, id) => invoke('locks:requestLock', { type, id }),
+    release: (type, id) => invoke('locks:releaseLock', { type, id })
   },
   users: {
     list: () => invoke('users:list'),
@@ -170,6 +178,13 @@ contextBridge.exposeInMainWorld('api', {
      *  этот клиент был подключён. Только для режима "клиент". */
     onDataChanged: (callback) => {
       ipcRenderer.on('data-changed', (_event, changes) => callback(changes));
+    },
+    /** callback({ allowWrites, allLocks, acquired, rejected }) — на каждом heartbeat-тике
+     *  (см. startClientHeartbeat) — allLocks: [{type, id, hostname, isMine}, ...] — что
+     *  сейчас занято, включая чужое; rejected — то из СВОИХ held keys, что вдруг
+     *  отклонено (например, хост выключил тумблер посреди сессии). */
+    onLocksStateChanged: (callback) => {
+      ipcRenderer.on('locks-state-changed', (_event, data) => callback(data));
     }
   }
 });

@@ -12,13 +12,22 @@
 const http = require('http');
 const { URL } = require('url');
 
-/** Запускает RPC-сервер на указанном порту. rpcHandlers — карта { [channel]: { fn, write } },
- *  та же самая, что main/index.js использует для локальных ipcMain.handle(). Слушает на
- *  0.0.0.0, чтобы быть доступным с других машин в локальной сети, не только с localhost.
- *  onClientPing(clientId, hostname) — необязательный колбэк, вызывается на каждый /ping
- *  с идентификацией клиента (см. rpcClient.js) — хост так узнаёт, кто сейчас подключён;
- *  без этого колбэка хост "не видит" клиентов формально, только раздаёт им данные. */
-function startRpcServer(port, rpcHandlers, onClientPing) {
+/** Запускает RPC-сервер на указанном порту. rpcHandlers — карта { [channel]: { fn, write,
+ *  lockEntity } }, та же самая, что main/index.js использует для локальных ipcMain.handle().
+ *  Слушает на 0.0.0.0, чтобы быть доступным с других машин в локальной сети, не только с
+ *  localhost.
+ *  onClientPing(clientId, hostname) — вызывается на каждый /ping с идентификацией клиента —
+ *  хост так узнаёт, кто сейчас подключён.
+ *  authorizeWrite(channel, payload, clientId, hostname) — вызывается ПЕРЕД любой write-
+ *  операцией, пришедшей по сети (локальные вызовы самого хоста её не проходят вообще —
+ *  хост всегда полный хозяин своих данных). Должна вернуть { ok: true } или { ok: false,
+ *  error }. Без этого колбэка все write-запросы по сети остаются отклонены (прежнее
+ *  поведение "клиент — только просмотр", когда разрешение на запись нигде не настроено).
+ *  onWriteSuccess(channel, payload) — вызывается ПОСЛЕ успешной write-операции, пришедшей
+ *  по сети — хост так узнаёт, что клиент только что реально что-то изменил, и может
+ *  обновить своё собственное окно (см. notifyHostOfClientWrite в main/index.js). Без этого
+ *  хост "не видит" правки клиентов в своём интерфейсе, пока сам что-то не сделает. */
+function startRpcServer(port, rpcHandlers, onClientPing, authorizeWrite, onWriteSuccess) {
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url.startsWith('/ping')) {
       // Лёгкая проверка "жив ли хост" — используется клиентом для индикации соединения,
@@ -63,13 +72,32 @@ function startRpcServer(port, rpcHandlers, onClientPing) {
       }
 
       Promise.resolve()
-        .then(() => entry.fn(parsed.payload))
+        .then(async () => {
+          if (entry.write && authorizeWrite) {
+            const auth = await authorizeWrite(parsed.channel, parsed.payload, parsed.clientId, parsed.hostname);
+            if (!auth || !auth.ok) {
+              const err = new Error((auth && auth.error) || 'Изменение сейчас недоступно.');
+              err.statusCode = 403;
+              throw err;
+            }
+          } else if (entry.write) {
+            // authorizeWrite не передан вообще — запись по сети запрещена безусловно
+            // (прежнее поведение, если разрешение клиентам нигде не включалось)
+            const err = new Error('Только просмотр — редактирование по сети сейчас не разрешено хостом.');
+            err.statusCode = 403;
+            throw err;
+          }
+          return entry.fn(parsed.payload);
+        })
         .then((result) => {
+          if (entry.write && onWriteSuccess) {
+            try { onWriteSuccess(parsed.channel, parsed.payload); } catch { /* уведомление собственного окна хоста — не должно ронять ответ клиенту */ }
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, result }));
         })
         .catch((err) => {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.writeHead(err.statusCode || 500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: err.message || String(err) }));
         });
     });
