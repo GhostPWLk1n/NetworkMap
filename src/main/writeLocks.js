@@ -71,6 +71,12 @@ function release(clientId, type, id) {
  *  rejected, allLocks } — allLocks нужен клиенту, чтобы показать в UI, что занято
  *  другими прямо сейчас. */
 function syncClientLocks(clientId, hostname, heldKeys) {
+  if (consumeForceDisconnectFlag(clientId)) {
+    // Хост только что экстренно отключил этого клиента — отказываем во всём, что он
+    // держал, вместо обычной попытки продлить/перезахватить. Клиент увидит это в
+    // rejected и очистит свои held keys сам, а не будет молча их держать дальше.
+    return { acquired: [], rejected: heldKeys.map((k) => ({ ...k, heldBy: null, reason: 'force-disconnected' })), allLocks: listAll(), forceDisconnected: true };
+  }
   const wantedSet = new Set(heldKeys.map((k) => lockKey(k.type, k.id)));
   for (const [key, entry] of locks) {
     if (entry.clientId === clientId && !wantedSet.has(key)) locks.delete(key);
@@ -104,4 +110,42 @@ function releaseAllForClient(clientId) {
   }
 }
 
-module.exports = { canWrite, whoHolds, acquire, release, syncClientLocks, releaseAllForClient, STALE_AFTER_MS };
+// clientId -> true — одноразовый флаг "этого клиента только что принудительно
+// отключили" (см. forceDisconnect/consumeForceDisconnectFlag). Без него на следующем
+// же heartbeat клиент просто заново захватил бы то же самое (он ведь не в курсе, что
+// хост его отключил, и продолжит слать те же heldKeys, что и раньше).
+const forceDisconnectedClients = new Set();
+
+/** Хост экстренно отключает клиента — снимает все его блокировки немедленно И не даёт
+ *  ему захватить их снова на следующем heartbeat (см. consumeForceDisconnectFlag),
+ *  пока клиент не осознает разрыв и не сформирует новый (пустой) список held keys сам. */
+function forceDisconnect(clientId) {
+  releaseAllForClient(clientId);
+  forceDisconnectedClients.add(clientId);
+}
+
+/** Одноразовая проверка — потребляет флаг при первом же обращении (следующий heartbeat
+ *  этого клиента снова будет обработан как обычно, если хост не отключит его повторно). */
+function consumeForceDisconnectFlag(clientId) {
+  if (!forceDisconnectedClients.has(clientId)) return false;
+  forceDisconnectedClients.delete(clientId);
+  return true;
+}
+
+/** Живой список всех активных блокировок — для UI (хост видит занятость точно так же,
+ *  как её видит клиент, не только по факту отказа при попытке записи). */
+function listAll() {
+  const now = Date.now();
+  const result = [];
+  for (const [key, entry] of locks) {
+    if (now - entry.lastRenewedAt > STALE_AFTER_MS) { locks.delete(key); continue; }
+    const [type, idStr] = key.split(':');
+    result.push({ type, id: Number(idStr), hostname: entry.hostname, clientId: entry.clientId });
+  }
+  return result;
+}
+
+module.exports = {
+  canWrite, whoHolds, acquire, release, syncClientLocks, releaseAllForClient,
+  forceDisconnect, consumeForceDisconnectFlag, listAll, STALE_AFTER_MS
+};

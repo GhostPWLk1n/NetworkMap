@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('api', {
     setClientMode: (remoteHost) => invoke('settings:setClientMode', remoteHost),
     pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost),
     getConnectedClients: () => invoke('settings:getConnectedClients'),
+    forceDisconnectClient: (clientId) => invoke('settings:forceDisconnectClient', clientId),
     getAllowClientWrites: () => invoke('settings:getAllowClientWrites'),
     setAllowClientWrites: (allow) => invoke('settings:setAllowClientWrites', allow)
   },

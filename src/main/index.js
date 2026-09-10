@@ -71,11 +71,28 @@ function createWindow() {
  *  для редактирования. Если глобальный тумблер выключен — ничего не выдаём и снимаем
  *  всё, что было (на случай если тумблер выключили ПОКА клиент уже что-то держал). */
 function handleLocksHeartbeat({ clientId, hostname, heldKeys }) {
+  let result;
   if (!getAllowClientWrites()) {
     writeLocks.releaseAllForClient(clientId);
-    return { allowWrites: false, acquired: [], rejected: (heldKeys || []).map((k) => ({ ...k, heldBy: null, reason: 'writes-disabled' })), allLocks: [] };
+    result = { allowWrites: false, acquired: [], rejected: (heldKeys || []).map((k) => ({ ...k, heldBy: null, reason: 'writes-disabled' })), allLocks: [] };
+  } else {
+    result = { allowWrites: true, ...writeLocks.syncClientLocks(clientId, hostname, heldKeys || []) };
   }
-  return { allowWrites: true, ...writeLocks.syncClientLocks(clientId, hostname, heldKeys || []) };
+  pushLocksStateToHost(); // хост видит занятость объектов точно так же, как её видит клиент — не только по факту отказа при попытке записи
+  return result;
+}
+
+/** Отправляет собственному окну хоста живой снимок всех активных блокировок — хост
+ *  раньше "не видел" резервирования клиентов вообще, узнавая о занятости только по
+ *  факту отказа при попытке что-то отредактировать. Переиспользует тот же канал
+ *  'locks-state-changed', что уже умеет обрабатывать интерфейс клиента (isMine здесь
+ *  всегда false — у хоста нет "своих" блокировок в этом смысле, он либо владелец БД
+ *  без всяких резервирований, либо уважает чужие). */
+function pushLocksStateToHost() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const allLocks = writeLocks.listAll().map((l) => ({ type: l.type, id: l.id, hostname: l.hostname, isMine: false }));
+    mainWindow.webContents.send('locks-state-changed', { allowWrites: true, allLocks, acquired: [], rejected: [] });
+  }
 }
 
 /** Проверка прав ПЕРЕД любой write-операцией, пришедшей по сети (см. authorizeWrite в
@@ -284,9 +301,25 @@ function registerIpcHandlers() {
     ipcMain.handle('locks:requestLock', (_event, { type, id }) => requestLock(type, id));
     ipcMain.handle('locks:releaseLock', (_event, { type, id }) => releaseLock(type, id));
   } else {
-    // local ИЛИ host — как раньше, прямые вызовы репозиториев
-    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn }]) => {
+    // local ИЛИ host — как раньше, прямые вызовы репозиториев, но теперь хост тоже
+    // уважает блокировки, которые держат подключённые клиенты (раньше хост мог
+    // перехватить зарезервированный клиентом объект без единого предупреждения —
+    // локальные вызовы вообще не проходили через writeLocks). В режиме 'local'
+    // клиентов не бывает в принципе, эта проверка там просто ничего не найдёт.
+    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn, lockEntity }]) => {
       ipcMain.handle(channel, async (_event, payload) => {
+        if (write && mode === 'host' && lockEntity) {
+          const entity = lockEntity(payload);
+          if (entity && entity.id != null) {
+            const holder = writeLocks.whoHolds(entity.type, entity.id);
+            if (holder) {
+              throw new Error(
+                `Сейчас редактируется клиентом «${holder.hostname}» — подождите, пока он закончит, ` +
+                'либо отключите его принудительно (⚙️ Настройки БД → список подключённых клиентов).'
+              );
+            }
+          }
+        }
         const result = await fn(payload);
         if (write && mode === 'host' && hostLastNotifiedAuditId !== null) {
           // Собственное локальное действие хоста тоже сдвигает точку отсчёта — иначе
@@ -467,9 +500,20 @@ function registerIpcHandlers() {
     for (const [id, info] of connectedClients) {
       if (now - info.lastSeenAt > CLIENT_STALE_AFTER_MS) connectedClients.delete(id);
     }
-    return [...connectedClients.values()]
-      .map((info) => ({ hostname: info.hostname, secondsAgo: Math.round((now - info.lastSeenAt) / 1000) }))
+    return [...connectedClients.entries()]
+      .map(([clientId, info]) => ({ clientId, hostname: info.hostname, secondsAgo: Math.round((now - info.lastSeenAt) / 1000) }))
       .sort((a, b) => a.hostname.localeCompare(b.hostname));
+  });
+
+  // Экстренное отключение клиента — снимает все его блокировки немедленно и не даёт
+  // захватить их снова на следующем же heartbeat (см. writeLocks.forceDisconnect).
+  // Клиент физически не "разрывается" (это stateless HTTP, разрывать нечего) — просто
+  // теряет все свои резервирования и получает об этом честное уведомление в интерфейсе.
+  ipcMain.handle('settings:forceDisconnectClient', (_event, clientId) => {
+    writeLocks.forceDisconnect(clientId);
+    connectedClients.delete(clientId);
+    pushLocksStateToHost();
+    return { ok: true };
   });
 }
 
@@ -507,6 +551,12 @@ async function requestLock(type, id) {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+  // Немедленно рассылаем актуальное состояние — иначе визуальный контур занятости
+  // (см. isNodeLocked/applyLayerStates в рендерере) появился бы только на следующем
+  // фоновом heartbeat-тике (раз в 10 секунд), а не сразу при реальном захвате
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('locks-state-changed', { allowWrites: result.allowWrites, allLocks: result.allLocks || [], acquired: result.acquired || [], rejected: [] });
+  }
   if (!result.allowWrites) return { ok: false, error: 'Изменения от клиентов сейчас не разрешены хостом.' };
   const rejected = result.rejected.find((r) => r.type === type && r.id === id);
   if (rejected) {
@@ -524,7 +574,13 @@ function releaseLock(type, id) {
   const remoteHost = getRemoteHost();
   if (!remoteHost) return;
   const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-  rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000).catch(() => {});
+  rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000)
+    .then((result) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('locks-state-changed', { allowWrites: result.allowWrites, allLocks: result.allLocks || [], acquired: [], rejected: [] });
+      }
+    })
+    .catch(() => {});
 }
 
 async function heartbeatTick(remoteHost) {

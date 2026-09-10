@@ -1598,15 +1598,21 @@ function planLayerFor(itemType) {
  *  либо конкретно его логический слой стоит в состоянии "заблокирован". Используется
  *  везде, где раньше проверялся только planState.viewMode (драг, удаление, контекстное меню). */
 function isNodeLocked(node) {
-  if (clientModeActive) {
-    // Персональное право на КОНКРЕТНЫЙ объект — главная проверка для устройств/групп
-    // у клиента, перебивает общий viewMode: получения права на объект достаточно само
-    // по себе, без отдельного переключения в общий "режим рисования" (тот нужен только
-    // для НОВЫХ объектов — стен/столов/кабелей — не покрытых per-object блокировками).
-    const itemData = node.getAttr('itemData');
-    if (itemData && (itemData.item_type === 'device' || itemData.item_type === 'group') && !itemData.via_group) {
-      return !clientHeldLockKeys.has(`plan_item:${itemData.id}`);
+  const itemData = node.getAttr('itemData');
+  if (itemData && (itemData.item_type === 'device' || itemData.item_type === 'group') && !itemData.via_group) {
+    const key = `plan_item:${itemData.id}`;
+    if (clientModeActive) {
+      // Клиент: персональное право на КОНКРЕТНЫЙ объект — главная проверка, перебивает
+      // общий viewMode: получения права на объект достаточно само по себе, без
+      // отдельного переключения в общий "режим рисования" (тот нужен только для НОВЫХ
+      // объектов — стен/столов/кабелей — не покрытых per-object блокировками).
+      return !clientHeldLockKeys.has(key);
     }
+    // Хост: у него нет понятия "своя" блокировка — если объект занят хоть кем-то
+    // (обязательно клиентом, раз хост сам блокировок не держит), редактировать нельзя.
+    // Раньше хост мог перехватить зарезервированный клиентом объект без предупреждения —
+    // теперь он видит занятость точно так же, как её видит клиент (см. activeLocksSnapshot).
+    if (activeLocksSnapshot.some((l) => l.type === 'plan_item' && l.id === itemData.id)) return true;
   }
   if (planState.viewMode) return true;
   const layer = node.getAttr('planLayer');
@@ -1673,6 +1679,7 @@ async function initPlan() {
   bindPlanToolbar();
   bindPlanSearch();
   bindZoomButtons();
+  bindPlanInspectorResizer();
   bindLayerToggles();
   bindUserDragDrop();
 
@@ -2429,6 +2436,18 @@ function renderPointItem(item) {
     if (planState.selectedNode === group) renderInspector(group);
     planState.layer.draw();
   });
+
+  // Контур занятости — виден только когда объект зарезервирован кем-то (клиентом или,
+  // для хоста, "кем-то ещё"). Только у устройств/групп: у них есть свой plan_item и
+  // собственная блокировка; у стола/зоны такого понятия нет. Изначально невидим и без
+  // цвета — applyLayerStates() выставляет их по activeLocksSnapshot при каждом изменении.
+  if (!isDesk) {
+    group.add(new Konva.Rect({
+      width: CELL_PX, height: CELL_PX, x: 0, y: 0,
+      stroke: "transparent", strokeWidth: 3, cornerRadius: 6,
+      listening: false, visible: false, name: "lockOutline"
+    }));
+  }
 
   planState.layer.add(group);
   enforceLayerZOrder(group);
@@ -3971,6 +3990,52 @@ function setZoom(newScale) {
 }
 
 /** Кнопки зума — вешаем один раз, они всегда читают planState.stage на момент клика */
+const PLAN_INSPECTOR_WIDTH_KEY = 'networkmap.planInspectorWidth';
+
+/** Вертикальная ручка между рабочей областью плана и инспектором — тянуть можно по
+ *  всей высоте разделителя, а не только за нижний правый угол (как было раньше с
+ *  нативным CSS resize). Ширина ограничивается теми же min/max, что заданы в CSS
+ *  (#plan-inspector), и сохраняется между запусками. */
+function bindPlanInspectorResizer() {
+  const resizer = document.getElementById('plan-inspector-resizer');
+  const inspector = document.getElementById('plan-inspector');
+  const MIN_WIDTH = 200;
+  const MAX_WIDTH = 640;
+
+  const savedWidth = Number(localStorage.getItem(PLAN_INSPECTOR_WIDTH_KEY));
+  if (savedWidth && savedWidth >= MIN_WIDTH && savedWidth <= MAX_WIDTH) {
+    inspector.style.width = `${savedWidth}px`;
+  }
+
+  let dragging = false;
+
+  resizer.addEventListener('mousedown', (e) => {
+    dragging = true;
+    resizer.classList.add('resizing');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none'; // не выделять текст на канве/инспекторе во время протяжки
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    // Инспектор справа — ширина считается от текущего X мыши до правого края всей области
+    const layoutRect = document.querySelector('.plan-layout').getBoundingClientRect();
+    const newWidth = Math.round(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, layoutRect.right - e.clientX)));
+    inspector.style.width = `${newWidth}px`;
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('resizing');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    try { localStorage.setItem(PLAN_INSPECTOR_WIDTH_KEY, inspector.style.width.replace('px', '')); }
+    catch { /* localStorage недоступен — ширина просто не сохранится между запусками */ }
+  });
+}
+
 function bindZoomButtons() {
   document.getElementById('zoom-in').addEventListener('click', () => setZoom(planState.stage.scaleX() * 1.2));
   document.getElementById('zoom-out').addEventListener('click', () => setZoom(planState.stage.scaleX() / 1.2));
@@ -4062,12 +4127,37 @@ function updateToolbarLockedState() {
 /** Применяет текущее planState.layerState ко всем уже отрисованным объектам — видимость
  *  и draggable (для точечных объектов и подписи зоны). Не нужна при создании новых
  *  объектов — те сами выставляют себе то и другое при отрисовке (см. planLayerFor). */
+// Палитра для контура занятости на плане — намеренно без красного/жёлтого/оранжевого:
+// эти уже заняты системными смыслами (danger/attention, выделение узла) в этом же
+// интерфейсе, повторное использование запутало бы, что означает какой цвет.
+const LOCK_OUTLINE_PALETTE = ['#3b82f6', '#10b981', '#8b5cf6', '#ec4899', '#06b6d4', '#6366f1', '#65a30d', '#0891b2'];
+
+/** Стабильный цвет для конкретного держателя блокировки — простой хэш hostname в индекс
+ *  палитры, так что у одного и того же клиента цвет не "прыгает" между тиками. */
+function colorForLockHolder(hostname) {
+  let hash = 0;
+  for (let i = 0; i < hostname.length; i++) hash = (hash * 31 + hostname.charCodeAt(i)) | 0;
+  return LOCK_OUTLINE_PALETTE[Math.abs(hash) % LOCK_OUTLINE_PALETTE.length];
+}
+
 function applyLayerStates() {
   planState.itemsById.forEach((node) => {
     const planLayer = node.getAttr('planLayer');
     if (planLayer === null || planLayer === undefined) return;
     node.visible(planState.layerState[planLayer] !== 'hidden');
     if (node.getAttr('kind') === 'point') node.draggable(!isNodeLocked(node));
+
+    // Цветной контур занятости — как в Google Таблицах: видно, что объект держит
+    // кто-то, ещё до попытки его отредактировать, а не только по факту отказа.
+    const itemData = node.getAttr('itemData');
+    if (itemData && (itemData.item_type === 'device' || itemData.item_type === 'group') && !itemData.via_group) {
+      const outline = node.findOne('.lockOutline');
+      if (outline) {
+        const held = activeLocksSnapshot.find((l) => l.type === 'plan_item' && l.id === itemData.id);
+        if (held) { outline.visible(true); outline.stroke(colorForLockHolder(held.hostname)); }
+        else outline.visible(false);
+      }
+    }
   });
   planState.cablesById.forEach((line) => {
     line.visible(planState.layerState[3] !== 'hidden');
@@ -4099,7 +4189,7 @@ function bindModeSwitch() {
   updateModeSwitchUI(true);
 }
 
-let clientAllLocks = []; // [{type, id, hostname, isMine}, ...] — что сейчас занято на хосте (только для режима клиента)
+let activeLocksSnapshot = []; // [{type, id, hostname, isMine}, ...] — что сейчас занято прямо сейчас, актуально и хосту, и клиенту
 
 /** Кнопка "✏️ Рисование" доступна клиенту, только если хост разрешил запись (тумблер) —
  *  без этого переключаться в режим редактирования бессмысленно, любое действие всё
@@ -4483,7 +4573,20 @@ function unhighlight(node) {
  *  'device' (та даётся через карточку на вкладке "Устройства"). Без неё узел просто
  *  не перетаскивается (см. isNodeLocked). Только для clientModeActive. */
 function appendPlanItemLockButton(el, item) {
-  if (!clientModeActive) return;
+  if (!clientModeActive) {
+    // Хост: своего request/release нет (это его собственная БД) — но он должен ВИДЕТЬ
+    // занятость точно так же, как её видит клиент, а не узнавать о ней только по факту
+    // отказа при попытке сохранить. Единственный доступный хосту способ вмешаться —
+    // принудительно отключить клиента целиком (⚙️ Настройки БД → список клиентов).
+    const held = activeLocksSnapshot.find((l) => l.type === 'plan_item' && l.id === item.id);
+    if (held) {
+      const wrap = document.createElement('div');
+      wrap.className = 'edit-lock-controls';
+      wrap.textContent = `🔒 Сейчас редактируется клиентом «${held.hostname}» — откройте ⚙️ Настройки БД, чтобы отключить его принудительно.`;
+      el.appendChild(wrap);
+    }
+    return;
+  }
   const key = `plan_item:${item.id}`;
   const wrap = document.createElement('div');
   wrap.className = 'edit-lock-controls';
@@ -4515,7 +4618,9 @@ function appendPlanItemLockButton(el, item) {
       releaseBtn.classList.remove('hidden');
       statusEl.textContent = '✏️ Вы можете перемещать';
     } else {
-      statusEl.textContent = result.error || 'Не удалось получить право';
+      const message = result.error || 'Не удалось получить право';
+      statusEl.textContent = message;
+      showToast(`⛔ ${message}`, 'error', 7000);
     }
   };
   releaseBtn.onclick = async () => {
@@ -5424,7 +5529,9 @@ function createEditLockControls(type, id, formEl, { onGranted, onReleased } = {}
       statusEl.textContent = '✏️ Вы редактируете';
       if (onGranted) onGranted();
     } else {
-      statusEl.textContent = result.error || 'Не удалось получить право редактирования';
+      const message = result.error || 'Не удалось получить право редактирования';
+      statusEl.textContent = message;
+      showToast(`⛔ ${message}`, 'error', 7000);
     }
   }
 
@@ -5777,7 +5884,17 @@ async function refreshConnectedClients() {
     const ul = document.createElement('ul');
     clients.forEach((c) => {
       const li = document.createElement('li');
-      li.textContent = `${c.hostname} — виден ${c.secondsAgo} сек назад`;
+      li.textContent = `${c.hostname} — виден ${c.secondsAgo} сек назад `;
+      const disconnectBtn = document.createElement('button');
+      disconnectBtn.type = 'button';
+      disconnectBtn.className = 'client-disconnect-btn';
+      disconnectBtn.textContent = '⛔ Отключить';
+      disconnectBtn.onclick = async () => {
+        if (!(await confirmModal(`Экстренно отключить «${c.hostname}»? Все его резервирования на редактирование будут сняты немедленно.`))) return;
+        await window.api.settings.forceDisconnectClient(c.clientId);
+        await refreshConnectedClients();
+      };
+      li.appendChild(disconnectBtn);
       ul.appendChild(li);
     });
     clientsEl.appendChild(ul);
@@ -5833,9 +5950,32 @@ function bindDbSettingsModal() {
       const connectBtn = document.createElement('button');
       connectBtn.type = 'button';
       connectBtn.textContent = 'Подключиться как клиент';
-      connectBtn.onclick = () => {
-        const address = best.addresses && best.addresses.length ? `${best.addresses[0]}:${best.port}` : '';
-        document.getElementById('db-client-host-input').value = address;
+      connectBtn.onclick = async () => {
+        const candidates = best.addresses && best.addresses.length ? best.addresses : [];
+        if (candidates.length === 0) return;
+
+        // Маячок публикует ВСЕ IPv4-адреса хоста, включая виртуальные адаптеры
+        // (Hyper-V/WSL/VPN/Docker) — угадать заранее, какой из них реально доступен
+        // с ЭТОГО компьютера, нельзя надёжно (виртуальные диапазоны пересекаются с
+        // корпоративными сетями). Вместо гадания — реально проверяем каждый по очереди,
+        // тем же пингом, что и обычная проверка связи, и используем первый ответивший.
+        connectBtn.disabled = true;
+        const originalText = connectBtn.textContent;
+        let workingAddress = null;
+        for (const addr of candidates) {
+          const candidate = `${addr}:${best.port}`;
+          connectBtn.textContent = `Проверяем ${candidate}…`;
+          // eslint-disable-next-line no-await-in-loop
+          const alive = await window.api.settings.pingRemoteHost(candidate);
+          if (alive) { workingAddress = candidate; break; }
+        }
+        connectBtn.disabled = false;
+        connectBtn.textContent = originalText;
+
+        // Ни один не ответил (например, все временно недоступны) — берём первый как
+        // есть, дальше обычный поток подключения покажет свою собственную, уже понятную
+        // ошибку, а не молчаливо подставит непроверенный адрес без всякой обратной связи
+        document.getElementById('db-client-host-input').value = workingAddress || `${candidates[0]}:${best.port}`;
         document.getElementById('db-become-client-btn').click(); // переиспользуем уже готовый поток подключения
       };
       statusNote.appendChild(connectBtn);
@@ -5879,12 +6019,22 @@ function bindDbSettingsModal() {
   document.getElementById('db-become-host-btn').addEventListener('click', async () => {
     const port = Number(document.getElementById('db-host-port-input').value) || 47821;
     const discoveryPath = document.getElementById('db-host-discovery-input').value.trim() || null;
+
+    // Раньше здесь всегда передавался null — из-за этого при переходе в режим хоста
+    // путь к БД тихо откатывался на дефолтный (AppData/Roaming/.../data.db), даже если
+    // на самом деле был открыт другой файл (например, сетевой путь) — сообщение ниже
+    // обещало "текущий файл останется", а на деле не оставалось. У клиентского режима
+    // своего открытого файла физически нет (клиент свою БД не открывает вообще) — для
+    // него null остаётся правильным значением, создастся/откроется дефолтная БД.
+    const currentInfo = await window.api.settings.getDbInfo();
+    const currentDbPath = currentInfo.mode === 'client' ? null : currentInfo.path;
+
     if (!(await confirmModal(
-      `Стать хостом на порту ${port}? Текущий файл БД останется у вас локально, остальные компьютеры ` +
+      `Стать хостом на порту ${port}? Текущий файл БД${currentDbPath ? ` (${currentDbPath})` : ' (по умолчанию)'} останется у вас локально, остальные компьютеры ` +
       'смогут подключиться и просматривать данные (без редактирования). Приложение перезапустится.' + portableRelaunchWarning()
     ))) return;
     sharedStatusNote.textContent = 'Переключение…';
-    const result = await window.api.settings.setHostMode(null, port, discoveryPath);
+    const result = await window.api.settings.setHostMode(currentDbPath, port, discoveryPath);
     if (result && result.success === false) sharedStatusNote.textContent = `Ошибка: ${result.error}`;
   });
 
@@ -5994,27 +6144,6 @@ window.addEventListener('api-error', (e) => {
       else showToast('⚠️ Связь с хостом потеряна — проверьте сеть', 'warning', 8000);
     });
 
-    // Тумблер "разрешить клиентам менять" (хост) + список занятых объектов — приходит
-    // на каждый heartbeat-тик (первый — сразу при подключении, не через 10 секунд).
-    // Кнопка режима "✏️ Рисование" разблокируется/блокируется по факту — переключаться
-    // в редактирование, когда хост его не разрешил, бессмысленно (любое действие
-    // отклонит бэкенд), лучше явно показать это ДО попытки, а не после.
-    window.api.events.onLocksStateChanged(({ allowWrites, allLocks, rejected }) => {
-      clientAllLocks = allLocks || [];
-      clientAllowWritesFlag = allowWrites;
-      updateClientWritePermissionUI(allowWrites);
-      // Событие приходит только когда связь с хостом реально жива (main-процесс
-      // проверяет это перед отправкой) — reachable=true здесь безопасно
-      updateReadOnlyBanner(info.remoteHost, true);
-      if (rejected && rejected.length > 0) {
-        // Что-то из ранее полученного вдруг отклонено (хост выключил тумблер, или
-        // блокировка протухла на бэкенде по какой-то причине) — синхронизируем канву
-        let changed = false;
-        rejected.forEach((r) => { if (clientHeldLockKeys.delete(`${r.type}:${r.id}`)) changed = true; });
-        if (changed) applyLayerStates();
-      }
-    });
-
     // Данные отданы из локального кэша (сети сейчас нет) — троттлим тем же способом,
     // что и api-error, иначе загрузка вкладки при обрыве связи даст сразу десяток
     // одинаковых по смыслу уведомлений (по одному на каждый read-запрос этой вкладки)
@@ -6026,6 +6155,33 @@ window.addEventListener('api-error', (e) => {
       showToast('📦 Показаны сохранённые ранее данные — сети нет', 'warning', 6000);
     });
   }
+
+  // Живой снимок "кто что сейчас держит" — приходит на каждое изменение блокировок
+  // (heartbeat клиента, явный запрос/освобождение, принудительное отключение), не
+  // только клиенту, но и хосту: раньше хост "не видел" резервирования клиентов вообще,
+  // узнавая о занятости только по факту отказа при попытке что-то отредактировать.
+  window.api.events.onLocksStateChanged(({ allowWrites, allLocks, rejected, forceDisconnected }) => {
+    activeLocksSnapshot = allLocks || [];
+    applyLayerStates(); // видимость занятости (draggable) — актуальна и хосту, и клиенту
+
+    if (clientModeActive) {
+      clientAllowWritesFlag = allowWrites;
+      updateClientWritePermissionUI(allowWrites);
+      // Событие приходит только когда связь с хостом реально жива (main-процесс
+      // проверяет это перед отправкой) — reachable=true здесь безопасно
+      updateReadOnlyBanner(info.remoteHost, true);
+      if (rejected && rejected.length > 0) {
+        // Что-то из ранее полученного вдруг отклонено (хост выключил тумблер, блокировка
+        // протухла, или хост принудительно отключил этого клиента) — синхронизируем канву
+        let changed = false;
+        rejected.forEach((r) => { if (clientHeldLockKeys.delete(`${r.type}:${r.id}`)) changed = true; });
+        if (changed) applyLayerStates();
+      }
+      if (forceDisconnected) {
+        showToast('🔌 Хост принудительно отключил вас — права на редактирование сброшены', 'warning', 10000);
+      }
+    }
+  });
 
   // Кто-то ДРУГОЙ изменил данные — для клиента это хост (или другой клиент через
   // хост), для хоста это подключённый клиент, воспользовавшийся правом на запись
