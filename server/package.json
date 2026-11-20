@@ -1,0 +1,18 @@
+{
+  "name": "network-map-server",
+  "version": "1.49.0",
+  "description": "Выделенный сервер базы NetworkMap — держит базу постоянно и обслуживает подключённые экземпляры приложения",
+  "private": true,
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "comment": "Зависимость ровно одна: electron, konva и xlsx нужны только приложению, в образ сервера они не попадают.",
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

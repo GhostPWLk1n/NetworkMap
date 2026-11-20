@@ -6,11 +6,25 @@ const { contextBridge, ipcRenderer } = require('electron');
  *  ~90 мест вызова по отдельности — единая точка перехвата. Исходное исключение
  *  пробрасывается дальше как обычно: вызывающий код, у которого уже есть собственная
  *  обработка (например, в потоках импорта), продолжает работать точно так же, как раньше. */
+/** Electron оборачивает любую ошибку обработчика в свой служебный префикс:
+ *  "Error invoking remote method 'users:create': Error: <наш текст>". Пользователю он
+ *  не говорит ничего, зато вытесняет из тоста сам текст. Срезаем его, оставляя только
+ *  то сообщение, которое мы сами и написали. */
+function cleanIpcErrorMessage(raw) {
+  const text = String(raw || '');
+  const stripped = text.replace(/^Error invoking remote method '[^']*':\s*/, '');
+  return stripped.replace(/^(?:Error|TypeError|RangeError):\s*/, '') || text;
+}
+
 async function invoke(channel, ...args) {
   try {
     return await ipcRenderer.invoke(channel, ...args);
   } catch (err) {
-    window.dispatchEvent(new CustomEvent('api-error', { detail: { channel, message: err.message || String(err) } }));
+    const message = cleanIpcErrorMessage(err && err.message);
+    window.dispatchEvent(new CustomEvent('api-error', { detail: { channel, message } }));
+    // Пробрасываем с уже очищенным текстом: у части вызывающего кода есть свой
+    // try/catch, который показывает err.message прямо в карточке (см. правку ПО)
+    if (err instanceof Error) err.message = message;
     throw err;
   }
 }
@@ -28,6 +42,11 @@ contextBridge.exposeInMainWorld('api', {
     resetDb: () => invoke('settings:resetDb'),
     setHostMode: (dbPath, hostPort, discoveryPath) => invoke('settings:setHostMode', { dbPath, hostPort, discoveryPath }),
     setClientMode: (remoteHost) => invoke('settings:setClientMode', remoteHost),
+    /** Подключение к выделенному серверу (см. server/index.js) — тот же протокол, что у
+     *  режима "хост", но с ключом доступа. Приложение после успеха перезапускается. */
+    setServerMode: (remoteHost, token) => invoke('settings:setServerMode', { remoteHost, token }),
+    /** Проверка адреса и ключа без переключения режима — { ok, reason?, error? }. */
+    diagnoseServer: (remoteHost, token) => invoke('settings:diagnoseServer', { remoteHost, token }),
     pingRemoteHost: (remoteHost) => invoke('settings:pingRemoteHost', remoteHost),
     getConnectedClients: () => invoke('settings:getConnectedClients'),
     forceDisconnectClient: (clientId) => invoke('settings:forceDisconnectClient', clientId),
@@ -55,6 +74,8 @@ contextBridge.exposeInMainWorld('api', {
     setStatus: (id, status, note) => invoke('devices:setStatus', { id, status, note }),
     setFlag: (id, flag) => invoke('devices:setFlag', { id, flag }),
     setUplink: (id, uplinkDeviceId) => invoke('devices:setUplink', { id, uplinkDeviceId }),
+    /** Условный радиус охвата Wi-Fi в метрах; null — вернуть значение по умолчанию. */
+    setWifiRadius: (id, radiusM) => invoke('devices:setWifiRadius', { id, radiusM }),
     statusHistory: (id) => invoke('devices:statusHistory', id),
     listVMsByHost: (hostDeviceId) => invoke('devices:listVMsByHost', hostDeviceId),
     remove: (id) => invoke('devices:remove', id),
@@ -67,6 +88,8 @@ contextBridge.exposeInMainWorld('api', {
   floorPlans: {
     list: () => invoke('floorPlans:list'),
     ensureDefault: () => invoke('floorPlans:ensureDefault'),
+    /** Подтянуть границы плана под уже лежащее на нём содержимое (см. fitToContent). */
+    fitToContent: (floorPlanId) => invoke('floorPlans:fitToContent', floorPlanId),
     create: (payload) => invoke('floorPlans:create', payload),
     remove: (id) => invoke('floorPlans:remove', id),
     rename: (id, name) => invoke('floorPlans:rename', { id, name })
@@ -76,6 +99,8 @@ contextBridge.exposeInMainWorld('api', {
     create: (payload) => invoke('planItems:create', payload),
     move: (id, x, y) => invoke('planItems:move', { id, x, y }),
     setRotation: (id, rotation) => invoke('planItems:setRotation', { id, rotation }),
+    setDoorWidth: (id, width) => invoke('planItems:setDoorWidth', { id, width }),
+    setCellOffset: (id, offset_x, offset_y) => invoke('planItems:setCellOffset', { id, offset_x, offset_y }),
     remove: (id) => invoke('planItems:remove', id),
     findByDeviceRef: (deviceId) => invoke('planItems:findByDeviceRef', deviceId),
     listPlacedDeviceIds: () => invoke('planItems:listPlacedDeviceIds'),
@@ -126,6 +151,7 @@ contextBridge.exposeInMainWorld('api', {
     list: (deviceId) => invoke('software:list', deviceId),
     listActive: () => invoke('software:listActive'),
     add: (payload) => invoke('software:add', payload),
+    update: (id, payload) => invoke('software:update', { id, ...payload }),
     remove: (id) => invoke('software:remove', id),
     setFlag: (id, flag) => invoke('software:setFlag', { id, flag })
   },
@@ -167,6 +193,12 @@ contextBridge.exposeInMainWorld('api', {
      *  режима "клиент" — в остальных режимах событие просто не рассылается. */
     onHostConnectivityChanged: (callback) => {
       ipcRenderer.on('host-connectivity-changed', (_event, data) => callback(data));
+    },
+    /** callback({ readonly, reason, heldBy }) — база перешла в режим только чтения уже
+     *  ПОСЛЕ запуска: замок на базу перехватил другой экземпляр (нашу машину усыпляли,
+     *  шара пропадала дольше таймаута). Читать можно, писать больше нельзя. */
+    onDbReadonlyChanged: (callback) => {
+      ipcRenderer.on('db-readonly-changed', (_event, data) => callback(data));
     },
     /** callback({ channel, cachedAt }) — вызывается, когда конкретный read-запрос был
      *  отдан из локального кэша вместо живого ответа хоста (сети сейчас нет, но раньше

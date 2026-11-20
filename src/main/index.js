@@ -5,17 +5,19 @@ const crypto = require('crypto');
 const { fork } = require('child_process');
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const {
-  initDatabase, usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
-  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
+  // Репозитории здесь нужны только там, где логика шире одного канала данных:
+  // auditLogRepo — уведомления об изменениях. Сами каналы живут в shared/dbChannels.js.
+  initDatabase, auditLogRepo, getDbReadonly, markReadonly, releaseDbLock, dbLock,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
   getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
+  getServerToken, getSourceKind,
   getAllowClientWrites, setAllowClientWrites
 } = require('./db');
-const { pingHost } = require('./ping');
 const { importExcel } = require('./import');
 const { parsePcInfoFile, parsePcInfoFolder, applyPcInfoImport } = require('./pcInfoImport');
+const { DB_CHANNELS } = require('../shared/dbChannels');
 const { startRpcServer } = require('./rpcServer');
-const { rpcCall, rpcPing } = require('./rpcClient');
+const { rpcCall, rpcPing, rpcDiagnose } = require('./rpcClient');
 const { publishHostMarker, updateHostMarker, removeHostMarker, readHostMarker, findActiveMarkersInDir, cleanupStaleMarkersInDir } = require('./discovery');
 const { initLocalCache, saveToCache, readFromCache, hasAnyCache, forceFlush } = require('./localCache');
 const writeLocks = require('./writeLocks');
@@ -29,6 +31,9 @@ let connectivityHeartbeatTimer = null; // клиентский режим — п
 // перезапусками — при следующем запуске сгенерируется новый) — чтобы хост видел, что
 // это тот же самый клиент, а не новый, если несколько раз пинганёт за одну сессию.
 const clientInstanceId = crypto.randomUUID();
+// Ключ доступа к выделенному серверу — нужен в каждом сетевом вызове. У режима "хост"
+// ключа нет (null), и проверка на той стороне тогда просто не выполняется.
+const serverToken = getServerToken();
 let lastKnownAuditId = null; // с какого id отслеживаем новые записи журнала — сбрасывается при (пере)подключении (клиентский режим)
 let hostLastNotifiedAuditId = null; // то же самое, но для СОБСТВЕННОГО окна хоста — отслеживает, что уже показано, когда меняет клиент
 // Режим "хост": кто сейчас пингует — clientId -> { hostname, lastSeenAt }. Без этого
@@ -55,6 +60,17 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+
+  // Первый heartbeat происходит в app.whenReady(), ДО создания окна, поэтому событие
+  // locks-state-changed с реальными правами уходило в никуда: рендерер подписывается
+  // на него только после загрузки страницы. Из-за этого клиент до 10 секунд (до
+  // следующего тика) показывал «только просмотр» и держал кнопку «Рисование»
+  // выключенной, даже когда запись была разрешена. Повторяем тик сразу после загрузки.
+  mainWindow.webContents.once('did-finish-load', () => {
+    if (getAppMode() !== 'client') return;
+    const remoteHost = getRemoteHost();
+    if (remoteHost) heartbeatTick(remoteHost).catch(() => { /* следующий тик попробует снова */ });
+  });
 }
 
 /**
@@ -134,114 +150,12 @@ function notifyHostOfClientWrite() {
   }
 }
 
+// Каналы работы с данными вынесены в src/shared/dbChannels.js — их же использует
+// выделенный сервер (server/index.js), который работает без Electron. Здесь к ним
+// добавляется только то, что осмысленно исключительно в приложении: heartbeat
+// блокировок (у него своя проверка прав, см. handleLocksHeartbeat).
 const RPC_HANDLERS = {
-  'users:list': { write: false, fn: () => usersRepo.list() },
-  'users:create': { write: true, fn: (payload) => usersRepo.create(payload) },
-  'users:update': { write: true, fn: ({ id, payload }) => usersRepo.update(id, payload) },
-  'users:setStatus': { write: true, fn: ({ id, status }) => usersRepo.setStatus(id, status) },
-  'users:setFlag': { write: true, fn: ({ id, flag }) => usersRepo.setFlag(id, flag) },
-  'users:remove': { write: true, fn: (id) => usersRepo.remove(id) },
-
-  'devices:list': { write: false, fn: () => devicesRepo.list() },
-  'devices:create': { write: true, fn: (payload) => devicesRepo.create(payload) },
-  'devices:update': { write: true, lockEntity: (p) => ({ type: 'device', id: p.id }), fn: ({ id, payload }) => devicesRepo.update(id, payload) },
-  'devices:setStatus': { write: true, fn: ({ id, status, note }) => devicesRepo.setStatus(id, status, note) },
-  'devices:setFlag': { write: true, fn: ({ id, flag }) => devicesRepo.setFlag(id, flag) },
-  'devices:setUplink': { write: true, lockEntity: (p) => ({ type: 'device', id: p.id }), fn: ({ id, uplinkDeviceId }) => devicesRepo.setUplink(id, uplinkDeviceId) },
-  'devices:statusHistory': { write: false, fn: (id) => devicesRepo.statusHistory(id) },
-  'devices:listVMsByHost': { write: false, fn: (hostDeviceId) => devicesRepo.listVMsByHost(hostDeviceId) },
-  'devices:remove': { write: true, fn: (id) => devicesRepo.remove(id) },
-  'devices:search': { write: false, fn: (query) => devicesRepo.search(query) },
-
-  'ping:run': {
-    write: true,
-    fn: async ({ deviceId, ip }) => {
-      const result = await pingHost(ip);
-      pingRepo.record(deviceId, result.status, result.responseTimeMs);
-      return result;
-    }
-  },
-  'ping:history': { write: false, fn: (deviceId) => pingRepo.history(deviceId) },
-
-  'floorPlans:list': { write: false, fn: () => floorPlansRepo.list() },
-  'floorPlans:ensureDefault': { write: true, fn: () => floorPlansRepo.ensureDefault() },
-  'floorPlans:create': { write: true, fn: (payload) => floorPlansRepo.create(payload) },
-  'floorPlans:remove': { write: true, fn: (id) => floorPlansRepo.remove(id) },
-  'floorPlans:rename': { write: true, fn: ({ id, name }) => floorPlansRepo.rename(id, name) },
-
-  'planItems:list': { write: false, fn: (floorPlanId) => planItemsRepo.listByPlan(floorPlanId) },
-  'planItems:create': { write: true, fn: (payload) => planItemsRepo.create(payload) },
-  'planItems:move': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, x, y }) => planItemsRepo.move(id, x, y) },
-  'planItems:setRotation': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, rotation }) => planItemsRepo.setRotation(id, rotation) },
-  'planItems:remove': { write: true, lockEntity: (id) => ({ type: 'plan_item', id }), fn: (id) => planItemsRepo.remove(id) },
-  'planItems:findByDeviceRef': { write: false, fn: (deviceId) => planItemsRepo.findByDeviceRef(deviceId) },
-  'planItems:listPlacedDeviceIds': { write: false, fn: () => planItemsRepo.listPlacedDeviceIds() },
-  'planItems:listAllDevicePlacements': { write: false, fn: () => planItemsRepo.listAllDevicePlacements() },
-  'planItems:setReviewNote': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, note }) => planItemsRepo.setReviewNote(id, note) },
-  'planItems:setNetworkRole': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.id }), fn: ({ id, role }) => planItemsRepo.setNetworkRole(id, role) },
-  'planItems:placeDeviceWithGrouping': { write: true, fn: ({ floorPlanId, deviceId, x, y }) => planItemsRepo.placeDeviceWithGrouping(floorPlanId, deviceId, x, y) },
-  'planItems:moveDeviceItemWithGrouping': { write: true, fn: ({ oldItemId, floorPlanId, deviceId, x, y }) => planItemsRepo.moveDeviceItemWithGrouping(oldItemId, floorPlanId, deviceId, x, y) },
-  'planItems:groupMembers': { write: false, fn: (groupItemId) => planItemsRepo.groupMembers(groupItemId) },
-  'planItems:removeFromGroup': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.groupItemId }), fn: ({ groupItemId, deviceId }) => planItemsRepo.removeFromGroup(groupItemId, deviceId) },
-  'planItems:renameGroup': { write: true, lockEntity: (p) => ({ type: 'plan_item', id: p.groupItemId }), fn: ({ groupItemId, label }) => planItemsRepo.renameGroup(groupItemId, label) },
-
-  'cables:list': { write: false, fn: (floorPlanId) => cablesRepo.listByPlan(floorPlanId) },
-  'cables:get': { write: false, fn: (id) => cablesRepo.get(id) },
-  'cables:create': { write: true, fn: (payload) => cablesRepo.create(payload) },
-  'cables:updatePath': { write: true, fn: ({ id, path: p }) => cablesRepo.updatePath(id, p) },
-  'cables:setLabel': { write: true, fn: ({ id, label }) => cablesRepo.setLabel(id, label) },
-  'cables:remove': { write: true, fn: (id) => cablesRepo.remove(id) },
-
-  'cableConnections:listByPlan': { write: false, fn: (floorPlanId) => cableConnectionsRepo.listByPlan(floorPlanId) },
-  'cableConnections:listByPlanItem': { write: false, fn: (planItemId) => cableConnectionsRepo.listByPlanItem(planItemId) },
-  'cableConnections:connect': { write: true, fn: ({ planItemId, cableId }) => cableConnectionsRepo.connect(planItemId, cableId) },
-  'cableConnections:disconnect': { write: true, fn: ({ planItemId, cableId }) => cableConnectionsRepo.disconnect(planItemId, cableId) },
-
-  'ownership:history': { write: false, fn: (deviceId) => ownershipRepo.history(deviceId) },
-  'ownership:historyForUser': { write: false, fn: (userId) => ownershipRepo.historyForUser(userId) },
-  'ownership:assign': { write: true, lockEntity: (p) => ({ type: 'device', id: p.deviceId }), fn: ({ deviceId, userId }) => ownershipRepo.assign(deviceId, userId) },
-  'ownership:unassign': { write: true, lockEntity: (id) => ({ type: 'device', id }), fn: (deviceId) => ownershipRepo.unassign(deviceId) },
-
-  'components:list': { write: false, fn: (deviceId) => componentsRepo.listByDevice(deviceId) },
-  'components:listAllActive': { write: false, fn: () => componentsRepo.listAllActive() },
-  'components:add': { write: true, fn: (payload) => componentsRepo.add(payload) },
-  'components:detach': { write: true, fn: (id) => componentsRepo.detach(id) },
-  'components:remove': { write: true, fn: (id) => componentsRepo.remove(id) },
-
-  'peripherals:list': { write: false, fn: (deviceId) => peripheralsRepo.listByDevice(deviceId) },
-  'peripherals:listAllActive': { write: false, fn: () => peripheralsRepo.listAllActive() },
-  'peripherals:add': { write: true, fn: (payload) => peripheralsRepo.add(payload) },
-  'peripherals:detach': { write: true, fn: (id) => peripheralsRepo.detach(id) },
-  'peripherals:remove': { write: true, fn: (id) => peripheralsRepo.remove(id) },
-
-  'software:list': { write: false, fn: (deviceId) => softwareRepo.listByDevice(deviceId) },
-  'software:listActive': { write: false, fn: () => softwareRepo.listActive() },
-  'software:add': { write: true, fn: (payload) => softwareRepo.add(payload) },
-  'software:remove': { write: true, fn: (id) => softwareRepo.remove(id) },
-  'software:setFlag': { write: true, fn: ({ id, flag }) => softwareRepo.setFlag(id, flag) },
-
-  'warehouse:list': { write: false, fn: (category) => warehouseRepo.list(category) },
-  'warehouse:add': { write: true, fn: (payload) => warehouseRepo.add(payload) },
-  'warehouse:update': { write: true, fn: ({ id, payload }) => warehouseRepo.update(id, payload) },
-  'warehouse:setStatus': { write: true, fn: ({ id, status }) => warehouseRepo.setStatus(id, status) },
-  'warehouse:setFlag': { write: true, fn: ({ id, flag }) => warehouseRepo.setFlag(id, flag) },
-  'warehouse:receiveComponent': { write: true, fn: ({ componentId, note }) => warehouseRepo.receiveComponent(componentId, note) },
-  'warehouse:receiveSoftware': { write: true, fn: ({ softwareId, note }) => warehouseRepo.receiveSoftware(softwareId, note) },
-  'warehouse:issueToDevice': { write: true, fn: ({ itemId, deviceId }) => warehouseRepo.issueToDevice(itemId, deviceId) },
-  'warehouse:remove': { write: true, fn: (id) => warehouseRepo.remove(id) },
-
-  'zones:list': { write: false, fn: (floorPlanId) => zonesRepo.listByPlan(floorPlanId) },
-  'zones:create': { write: true, fn: (payload) => zonesRepo.create(payload) },
-  'zones:updateLabel': { write: true, fn: ({ id, payload }) => zonesRepo.updateLabel(id, payload) },
-  'zones:remove': { write: true, fn: (id) => zonesRepo.remove(id) },
-
-  'network:listRoots': { write: false, fn: () => networkRepo.listRoots() },
-  'network:buildTree': { write: false, fn: (rootDeviceId) => networkRepo.buildTree(rootDeviceId) },
-
-  'auditLog:list': { write: false, fn: (filters) => auditLogRepo.list(filters) },
-  'auditLog:listSince': { write: false, fn: (sinceId) => auditLogRepo.listSince(sinceId) },
-  'auditLog:latestId': { write: false, fn: () => auditLogRepo.latestId() },
-
+  ...DB_CHANNELS,
   // Не бизнес-данные (не БД) — сама проверка прав живёт внутри функции, не через общий
   // authorizeWrite; см. handleLocksHeartbeat ниже. write:false — вызов разрешён всегда,
   // а вот РЕЗУЛЬТАТ (что реально выдано) зависит от тумблера и занятости объектов.
@@ -266,10 +180,10 @@ function registerIpcHandlers() {
           // жёсткому правилу "запись = нет", без всякой возможности это разрешить.
           // Кэшировать write-результаты не нужно (не идемпотентные операции) и
           // повторять из кэша при сбое сети тоже нельзя — просто пробрасываем ошибку.
-          return rpcCall(remoteHost, channel, payload, 10000, clientInfo);
+          return rpcCall(remoteHost, channel, payload, 10000, clientInfo, serverToken);
         }
         try {
-          const result = await rpcCall(remoteHost, channel, payload, 10000, clientInfo);
+          const result = await rpcCall(remoteHost, channel, payload, 10000, clientInfo, serverToken);
           saveToCache(channel, payload, result); // свежий успешный ответ — обновляем локальный кэш
           return result;
         } catch (err) {
@@ -380,8 +294,14 @@ function registerIpcHandlers() {
       mode,
       hostPort: mode === 'host' ? getHostPort() : null,
       remoteHost: mode === 'client' ? getRemoteHost() : null,
+      // 'host' (другой экземпляр приложения) или 'server' (выделенный сервер) — протокол
+      // один, но подписи и доступные действия в интерфейсе разные
+      sourceKind: mode === 'client' ? getSourceKind() : null,
       hostReachable: mode === 'client' ? hostReachable : null,
       startupNotice: notice,
+      // Режим только чтения: базу уже держит другой живой экземпляр (см. db/dbLock.js).
+      // Интерфейс по этому признаку показывает плашку и уходит в режим просмотра.
+      readonly: getDbReadonly(),
       // electron-builder выставляет эту переменную окружения ТОЛЬКО для portable-сборки
       // (не для обычного установленного приложения) — надёжный способ отличить одно от другого
       isPortable: !!process.env.PORTABLE_EXECUTABLE_DIR
@@ -478,17 +398,41 @@ function registerIpcHandlers() {
     if (!remoteHost || !remoteHost.includes(':')) {
       return { success: false, error: 'Укажите адрес в формате ip:порт' };
     }
-    const alive = await rpcPing(remoteHost, 6000);
+    const alive = await rpcPing(remoteHost, 6000, null, serverToken);
     if (!alive) {
       return { success: false, error: `Хост ${remoteHost} не отвечает. Проверьте адрес, порт и что на хосте запущен режим "хост".` };
     }
-    setClientMode(remoteHost);
+    setClientMode(remoteHost, null, 'host');
     app.relaunch();
     app.exit(0);
     return { success: true };
   });
 
-  ipcMain.handle('settings:pingRemoteHost', (_event, remoteHost) => rpcPing(remoteHost, 5000));
+  /** Подключение к ВЫДЕЛЕННОМУ серверу (см. server/index.js). Протокол тот же, что у
+   *  режима "хост", но нужен ключ доступа, поэтому и отдельный канал: ошибку «ключ не
+   *  принят» важно отличать от «адрес не отвечает», иначе человек будет искать проблему
+   *  в сети, хотя дело в ключе. */
+  ipcMain.handle('settings:setServerMode', async (_event, { remoteHost, token }) => {
+    if (!remoteHost || !remoteHost.includes(':')) {
+      return { success: false, error: 'Укажите адрес сервера в формате ip:порт' };
+    }
+    const check = await rpcDiagnose(remoteHost, 6000, token || null);
+    if (!check.ok) return { success: false, error: check.error, reason: check.reason };
+    setClientMode(remoteHost, token || null, 'server');
+    app.relaunch();
+    app.exit(0);
+    return { success: true };
+  });
+
+  /** Кнопка «Проверить» — та же диагностика, но без переключения режима и перезапуска. */
+  ipcMain.handle('settings:diagnoseServer', (_event, { remoteHost, token }) => {
+    if (!remoteHost || !remoteHost.includes(':')) {
+      return { ok: false, error: 'Укажите адрес сервера в формате ip:порт' };
+    }
+    return rpcDiagnose(remoteHost, 6000, token || null);
+  });
+
+  ipcMain.handle('settings:pingRemoteHost', (_event, remoteHost) => rpcPing(remoteHost, 5000, null, serverToken));
 
   // Список подключённых клиентов — только для собственного UI хоста (не для сети,
   // поэтому не в RPC_HANDLERS). Раньше хост формально не видел, кто к нему подключён,
@@ -547,7 +491,7 @@ async function requestLock(type, id) {
   const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
   let result;
   try {
-    result = await rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: nextKeys }, 8000);
+    result = await rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: nextKeys }, 8000, clientInfo, serverToken);
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -574,7 +518,7 @@ function releaseLock(type, id) {
   const remoteHost = getRemoteHost();
   if (!remoteHost) return;
   const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-  rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000)
+  rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000, clientInfo, serverToken)
     .then((result) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('locks-state-changed', { allowWrites: result.allowWrites, allLocks: result.allLocks || [], acquired: [], rejected: [] });
@@ -585,7 +529,7 @@ function releaseLock(type, id) {
 
 async function heartbeatTick(remoteHost) {
   const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-  const stillAlive = await rpcPing(remoteHost, 5000, clientInfo);
+  const stillAlive = await rpcPing(remoteHost, 5000, clientInfo, serverToken);
 
   if (stillAlive !== hostReachable) {
     hostReachable = stillAlive;
@@ -595,13 +539,13 @@ async function heartbeatTick(remoteHost) {
     if (stillAlive) {
       // Только что переподключились — начинаем отслеживать изменения ЗАНОВО с этой
       // точки, а не заваливаем клиента всей историей за время отключения
-      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 5000); } catch { /* попробуем на следующем тике */ }
+      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 5000, clientInfo, serverToken); } catch { /* попробуем на следующем тике */ }
     }
   }
 
   if (stillAlive && lastKnownAuditId !== null) {
     try {
-      const changes = await rpcCall(remoteHost, 'auditLog:listSince', lastKnownAuditId, 5000);
+      const changes = await rpcCall(remoteHost, 'auditLog:listSince', lastKnownAuditId, 5000, clientInfo, serverToken);
       if (changes.length > 0) {
         lastKnownAuditId = changes[changes.length - 1].id;
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -618,7 +562,7 @@ async function heartbeatTick(remoteHost) {
     // объектов (не только своих) — интерфейсу нужно показывать, что занято чужим.
     try {
       const locksResult = await rpcCall(remoteHost, 'locks:heartbeat',
-        { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000);
+        { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: clientHeldKeys }, 5000, clientInfo, serverToken);
       if (locksResult.rejected && locksResult.rejected.length > 0) {
         // Что-то из ранее удерживаемого вдруг отклонено (например, хост выключил
         // тумблер посреди сессии) — синхронизируем локальный список под реальность
@@ -678,7 +622,7 @@ app.whenReady().then(async () => {
     initLocalCache(app.getPath('userData'));
     const remoteHost = getRemoteHost();
     const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-    const alive = remoteHost ? await rpcPing(remoteHost, 6000, clientInfo) : false;
+    const alive = remoteHost ? await rpcPing(remoteHost, 6000, clientInfo, serverToken) : false;
     if (!alive && hasAnyCache()) {
       // Хост недоступен ПРЯМО СЕЙЧАС, но раньше уже был доступен — есть что показать.
       // Раньше в этой ситуации откатывались на заведомо ПУСТУЮ локальную БД, будто
@@ -700,7 +644,7 @@ app.whenReady().then(async () => {
     } else {
       // Хост жив — initDatabase() НЕ вызывается вообще, все запросы уйдут по сети.
       hostReachable = true;
-      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 6000); } catch { /* не критично — просто начнём отслеживать со следующего тика */ }
+      try { lastKnownAuditId = await rpcCall(remoteHost, 'auditLog:latestId', null, 6000, clientInfo, serverToken); } catch { /* не критично — просто начнём отслеживать со следующего тика */ }
       startClientHeartbeat(remoteHost);
     }
   } else {
@@ -720,12 +664,31 @@ app.whenReady().then(async () => {
       initDatabase();
     }
 
+    // Замок на базу могли отобрать уже ПОСЛЕ открытия: машину усыпляли, шара пропадала
+    // дольше таймаута — и другой экземпляр решил, что мы пропали, и занял базу. Писать
+    // с этого момента нельзя (иначе две пишущие копии), но читать уже открытым
+    // соединением безопасно, поэтому просто переходим в режим только чтения на ходу.
+    dbLock.onLockLost((holder) => {
+      const where = holder && holder.hostname ? `«${holder.hostname}»` : 'другим экземпляром';
+      markReadonly(holder, `База перехвачена ${where}, пока это приложение было неактивно`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('db-readonly-changed', getDbReadonly());
+      }
+    });
+
     if (mode === 'host') {
       try {
         hostLastNotifiedAuditId = auditLogRepo.latestId(); // точка отсчёта сразу — далее синхронизируется на лету после каждого локального действия хоста (см. ветку local/host ниже), поэтому первая же запись клиента покажет только её саму, а не накопленную локальную историю
-        rpcServerInstance = await startRpcServer(getHostPort(), RPC_HANDLERS, (clientId, hostname) => {
-          connectedClients.set(clientId, { hostname, lastSeenAt: Date.now() });
-        }, authorizeWrite, notifyHostOfClientWrite);
+        rpcServerInstance = await startRpcServer(getHostPort(), RPC_HANDLERS, {
+          // У режима "хост" ключа доступа нет: хост поднимается на время работы
+          // приложения и ищется маячком в своей же сети. Ключ — свойство выделенного
+          // сервера, который доступен постоянно (см. server/index.js).
+          onClientPing: (clientId, hostname) => {
+            connectedClients.set(clientId, { hostname, lastSeenAt: Date.now() });
+          },
+          authorizeWrite,
+          onWriteSuccess: notifyHostOfClientWrite
+        });
 
         const discoveryPath = getDiscoveryPath();
         if (discoveryPath) {
@@ -763,11 +726,16 @@ app.whenReady().then(async () => {
   });
 });
 
+// Выход может произойти и без закрытия окон (app.quit() из меню, выключение системы) —
+// замок надо снять в обоих случаях, иначе база останется "занятой" до истечения таймаута
+app.on('will-quit', () => { releaseDbLock(); });
+
 app.on('window-all-closed', () => {
   if (rpcServerInstance) { try { rpcServerInstance.close(); } catch { /* уже могло закрыться */ } }
   if (discoveryHeartbeatTimer) clearInterval(discoveryHeartbeatTimer);
   if (connectivityHeartbeatTimer) clearInterval(connectivityHeartbeatTimer);
   forceFlush(); // последние секунды кэша могли ещё не долететь до диска по дебаунсу
+  releaseDbLock(); // снимаем свой файл-замок, чтобы база сразу освободилась для коллег
   if (ownMarkerPath) removeHostMarker(ownMarkerPath); // штатный выход — убираем ТОЛЬКО свой маячок, не чужие
   if (getAppMode() === 'client' && clientHeldKeys.length > 0) {
     // Best-effort — не ждём ответа и не блокируем выход; если не успеет долететь,
@@ -775,7 +743,7 @@ app.on('window-all-closed', () => {
     const remoteHost = getRemoteHost();
     if (remoteHost) {
       const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-      rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: [] }, 2000).catch(() => {});
+      rpcCall(remoteHost, 'locks:heartbeat', { clientId: clientInfo.clientId, hostname: clientInfo.hostname, heldKeys: [] }, 2000, clientInfo, serverToken).catch(() => {});
     }
   }
   if (process.platform !== 'darwin') app.quit();

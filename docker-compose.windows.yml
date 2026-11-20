@@ -1,0 +1,53 @@
+# Дополнение к docker-compose.yml для случая, когда сервер работает на WINDOWS
+# (Docker Desktop). Отдельным файлом, а не правкой основного: правку в
+# docker-compose.yml затёрло бы при следующем обновлении, а этот файл приезжает
+# вместе с архивом и переживает обновления.
+#
+# Включается один раз — строкой в .env рядом с docker-compose.yml:
+#
+#   COMPOSE_FILE=docker-compose.yml;docker-compose.windows.yml
+#
+# После этого все обычные команды (docker compose up -d, logs, ps) работают как
+# есть, ничего дописывать к ним не нужно.
+#
+# Можно и без .env, явным перечислением файлов при каждом вызове:
+#   docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d
+#
+# ЗАЧЕМ ЭТО НУЖНО. База работает в режиме журнала WAL (journal_mode = WAL), а WAL
+# требует разделяемой памяти: SQLite отображает в память файл data.db-shm и
+# рассчитывает на обычную файловую систему. Папка с диска Windows попадает в
+# контейнер через проброс Docker Desktop (virtiofs/9p), и это НЕ обычная локальная
+# файловая система: отображение в память там либо не поддерживается, либо
+# несогласованно между процессами. Проявляется это не отказом при старте, а
+# ошибками "disk I/O error" и "database is locked" на ходу, то есть в самый
+# неудачный момент. Поэтому на Windows база живёт в томе докера (внутри виртуальной
+# машины WSL2, на нормальной ext4), а не в проброшенной папке.
+#
+# На Linux этот файл не нужен: там ./data — обычная папка, и WAL на ней работает.
+# Второй рабочий вариант для Windows — держать весь проект внутри WSL2
+# (\\wsl$\Ubuntu\home\...) и запускать docker compose оттуда: тогда ./data тоже
+# оказывается на ext4, и основной файл подходит без изменений.
+#
+# ЧЕМ ПРИХОДИТСЯ ПЛАТИТЬ. Папки data в проводнике больше нет — база и копии лежат
+# в томе. Забрать копии наружу:
+#
+#   docker compose cp networkmap-server:/data/backups .\backups
+#
+# Посмотреть, что в томе, и сколько он занимает:
+#
+#   docker compose exec networkmap-server ls -la /data /data/backups
+#   docker compose exec networkmap-server du -sh /data /data/backups
+#
+# Том живёт отдельно от контейнера: docker compose down его НЕ удаляет, данные
+# переживают пересборку образа и обновление сервера. Удалить его может только
+# docker compose down -v или docker volume rm — этих двух команд не делайте.
+
+services:
+  networkmap-server:
+    # !override, а не просто volumes: иначе compose СЛОЖИЛ бы списки из двух файлов
+    # и в контейнер прилетели бы два монтирования на /data сразу
+    volumes: !override
+      - networkmap-data:/data
+
+volumes:
+  networkmap-data:

@@ -53,8 +53,17 @@
         <h3>Конструктив</h3>
         <button id="mode-desk" type="button" class="tool-btn">🪑 Стол</button>
         <button id="mode-wall" type="button" class="tool-btn">🧱 Стена</button>
+        <button id="mode-border" type="button" class="tool-btn" title="Тонкая условная перегородка: делит помещение на зоны, но не изображает капитальную стену">┄ Граница</button>
         <button id="mode-door" type="button" class="tool-btn">🚪 Дверь</button>
         <button id="mode-stairs" type="button" class="tool-btn">🪜 Лестница</button>
+
+        <h3>Угол размещения</h3>
+        <div class="placement-row" title="Под каким углом ставить НОВЫЕ столы и устройства — удобно у косых стен, чтобы не доворачивать каждый объект отдельно">
+          <input id="placement-rotation-range" type="range" min="0" max="359" step="1" value="0" />
+          <input id="placement-rotation-num" class="placement-num" type="number" min="0" max="359" step="1" value="0" />
+          <span class="placement-unit">°</span>
+        </div>
+        <button id="placement-rotation-reset" type="button" class="tool-btn">⟲ Сбросить угол</button>
 
         <h3>Связи</h3>
         <button id="mode-cable" type="button" class="tool-btn">🔌 Кабель</button>
@@ -80,6 +89,7 @@
             <button id="layer-toggle-desk" type="button" class="layer-toggle" data-layer="2" data-icon="🪑" title="Слой 2: столы">🪑</button>
             <button id="layer-toggle-1" type="button" class="layer-toggle" data-layer="3" data-icon="🔌" title="Слой 3: кабель-менеджмент">🔌</button>
             <button id="layer-toggle-2" type="button" class="layer-toggle" data-layer="4" data-icon="🖥" title="Слой 4: оборудование">🖥</button>
+            <button id="wifi-coverage-toggle" type="button" class="layer-toggle" title="Условный охват Wi-Fi у роутеров (радиус задаётся у каждого в инспекторе)">📡</button>
           </div>
 
           <div id="plan-search">
@@ -440,10 +450,15 @@
 
       <p class="search-advanced-note db-explainer">
         SQLite — файловая база, не сетевой сервер: «подключение» здесь означает
-        просто открыть файл <code>data.db</code> по другому пути — например,
-        сетевой шаре (Samba/NFS), которую отдаёт контейнер в Docker. Для
-        одновременной записи с нескольких компьютеров это ограниченно
-        надёжно — таково свойство самого SQLite, а не этого приложения.
+        просто открыть файл <code>data.db</code> по другому пути — например, на
+        сетевой шаре (Samba/NFS). Одновременная запись с нескольких компьютеров
+        через шару для SQLite ненадёжна, поэтому приложение этого и не допускает:
+        рядом с базой ведётся файл-замок, и если её уже держит другой запущенный
+        экземпляр, эта копия откроет базу <b>только для чтения</b> — данные видны,
+        изменения отклоняются, а в шапке написано, на какой машине база занята.
+        Замок протухает сам, так что упавшее приложение базу не запирает. Чтобы
+        несколько человек могли писать одновременно, используйте совместный доступ
+        ниже: режим «хост» или выделенный сервер.
       </p>
 
       <div class="db-actions-grid">
@@ -501,6 +516,30 @@
         </div>
       </div>
       <div id="db-shared-status-note" class="status-note"></div>
+
+      <hr class="db-section-divider" />
+
+      <div class="modal-title">Выделенный сервер (постоянный доступ)</div>
+      <p class="search-advanced-note db-explainer">
+        Хостом может стать любой запущенный экземпляр, но база тогда доступна
+        только пока у кого-то открыто приложение. Выделенный сервер держит базу
+        <b>постоянно</b>: это тот же протокол, но отдельный процесс — обычно
+        контейнер в Docker на Linux (см. <code>docker-compose.yml</code> в
+        репозитории). Отличия от хоста: нужен <b>ключ доступа</b>, потому что
+        сервер слушает круглосуточно, и запись разрешена всем подключённым сразу —
+        тумблер включать некому. Конфликты разводятся так же, как у хоста: кто
+        первый открыл объект, тот его и правит, у остальных он подсвечен занятым.
+      </p>
+
+      <div class="db-shared-column">
+        <label class="db-shared-label">Адрес сервера <input id="db-server-host-input" type="text" placeholder="192.168.2.94:47821" /></label>
+        <label class="db-shared-label">Ключ доступа <input id="db-server-token-input" type="password" placeholder="тот же, что в NM_TOKEN на сервере" autocomplete="off" /></label>
+        <div class="card-body-actions">
+          <button id="db-server-check-btn" type="button" class="tool-btn">🔎 Проверить</button>
+          <button id="db-server-connect-btn" type="button" class="tool-btn">🖧 Подключиться к серверу</button>
+        </div>
+      </div>
+      <div id="db-server-status-note" class="status-note"></div>
 
       <div class="modal-actions">
         <button id="db-settings-close" type="button">Закрыть</button>

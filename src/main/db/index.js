@@ -1,17 +1,56 @@
 const path = require('path');
 const fs = require('fs');
-const { app } = require('electron');
 const Database = require('better-sqlite3');
+const dbLock = require('./dbLock');
+
+// Папка для служебных файлов (data.db по умолчанию, db-config.json, кэш). В Electron
+// это app.getPath('userData'), но этот же модуль целиком переиспользует выделенный
+// сервер (см. server/index.js), который работает на ОБЫЧНОМ Node, без Electron —
+// поэтому electron не требуется на верхнем уровне, а путь можно задать извне.
+let userDataPathOverride = null;
+
+/** Задать папку служебных файлов вручную — вызывается сервером до любых обращений к БД.
+ *  В Electron не вызывается вообще: там путь берётся у самого Electron (см. userDataPath). */
+function setUserDataPath(dir) {
+  userDataPathOverride = dir;
+}
+
+function userDataPath() {
+  if (userDataPathOverride) return userDataPathOverride;
+  // require внутри функции, а не на верхнем уровне: в обычном Node пакет 'electron'
+  // либо не установлен вовсе (образ сервера его не тянет), либо отдаёт путь к бинарнику
+  // вместо API — и в обоих случаях этот код просто не должен выполняться
+  try {
+    const { app } = require('electron');
+    if (app && typeof app.getPath === 'function') return app.getPath('userData');
+  } catch { /* не Electron — падаем в ошибку ниже, она понятнее любой случайной */ }
+  throw new Error('Папка данных не задана: вызовите setUserDataPath() до работы с БД (вне Electron это обязательно).');
+}
 
 let db;
 let currentDbPath = null;
 let lastConnectWarning = null; // строка предупреждения, если пришлось откатиться на локальную БД
+// Открыта ли база только для чтения (её уже держит другой экземпляр, см. dbLock.js) —
+// { readonly, heldBy, reason, schemaMismatch?, openError? }
+let readonlyState = { readonly: false, heldBy: null, reason: null };
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 19;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
 const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
-const PLAN_ITEM_TYPE_LABELS_RU = { device: 'Устройство', desk: 'Стол', wall: 'Стена', door: 'Дверь', stairs: 'Лестница' };
+const PLAN_ITEM_TYPE_LABELS_RU = {
+  device: 'Устройство', desk: 'Стол', wall: 'Стена', door: 'Дверь',
+  stairs: 'Лестница', border: 'Граница', group: 'Группа устройств'
+};
+// Клетка плана — условный метр, поэтому ширина двери в клетках равна ширине в метрах
+const DEFAULT_DOOR_WIDTH = 0.9;
+// Условный радиус охвата Wi-Fi по умолчанию, в метрах. Берётся, когда у устройства
+// своё значение не задано (wifi_radius_m IS NULL)
+const DEFAULT_WIFI_RADIUS_M = 15;
+// Типы устройств, у которых охват вообще имеет смысл показывать
+const WIFI_DEVICE_TYPES = ['router'];
+// Должно совпадать с CHECK(software_type) в device_software (см. schema.sql)
+const SOFTWARE_TYPES = ['os', 'office', 'antivirus', 'other'];
 
 /** Человекочитаемое название объекта плана для журнала изменений — для устройства
  *  подставляет его hostname, для остальных типов — просто название типа. */
@@ -23,12 +62,197 @@ function planItemLabelForLog(db, item) {
   return PLAN_ITEM_TYPE_LABELS_RU[item.item_type] || item.item_type;
 }
 
+/** Приводит угол к 0..359 — на входе может быть и отрицательный (поворот против часовой),
+ *  и больше оборота; CHECK в схеме принимает только нормализованный. */
+function normalizeRotation(rotation) {
+  const n = Math.round(Number(rotation) || 0);
+  return ((n % 360) + 360) % 360;
+}
+
+/** Смещение внутри клетки хранится в долях клетки и не должно выводить объект за её
+ *  пределы — ограничиваем -0.5..+0.5 (это же проверяет CHECK в схеме). */
+/** Округление смещения до 0.001 клетки (при 40px/клетку это 0.04px — незаметно даже
+ *  при зуме). Без него после перетаскивания в поля инспектора попадало что-то вроде
+ *  0.34999999999999964. */
+function roundCellOffset(value) {
+  const n = Number(value) || 0;
+  return Math.round(n * 1000) / 1000;
+}
+
+/** Последняя линия обороны под CHECK в схеме. Нормальный путь — normalizeCellAndOffset,
+ *  который за пределами половины клетки переносит объект к соседней, а не упирает его
+ *  в границу собственной. */
+function clampCellOffset(value) {
+  return Math.max(-0.5, Math.min(0.5, roundCellOffset(value)));
+}
+
+/**
+ * Приводит пару «клетка + смещение» к единственному каноничному виду: клетка-владелец
+ * всегда та, к ЦЕНТРУ которой объект ближе всего, а смещение от её центра не больше
+ * половины клетки.
+ *
+ * Иначе говоря: ушёл от центра своей клетки больше чем на половину — перепривязался к
+ * соседней. Смещение 0.8 не зажимается до 0.5 (объект застрял бы на границе, визуально
+ * находясь в чужой клетке, но принадлежа своей), а превращается в «следующая клетка,
+ * смещение -0.2». Ровно то же самое делает округление при перетаскивании мышью, поэтому
+ * мышь и числовые поля дают одинаковый результат.
+ *
+ * limit (необязательно) — число клеток по этой оси: за край плана объект уносить нельзя,
+ * там остаток остаётся смещением (упирается в границу осознанно, это единственный случай,
+ * когда |offset| может дойти до 0.5).
+ */
+function normalizeCellAndOffset(cell, offset, min = null, max = null) {
+  const own = Number(cell) || 0;
+  const delta = cellsToCarry(roundCellOffset(offset));
+  let targetCell = own + delta;
+  // Зажимаем ГРАНИЦАМИ ПЛАНА, а не нулём: начало координат может быть отрицательным,
+  // и объект, начерченный выше/левее нуля, иначе утаскивало бы в клетку 0 при первой же
+  // правке смещения.
+  if (min !== null && Number.isFinite(min)) targetCell = Math.max(Math.floor(min), targetCell);
+  if (max !== null && Number.isFinite(max)) targetCell = Math.min(Math.floor(max) - 1, targetCell);
+  return { cell: targetCell, offset: clampCellOffset(own + roundCellOffset(offset) - targetCell) };
+}
+
+/** Сколько целых клеток «съедает» смещение. Округление к НУЛЮ при ровной половине:
+ *  правило — «ушёл больше чем на половину», значит ровно половина остаётся за своей
+ *  клеткой. Math.round здесь не годится, он несимметричен: Math.round(0.5) = 1, но
+ *  Math.round(-0.5) = 0, и объект перепривязывался вправо, но не влево. */
+function cellsToCarry(offset) {
+  if (!offset) return 0;
+  const magnitude = Math.ceil(Math.abs(offset) - 0.5);
+  return magnitude <= 0 ? 0 : Math.sign(offset) * magnitude;
+}
+
+// Точечные объекты занимают ОДНУ клетку и рисуются как иконка в её центре — только у них
+// есть смысл у смещения внутри клетки. У стены/двери/лестницы x,y,x2,y2 — это УЗЛЫ сетки
+// (координата может равняться ширине плана, т.е. правому краю), смещения у них нет, и
+// нормализовать их координаты как клетки нельзя — это сдвинуло бы концы линий.
+const POINT_ITEM_TYPES = ['desk', 'device', 'group', 'other'];
+function isPointItemType(itemType) {
+  return POINT_ITEM_TYPES.includes(itemType);
+}
+
+/** Ширина проёма в допустимых пределах. strict=true — ругаться на мусор вместо тихой
+ *  подстановки умолчания: при явной правке поля человек должен увидеть, что ввёл не то. */
+function clampDoorWidth(width, strict = false) {
+  const n = Number(width);
+  if (!Number.isFinite(n) || n <= 0) {
+    if (strict) throw new Error('Ширина двери должна быть положительным числом (в метрах, например 0.9).');
+    return DEFAULT_DOOR_WIDTH;
+  }
+  const rounded = Math.round(n * 100) / 100; // сантиметры — достаточная точность для плана
+  if (rounded > 20) {
+    if (strict) throw new Error('Ширина двери не может быть больше 20 м.');
+    return 20;
+  }
+  return rounded;
+}
+
+/** Радиус охвата: null (пусто/0) значит «брать значение по умолчанию», поэтому пустое
+ *  поле — это не ошибка, а осмысленный сброс. strict=true ругается на мусор. */
+function normalizeWifiRadius(value, strict = false) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    if (strict) throw new Error('Радиус охвата — положительное число в метрах (оставьте пустым, чтобы взять значение по умолчанию).');
+    return null;
+  }
+  const rounded = Math.round(n * 10) / 10;
+  if (rounded > 500) {
+    if (strict) throw new Error('Радиус охвата не может быть больше 500 м.');
+    return 500;
+  }
+  return rounded;
+}
+
+/** «0.9 м» — короткая подпись для журнала и инспектора, без лишних нулей */
+function formatMeters(value) {
+  const n = Number(value) || 0;
+  return `${Number(n.toFixed(2))} м`;
+}
+
+// Предел автоматического роста плана. Без него одна опечатка («перенести на 99999
+// клеток вправо») раздувала бы сетку до неотрисовываемых размеров.
+const MAX_PLAN_CELLS = 2000;
+// Запас по краям при росте: объект у самой границы должен иметь вокруг себя сетку,
+// иначе он выглядит обрезанным и к нему нечего привязывать
+const PLAN_GROW_MARGIN = 4;
+
+/**
+ * Расширяет границы плана так, чтобы перечисленные клетки оказались внутри.
+ *
+ * Зачем: границы плана — это не только рамка на экране. По ним ограничены заливка зоны
+ * (floodFillZone) и перепривязка смещения (normalizeCellAndOffset), поэтому объект,
+ * оказавшийся за границей, попадает в область, где зоны и привязка не работают, да ещё и
+ * без сетки под собой. Раньше create/move координаты не проверяли вовсе, так что уехать
+ * за край было легко.
+ *
+ * Возвращает true, если план действительно вырос.
+ */
+function growPlanToFit(db, floorPlanId, cells) {
+  const plan = db.prepare(
+    'SELECT grid_width_cells, grid_height_cells, grid_min_x, grid_min_y FROM floor_plans WHERE id = ?'
+  ).get(floorPlanId);
+  if (!plan) return false;
+
+  // Работаем границами [min; max), а не парой «ширина/высота»: расти надо во все четыре
+  // стороны. Раньше росли только вправо и вниз, и всё, начерченное выше или левее начала
+  // координат, навсегда оставалось за пределами плана — там не работали ни заливка зон,
+  // ни привязка смещения.
+  let minX = plan.grid_min_x;
+  let minY = plan.grid_min_y;
+  let maxX = plan.grid_min_x + plan.grid_width_cells;   // граница исключающая
+  let maxY = plan.grid_min_y + plan.grid_height_cells;
+
+  for (const [cx, cy] of cells) {
+    if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+    const gx = Math.round(cx);
+    const gy = Math.round(cy);
+    // Запас добавляем ТОЛЬКО тому, кто реально вышел за границу. Объекту внутри плана —
+    // ничего: иначе любой объект у последней клетки толкал бы границу ещё на несколько
+    // клеток наружу, и размер плана полз бы сам, без всякой просьбы.
+    if (gx < minX) minX = gx - PLAN_GROW_MARGIN;
+    if (gx + 1 > maxX) maxX = gx + 1 + PLAN_GROW_MARGIN;
+    if (gy < minY) minY = gy - PLAN_GROW_MARGIN;
+    if (gy + 1 > maxY) maxY = gy + 1 + PLAN_GROW_MARGIN;
+  }
+
+  // Предел на ОБЩИЙ размер, а не на координату: план может целиком лежать в минусе
+  let width = Math.min(maxX - minX, MAX_PLAN_CELLS);
+  let height = Math.min(maxY - minY, MAX_PLAN_CELLS);
+
+  if (minX === plan.grid_min_x && minY === plan.grid_min_y &&
+      width === plan.grid_width_cells && height === plan.grid_height_cells) return false;
+
+  db.prepare(`
+    UPDATE floor_plans SET grid_min_x = ?, grid_min_y = ?, grid_width_cells = ?, grid_height_cells = ?,
+                            updated_at = datetime('now')
+    WHERE id = ?
+  `).run(minX, minY, width, height, floorPlanId);
+  return true;
+}
+
+/** Границы плана в клетках: [minX; maxX) x [minY; maxY). Нужны, чтобы перепривязка не
+ *  вынесла объект за край. Начало координат может быть отрицательным (см. grid_min_x). */
+function planBounds(db, floorPlanId) {
+  const plan = db.prepare(
+    'SELECT grid_width_cells, grid_height_cells, grid_min_x, grid_min_y FROM floor_plans WHERE id = ?'
+  ).get(floorPlanId);
+  if (!plan) return { minX: null, maxX: null, minY: null, maxY: null };
+  return {
+    minX: plan.grid_min_x,
+    maxX: plan.grid_min_x + plan.grid_width_cells,
+    minY: plan.grid_min_y,
+    maxY: plan.grid_min_y + plan.grid_height_cells
+  };
+}
+
 function getDefaultDbPath() {
-  return path.join(app.getPath('userData'), 'data.db');
+  return path.join(userDataPath(), 'data.db');
 }
 
 function getConfigPath() {
-  return path.join(app.getPath('userData'), 'db-config.json');
+  return path.join(userDataPath(), 'db-config.json');
 }
 
 /** Конфиг подключения — отдельный маленький JSON-файл рядом с БД, не в самой БД
@@ -64,9 +288,55 @@ function resolveDbPath() {
  * миграции по PRAGMA user_version, не трогая имеющиеся данные.
  * Без явного пути — берёт путь из конфига подключения (см. resolveDbPath),
  * по умолчанию это файл в userData, т.е. не теряется при переустановке.
+ *
+ * Перед открытием пытается занять базу под запись (см. dbLock.js). Если её уже
+ * держит другой живой экземпляр — база открывается ТОЛЬКО ДЛЯ ЧТЕНИЯ, а не
+ * параллельно на запись: на сетевой шаре собственные блокировки SQLite не спасают,
+ * и две пишущие копии портят файл. Приложение в этом случае всё равно запускается
+ * (данные видны), но все изменения отклоняются — см. getDbReadonly().
+ *
+ * options.skipLock — не занимать замок вообще (служебные открытия: пробник, бэкап).
  */
-function initDatabase(explicitPath) {
+function initDatabase(explicitPath, options = {}) {
   const dbPath = explicitPath || resolveDbPath();
+
+  readonlyState = { readonly: false, heldBy: null, reason: null };
+  if (!options.skipLock) {
+    const lock = dbLock.acquire(dbPath);
+    if (!lock.acquired) {
+      readonlyState = {
+        readonly: true,
+        heldBy: lock.heldBy || null,
+        reason: lock.heldBy
+          ? `База уже открыта на «${lock.heldBy.hostname}»${lock.heldBy.user ? ` (${lock.heldBy.user})` : ''}`
+          : `Не удалось занять базу под запись: ${lock.error || 'причина неизвестна'}`
+      };
+    }
+  }
+
+  if (readonlyState.readonly) {
+    try {
+      // journal_mode здесь НЕ трогаем: смена режима журнала — это запись в файл,
+      // на readonly-соединении она сорвётся. Режим и так уже выставлен владельцем.
+      db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      try { db.pragma('foreign_keys = ON'); } catch { /* на readonly-соединении не обязателен */ }
+      currentDbPath = dbPath;
+      const version = db.pragma('user_version', { simple: true });
+      if (version !== SCHEMA_VERSION) {
+        // Миграции — это запись, выполнить их сейчас нельзя. Честно говорим об этом,
+        // вместо того чтобы падать на первом же запросе к изменившейся таблице.
+        readonlyState.schemaMismatch = { found: version, expected: SCHEMA_VERSION };
+      }
+      console.log('[db] база занята другим экземпляром, открыта ТОЛЬКО ДЛЯ ЧТЕНИЯ:', dbPath);
+      return db;
+    } catch (err) {
+      // Даже на чтение не открылась — дальше нас подхватит обычный путь отката на
+      // локальную копию (см. app.whenReady в main/index.js)
+      readonlyState.openError = err.message;
+      throw new Error(`База занята другим экземпляром и не открывается даже для чтения: ${err.message}`);
+    }
+  }
+
   db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
@@ -87,6 +357,25 @@ function initDatabase(explicitPath) {
   }
 
   return db;
+}
+
+/** Открыта ли база только для чтения, и почему. Используется и диспетчером каналов
+ *  (отклонить запись), и интерфейсом (плашка в шапке). */
+function getDbReadonly() {
+  return readonlyState;
+}
+
+/** Переводит уже открытую базу в режим только чтения на ходу — вызывается, если замок
+ *  у нас отобрали посреди работы (машину усыпляли, шара моргнула дольше таймаута).
+ *  Соединение не переоткрываем: наша цель — перестать ПИСАТЬ, а читать уже открытым
+ *  соединением безопасно. */
+function markReadonly(heldBy, reason) {
+  readonlyState = { readonly: true, heldBy: heldBy || null, reason: reason || 'База занята другим экземпляром' };
+}
+
+/** Снимает наш замок — штатное завершение процесса. */
+function releaseDbLock() {
+  dbLock.release();
 }
 
 function getCurrentDbPath() { return currentDbPath; }
@@ -156,9 +445,33 @@ function setHostMode(dbPath, hostPort = DEFAULT_HOST_PORT, discoveryPath = null)
 }
 
 /** remoteHost — строка вида "192.168.1.42:47821". Собственную БД клиент не открывает
- *  вообще — resolveDbPath()/initDatabase() в этом режиме не вызываются. */
-function setClientMode(remoteHost) {
-  saveDbConfig({ mode: 'client', remoteHost, dbPath: null, hostPort: null });
+ *  вообще — resolveDbPath()/initDatabase() в этом режиме не вызываются.
+ *
+ *  sourceKind различает, к ЧЕМУ мы подключены, хотя протокол один и тот же:
+ *    'host'   — другой экземпляр приложения, поднявший общий доступ (ключа нет,
+ *               адрес ищется маячком, хост может экстренно отключить клиента);
+ *    'server' — выделенный сервер (см. server/index.js): нужен ключ доступа, адрес
+ *               постоянный, маячков нет.
+ *  Нужен только для подписей в интерфейсе и для того, чтобы не предлагать клиенту
+ *  сервера то, что осмысленно лишь с хостом. */
+function setClientMode(remoteHost, serverToken = null, sourceKind = 'host') {
+  saveDbConfig({
+    mode: 'client', remoteHost, dbPath: null, hostPort: null,
+    serverToken: serverToken || null,
+    sourceKind: sourceKind === 'server' ? 'server' : 'host'
+  });
+}
+
+/** Ключ доступа к выделенному серверу. Лежит в том же db-config.json, что и остальные
+ *  настройки подключения: иначе его негде держать до открытия базы, а база в этом
+ *  режиме вообще не открывается. */
+function getServerToken() {
+  return loadDbConfig().serverToken || null;
+}
+
+/** 'host' | 'server' — к чему подключён клиент (см. setClientMode). */
+function getSourceKind() {
+  return loadDbConfig().sourceKind === 'server' ? 'server' : 'host';
 }
 
 function runMigrations() {
@@ -178,6 +491,9 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 14) migrateToV14();
   if (db.pragma('user_version', { simple: true }) < 15) migrateToV15();
   if (db.pragma('user_version', { simple: true }) < 16) migrateToV16();
+  if (db.pragma('user_version', { simple: true }) < 17) migrateToV17();
+  if (db.pragma('user_version', { simple: true }) < 18) migrateToV18();
+  if (db.pragma('user_version', { simple: true }) < 19) migrateToV19();
 }
 
 /**
@@ -725,6 +1041,156 @@ function migrateToV16() {
   db.pragma('foreign_keys = ON');
 }
 
+/**
+ * v16 -> v17: произвольный угол поворота и смещение внутри клетки.
+ *
+ * rotation раньше был ограничен CHECK (0,90,180,270) — этого хватало, пока поворот
+ * кодировал только направление лестницы и hinge/swing двери. Для размещения устройств
+ * вдоль скошенных стен нужен любой угол, поэтому CHECK снимается (таблица пересоздаётся —
+ * SQLite не умеет ALTER ... DROP CONSTRAINT), а значения нормализуются в 0..359.
+ *
+ * offset_x/offset_y — положение внутри собственной клетки в ДОЛЯХ клетки (-0.5..+0.5),
+ * а не в пикселях: при смене размера клетки (CELL_PX) или масштаба сетки смещение
+ * сохраняет смысл, пиксельное бы "поехало". 0,0 — центр клетки, как и было раньше.
+ */
+function migrateToV17() {
+  console.log('[db] миграция схемы v16 -> v17 (произвольный поворот, смещение внутри клетки)');
+  db.pragma('foreign_keys = OFF');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE plan_items_new (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
+          item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','other','group')),
+          ref_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+          x              INTEGER NOT NULL,
+          y              INTEGER NOT NULL,
+          x2             INTEGER,
+          y2             INTEGER,
+          rotation       INTEGER NOT NULL DEFAULT 0 CHECK (rotation >= 0 AND rotation < 360),
+          offset_x       REAL NOT NULL DEFAULT 0 CHECK (offset_x >= -0.5 AND offset_x <= 0.5),
+          offset_y       REAL NOT NULL DEFAULT 0 CHECK (offset_y >= -0.5 AND offset_y <= 0.5),
+          width_cells    INTEGER NOT NULL DEFAULT 1,
+          height_cells   INTEGER NOT NULL DEFAULT 1,
+          label          TEXT,
+          z_index        INTEGER NOT NULL DEFAULT 0,
+          review_note    TEXT,
+          network_role   TEXT CHECK (network_role IN ('primary','backup','satellite')),
+          group_label    TEXT
+      );
+      INSERT INTO plan_items_new (id, floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
+                                   width_cells, height_cells, label, z_index, review_note, network_role, group_label)
+      SELECT id, floor_plan_id, item_type, ref_id, x, y, x2, y2,
+             ((rotation % 360) + 360) % 360,
+             width_cells, height_cells, label, z_index, review_note, network_role, group_label
+      FROM plan_items;
+      DROP TABLE plan_items;
+      ALTER TABLE plan_items_new RENAME TO plan_items;
+      CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
+      CREATE INDEX idx_planitems_plan_xy ON plan_items(floor_plan_id, x, y);
+      CREATE INDEX idx_planitems_ref ON plan_items(ref_id);
+    `);
+    db.pragma('user_version = 17');
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+}
+
+/**
+ * v17 -> v18: условная перегородка ('border' в item_type), ручная ширина двери и
+ * условный радиус охвата Wi-Fi.
+ *
+ * plan_items снова пересоздаётся: SQLite не умеет менять CHECK у существующего
+ * столбца, а в item_type надо добавить 'border'. Заодно появляется door_width.
+ * devices обходятся обычным ALTER TABLE ADD COLUMN — там CHECK только на новом
+ * столбце, пересоздавать таблицу не нужно.
+ */
+function migrateToV18() {
+  console.log('[db] миграция схемы v17 -> v18 (перегородка, ширина двери, охват Wi-Fi)');
+  db.pragma('foreign_keys = OFF');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE plan_items_new (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
+          item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','border','other','group')),
+          ref_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+          x              INTEGER NOT NULL,
+          y              INTEGER NOT NULL,
+          x2             INTEGER,
+          y2             INTEGER,
+          rotation       INTEGER NOT NULL DEFAULT 0 CHECK (rotation >= 0 AND rotation < 360),
+          offset_x       REAL NOT NULL DEFAULT 0 CHECK (offset_x >= -0.5 AND offset_x <= 0.5),
+          offset_y       REAL NOT NULL DEFAULT 0 CHECK (offset_y >= -0.5 AND offset_y <= 0.5),
+          width_cells    INTEGER NOT NULL DEFAULT 1,
+          height_cells   INTEGER NOT NULL DEFAULT 1,
+          label          TEXT,
+          z_index        INTEGER NOT NULL DEFAULT 0,
+          review_note    TEXT,
+          network_role   TEXT CHECK (network_role IN ('primary','backup','satellite')),
+          group_label    TEXT,
+          door_width     REAL NOT NULL DEFAULT 0.9 CHECK (door_width > 0 AND door_width <= 20)
+      );
+      INSERT INTO plan_items_new (id, floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
+                                   offset_x, offset_y, width_cells, height_cells, label, z_index,
+                                   review_note, network_role, group_label, door_width)
+      SELECT id, floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
+             offset_x, offset_y, width_cells, height_cells, label, z_index,
+             review_note, network_role, group_label,
+             0.9  -- уже расставленные двери получают стандартные 0.9 м; у остальных типов поле не используется
+      FROM plan_items;
+      DROP TABLE plan_items;
+      ALTER TABLE plan_items_new RENAME TO plan_items;
+      CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);
+      CREATE INDEX idx_planitems_plan_xy ON plan_items(floor_plan_id, x, y);
+      CREATE INDEX idx_planitems_ref ON plan_items(ref_id);
+    `);
+    // Радиус охвата: NULL значит "брать значение по умолчанию", поэтому заполнять
+    // существующие строки не нужно — они и так получат умолчание при отрисовке.
+    // Проверяем наличие столбца: ADD COLUMN на уже существующем столбце — жёсткая
+    // ошибка, которая оборвала бы миграцию и не дала открыть приложение вообще. Такое
+    // возможно, если базу один раз открыли новой версией, а потом откатились на старую.
+    const deviceColumns = db.prepare('PRAGMA table_info(devices)').all().map((c) => c.name);
+    if (!deviceColumns.includes('wifi_radius_m')) {
+      db.exec(`
+        ALTER TABLE devices ADD COLUMN wifi_radius_m REAL
+          CHECK (wifi_radius_m IS NULL OR (wifi_radius_m > 0 AND wifi_radius_m <= 500));
+      `);
+    }
+    db.pragma('user_version = 18');
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+}
+
+/**
+ * v18 -> v19: у плана появляется начало координат (grid_min_x / grid_min_y).
+ *
+ * До этого прямоугольник плана всегда начинался в (0,0), и всё, что чертили выше или
+ * левее этой точки, оказывалось за его пределами — а по границам плана ограничены
+ * заливка зон и привязка смещения. Выглядело это так: объекты в отрицательной области
+ * видны и двигаются, а зону там создать нельзя.
+ *
+ * Таблицу пересоздавать не нужно: только добавляем столбцы со значением по умолчанию 0,
+ * то есть у всех существующих планов начало координат остаётся прежним. Подтянуть
+ * границы под реально начерченное — задача fitToContent при открытии этажа.
+ */
+function migrateToV19() {
+  console.log('[db] миграция схемы v18 -> v19 (начало координат плана)');
+  const tx = db.transaction(() => {
+    const columns = db.prepare('PRAGMA table_info(floor_plans)').all().map((c) => c.name);
+    // ADD COLUMN на существующем столбце — жёсткая ошибка, которая оборвала бы миграцию
+    if (!columns.includes('grid_min_x')) {
+      db.exec('ALTER TABLE floor_plans ADD COLUMN grid_min_x INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!columns.includes('grid_min_y')) {
+      db.exec('ALTER TABLE floor_plans ADD COLUMN grid_min_y INTEGER NOT NULL DEFAULT 0;');
+    }
+    db.pragma('user_version = 19');
+  });
+  tx();
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -824,13 +1290,14 @@ const devicesRepo = {
   },
   create({ device_type, hostname = null, inventory_number = null, os = null, cpu = null,
            ram = null, disk = null, owner_user_id = null, host_device_id = null,
-           status = 'active', notes = null, ip_address = null, mac_address = null }) {
+           status = 'active', notes = null, ip_address = null, mac_address = null,
+           wifi_radius_m = null }) {
     const db = getDb();
     const insertDevice = db.prepare(`
       INSERT INTO devices (device_type, hostname, inventory_number, os, cpu, ram, disk,
-                            owner_user_id, host_device_id, status, notes)
+                            owner_user_id, host_device_id, status, notes, wifi_radius_m)
       VALUES (@device_type, @hostname, @inventory_number, @os, @cpu, @ram, @disk,
-              @owner_user_id, @host_device_id, @status, @notes)
+              @owner_user_id, @host_device_id, @status, @notes, @wifi_radius_m)
     `);
     const insertInterface = db.prepare(`
       INSERT INTO network_interfaces (device_id, ip_address, mac_address, is_primary)
@@ -848,7 +1315,8 @@ const devicesRepo = {
 
     const deviceId = createTx({
       device_type, hostname, inventory_number, os, cpu, ram, disk,
-      owner_user_id, host_device_id, status, notes, ip_address, mac_address
+      owner_user_id, host_device_id, status, notes, ip_address, mac_address,
+      wifi_radius_m: normalizeWifiRadius(wifi_radius_m)
     });
     const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId);
     auditLogRepo.log('device', deviceId, 'create', `Устройство «${device.hostname || device.device_type}» создано`);
@@ -862,7 +1330,7 @@ const devicesRepo = {
   },
   update(id, { device_type, hostname = null, inventory_number = null, os = null, cpu = null,
                 ram = null, disk = null, status = 'active', notes = null, host_device_id = null,
-                ip_address = undefined, mac_address = undefined }) {
+                ip_address = undefined, mac_address = undefined, wifi_radius_m = undefined }) {
     const db = getDb();
     const tx = db.transaction(() => {
       const before = db.prepare('SELECT status FROM devices WHERE id = ?').get(id);
@@ -871,6 +1339,12 @@ const devicesRepo = {
                             ram = ?, disk = ?, status = ?, notes = ?, host_device_id = ?, updated_at = datetime('now')
         WHERE id = ?
       `).run(device_type, hostname, inventory_number, os, cpu, ram, disk, status, notes, host_device_id, id);
+
+      // undefined — поля в форме не было, значение не трогаем (карточка устройства и
+      // инспектор правят разные наборы полей)
+      if (wifi_radius_m !== undefined) {
+        db.prepare('UPDATE devices SET wifi_radius_m = ? WHERE id = ?').run(normalizeWifiRadius(wifi_radius_m), id);
+      }
 
       if (before && before.status !== status) {
         db.prepare('INSERT INTO device_status_history (device_id, status) VALUES (?, ?)').run(id, status);
@@ -921,6 +1395,21 @@ const devicesRepo = {
   },
   /** Ручная связь для вкладки "Сеть" — куда подключён этот роутер/свитч, если кабель
    *  провести нельзя (например, через этажи). null снимает связь. */
+  /** Условный радиус охвата Wi-Fi в метрах. null — вернуться к значению по умолчанию. */
+  setWifiRadius(id, radiusM) {
+    const db = getDb();
+    const device = db.prepare('SELECT hostname, device_type, wifi_radius_m FROM devices WHERE id = ?').get(id);
+    if (!device) throw new Error('Устройство не найдено');
+    const value = normalizeWifiRadius(radiusM, true);
+    db.prepare("UPDATE devices SET wifi_radius_m = ?, updated_at = datetime('now') WHERE id = ?").run(value, id);
+    if (device.wifi_radius_m !== value) {
+      const name = device.hostname || device.device_type;
+      auditLogRepo.log('device', id, 'update', value === null
+        ? `«${name}»: радиус охвата Wi-Fi сброшен на значение по умолчанию (${DEFAULT_WIFI_RADIUS_M} м)`
+        : `«${name}»: радиус охвата Wi-Fi — ${formatMeters(value)}`);
+    }
+    return db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+  },
   setUplink(id, uplinkDeviceId) {
     if (uplinkDeviceId === id) throw new Error('Устройство не может быть подключено само на себя');
     getDb().prepare(`UPDATE devices SET uplink_device_id = ? WHERE id = ?`).run(uplinkDeviceId, id);
@@ -1003,6 +1492,40 @@ const floorPlansRepo = {
     auditLogRepo.log('floor_plan', plan.id, 'create', `План «${plan.name}» создан`);
     return plan;
   },
+  /** Подтягивает границы плана под то, что на нём уже лежит. Нужно для баз, созданных
+   *  до появления автоматического роста: там объекты могли уехать за край, и под ними
+   *  нет ни сетки, ни работающей заливки зон. Вызывается при открытии этажа. */
+  fitToContent(floorPlanId) {
+    const db = getDb();
+    // Минимумы нужны наравне с максимумами: чертят не от угла, и содержимое запросто
+    // оказывается выше и левее начала координат — именно там зоны и не создавались
+    const bounds = db.prepare(`
+      SELECT MIN(MIN(x, COALESCE(x2, x))) AS minX, MIN(MIN(y, COALESCE(y2, y))) AS minY,
+             MAX(MAX(x, COALESCE(x2, x))) AS maxX, MAX(MAX(y, COALESCE(y2, y))) AS maxY
+      FROM plan_items WHERE floor_plan_id = ?
+    `).get(floorPlanId);
+    const cells = [];
+    if (bounds && bounds.maxX !== null) {
+      cells.push([bounds.maxX, bounds.maxY]);
+      cells.push([bounds.minX, bounds.minY]);
+    }
+    // Зоны хранят список клеток в JSON — разбираем, иначе зона у края «подрежется»
+    const zones = db.prepare('SELECT cells FROM plan_zones WHERE floor_plan_id = ?').all(floorPlanId);
+    zones.forEach((z) => {
+      try {
+        JSON.parse(z.cells).forEach(([zx, zy]) => cells.push([zx, zy]));
+      } catch { /* битый JSON не должен мешать открытию плана */ }
+    });
+    if (cells.length === 0) return db.prepare('SELECT * FROM floor_plans WHERE id = ?').get(floorPlanId);
+    const grew = growPlanToFit(db, floorPlanId, cells);
+    const plan = db.prepare('SELECT * FROM floor_plans WHERE id = ?').get(floorPlanId);
+    if (grew) {
+      auditLogRepo.log('floor_plan', floorPlanId, 'update',
+        `Границы плана «${plan.name}» расширены под содержимое: ${plan.grid_width_cells}×${plan.grid_height_cells} клеток ` +
+        `от (${plan.grid_min_x},${plan.grid_min_y})`);
+    }
+    return plan;
+  },
   ensureDefault() {
     const db = getDb();
     const existing = db.prepare('SELECT * FROM floor_plans ORDER BY id LIMIT 1').get();
@@ -1027,6 +1550,45 @@ const floorPlansRepo = {
   }
 };
 
+/** Снимает устройство со всех прежних мест на плане, кроме exceptItemId — и как
+ *  одиночный элемент, и как участника группы (с тем же авто-разворачиванием группы,
+ *  что в removeFromGroup: остался один участник — группа снова становится одиночным
+ *  элементом, не осталось никого — группа удаляется).
+ *  Вызывается ВНУТРИ уже открытой транзакции, поэтому своей не создаёт. */
+function detachDeviceFromPlan(db, deviceId, exceptItemId = null) {
+  const singles = db.prepare(
+    "SELECT id FROM plan_items WHERE item_type = 'device' AND ref_id = ?"
+  ).all(deviceId);
+  for (const row of singles) {
+    if (exceptItemId !== null && row.id === exceptItemId) continue;
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(row.id);
+    db.prepare('DELETE FROM plan_items WHERE id = ?').run(row.id);
+    auditLogRepo.log('plan_item', row.id, 'delete',
+      `${planItemLabelForLog(db, item)} снят(а) с прежнего места на плане (переносится)`);
+  }
+
+  const memberships = db.prepare(
+    'SELECT group_item_id FROM plan_item_group_members WHERE device_id = ?'
+  ).all(deviceId);
+  for (const row of memberships) {
+    const groupId = row.group_item_id;
+    if (exceptItemId !== null && groupId === exceptItemId) continue;
+    db.prepare('DELETE FROM plan_item_group_members WHERE group_item_id = ? AND device_id = ?')
+      .run(groupId, deviceId);
+    const remaining = db.prepare('SELECT device_id FROM plan_item_group_members WHERE group_item_id = ?').all(groupId);
+    if (remaining.length === 0) {
+      db.prepare('DELETE FROM plan_items WHERE id = ?').run(groupId);
+      auditLogRepo.log('plan_item', groupId, 'delete', 'Группа устройств на плане удалена (опустела)');
+    } else if (remaining.length === 1) {
+      db.prepare("UPDATE plan_items SET item_type = 'device', ref_id = ?, group_label = NULL WHERE id = ?")
+        .run(remaining[0].device_id, groupId);
+      auditLogRepo.log('plan_item', groupId, 'update', 'Группа устройств на плане разгруппирована (осталось одно устройство)');
+    } else {
+      auditLogRepo.log('plan_item', groupId, 'update', 'Устройство убрано из группы на плане (переносится)');
+    }
+  }
+}
+
 const planItemsRepo = {
   listByPlan(floorPlanId) {
     // hostname/тип/IP/статус пинга/владелец устройства сразу — канва и инспектор
@@ -1037,7 +1599,8 @@ const planItemsRepo = {
              ni.ip_address AS device_ip, dlp.status AS last_ping_status,
              d.owner_user_id AS owner_user_id, u.full_name AS owner_name,
              d.status AS device_status, d.flag AS device_flag, u.status AS owner_status,
-             d.uplink_device_id AS device_uplink_id
+             d.uplink_device_id AS device_uplink_id,
+             d.wifi_radius_m AS device_wifi_radius_m
       FROM plan_items pi
       LEFT JOIN devices d ON d.id = pi.ref_id
       LEFT JOIN network_interfaces ni ON ni.device_id = d.id AND ni.is_primary = 1
@@ -1105,14 +1668,36 @@ const planItemsRepo = {
     return getDb().prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
   },
   create({ floor_plan_id, item_type, ref_id = null, x, y, x2 = null, y2 = null, rotation = 0,
-           width_cells = 1, height_cells = 1, label = null, z_index = 0 }) {
+           offset_x = 0, offset_y = 0, width_cells = 1, height_cells = 1, label = null, z_index = 0,
+           door_width = DEFAULT_DOOR_WIDTH }) {
     const db = getDb();
+    rotation = normalizeRotation(rotation);
+    // План растёт под новый объект ПЕРВЫМ делом. Порядок принципиален: нормализация
+    // ниже зажимает клетку по текущим границам плана, и если сначала нормализовать, то
+    // объект, созданный на 106-й клетке плана шириной 96, молча переехал бы на 95-ю.
+    // «Положили за границей» — это повод расширить план, а не сдвинуть объект.
+    growPlanToFit(db, floor_plan_id, [[x, y], [x2 === null ? x : x2, y2 === null ? y : y2]]);
+
+    if (isPointItemType(item_type)) {
+      // Тот же инвариант, что и в setCellOffset: владелец — ближайшая клетка. Если при
+      // создании передали смещение больше половины, объект сразу привязывается к
+      // соседней, а не рождается на границе своей. Границы читаем ПОСЛЕ роста.
+      const bounds = planBounds(db, floor_plan_id);
+      const nx = normalizeCellAndOffset(x, offset_x, bounds.minX, bounds.maxX);
+      const ny = normalizeCellAndOffset(y, offset_y, bounds.minY, bounds.maxY);
+      x = nx.cell; y = ny.cell;
+      offset_x = nx.offset; offset_y = ny.offset;
+    } else {
+      // Линейные объекты: координаты — узлы сетки, трогать их нельзя; смещения нет
+      offset_x = 0; offset_y = 0;
+    }
+    door_width = clampDoorWidth(door_width);
     const info = db.prepare(`
-      INSERT INTO plan_items (floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation,
-                               width_cells, height_cells, label, z_index)
-      VALUES (@floor_plan_id, @item_type, @ref_id, @x, @y, @x2, @y2, @rotation,
-              @width_cells, @height_cells, @label, @z_index)
-    `).run({ floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation, width_cells, height_cells, label, z_index });
+      INSERT INTO plan_items (floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation, offset_x, offset_y,
+                               width_cells, height_cells, label, z_index, door_width)
+      VALUES (@floor_plan_id, @item_type, @ref_id, @x, @y, @x2, @y2, @rotation, @offset_x, @offset_y,
+              @width_cells, @height_cells, @label, @z_index, @door_width)
+    `).run({ floor_plan_id, item_type, ref_id, x, y, x2, y2, rotation, offset_x, offset_y, width_cells, height_cells, label, z_index, door_width });
     const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(info.lastInsertRowid);
     auditLogRepo.log('plan_item', item.id, 'create', `${planItemLabelForLog(db, item)} размещён(а) на плане`);
     return item;
@@ -1120,6 +1705,7 @@ const planItemsRepo = {
   move(id, x, y) {
     const db = getDb();
     const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    if (item) growPlanToFit(db, item.floor_plan_id, [[x, y]]);
     db.prepare('UPDATE plan_items SET x = ?, y = ? WHERE id = ?').run(x, y, id);
     if (item && (item.x !== x || item.y !== y)) {
       auditLogRepo.log('plan_item', id, 'update',
@@ -1127,13 +1713,81 @@ const planItemsRepo = {
     }
     return { id, x, y };
   },
+  /** Ширина проёма двери, в клетках = в условных метрах. Вне диапазона CHECK в схеме
+   *  (0..20) не пропускаем здесь, чтобы отдать понятную ошибку вместо SQLITE_CONSTRAINT. */
+  setDoorWidth(id, width) {
+    const db = getDb();
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    if (!item) throw new Error('Объект плана не найден');
+    if (item.item_type !== 'door') throw new Error('Ширина проёма есть только у двери.');
+    const value = clampDoorWidth(width, true);
+    db.prepare('UPDATE plan_items SET door_width = ? WHERE id = ?').run(value, id);
+    if (item.door_width !== value) {
+      auditLogRepo.log('plan_item', id, 'update',
+        `Ширина двери изменена: ${formatMeters(item.door_width)} → ${formatMeters(value)}`);
+    }
+    return db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+  },
   /** Смена rotation без прочих полей — у двери используется для "Развернуть"/"Отразить" */
   setRotation(id, rotation) {
     const db = getDb();
+    rotation = normalizeRotation(rotation);
     const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
     db.prepare('UPDATE plan_items SET rotation = ? WHERE id = ?').run(rotation, id);
     if (item && item.rotation !== rotation) {
-      auditLogRepo.log('plan_item', id, 'update', `${planItemLabelForLog(db, item)} повёрнут(а) на плане`);
+      auditLogRepo.log('plan_item', id, 'update',
+        `${planItemLabelForLog(db, item)} повёрнут(а) на плане: ${item.rotation}° → ${rotation}°`);
+    }
+    return db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+  },
+  /** Смещение внутри собственной клетки (доли клетки, -0.5..+0.5) — привязка к косым
+   *  стенам, когда центр клетки не подходит. Отдельно от move(): клетка та же, меняется
+   *  только положение внутри неё, и в журнал это пишется как другое по смыслу действие. */
+  setCellOffset(id, offset_x, offset_y) {
+    const db = getDb();
+    const item = db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
+    if (!item) throw new Error('Объект плана не найден');
+    if (!isPointItemType(item.item_type)) {
+      // У стены/двери/лестницы координаты — узлы сетки, а не клетка: смещение внутри
+      // клетки для них не определено, и применять его значило бы сдвинуть конец линии
+      throw new Error('Смещение внутри клетки есть только у точечных объектов (стол, устройство, группа).');
+    }
+
+    // Смещение задаётся ОТ ЦЕНТРА ТЕКУЩЕЙ клетки, но владельцем должна остаться
+    // ближайшая: вышел больше чем на половину — перепривязываем к соседней, а остаток
+    // становится смещением уже от неё. Так числовые поля ведут себя ровно как мышь.
+    const bounds = planBounds(db, item.floor_plan_id);
+    const nx = normalizeCellAndOffset(item.x, offset_x, bounds.minX, bounds.maxX);
+    const ny = normalizeCellAndOffset(item.y, offset_y, bounds.minY, bounds.maxY);
+    const movedToAnotherCell = nx.cell !== item.x || ny.cell !== item.y;
+
+    if (movedToAnotherCell && (item.item_type === 'device' || item.item_type === 'group')) {
+      // Перепривязка может привести на клетку, где уже кто-то стоит. Объединять в группу
+      // по правке числового поля — слишком неожиданно (для этого есть перетаскивание,
+      // где слияние видно и ожидаемо), поэтому честно отказываемся.
+      const occupied = db.prepare(`
+        SELECT id FROM plan_items
+        WHERE floor_plan_id = ? AND x = ? AND y = ? AND id <> ? AND item_type IN ('device','group')
+      `).get(item.floor_plan_id, nx.cell, ny.cell, id);
+      if (occupied) {
+        throw new Error(
+          `Такое смещение переносит объект в клетку (${nx.cell},${ny.cell}), а она уже занята. ` +
+          'Чтобы объединить объекты в группу, перетащите один на другой мышью.'
+        );
+      }
+    }
+
+    db.prepare('UPDATE plan_items SET x = ?, y = ?, offset_x = ?, offset_y = ? WHERE id = ?')
+      .run(nx.cell, ny.cell, nx.offset, ny.offset, id);
+
+    const label = planItemLabelForLog(db, item);
+    if (movedToAnotherCell) {
+      auditLogRepo.log('plan_item', id, 'update',
+        `${label} перепривязан(а) к клетке (${nx.cell},${ny.cell}) со смещением ` +
+        `(${nx.offset.toFixed(2)}, ${ny.offset.toFixed(2)}) — было (${item.x},${item.y})`);
+    } else if (item.offset_x !== nx.offset || item.offset_y !== ny.offset) {
+      auditLogRepo.log('plan_item', id, 'update',
+        `${label} смещён(а) внутри клетки: (${nx.offset.toFixed(2)}, ${ny.offset.toFixed(2)})`);
     }
     return db.prepare('SELECT * FROM plan_items WHERE id = ?').get(id);
   },
@@ -1151,9 +1805,17 @@ const planItemsRepo = {
   placeDeviceWithGrouping(floor_plan_id, deviceId, x, y) {
     const db = getDb();
     const tx = db.transaction(() => {
+      growPlanToFit(db, floor_plan_id, [[x, y]]);
       const existing = db.prepare(`
         SELECT * FROM plan_items WHERE floor_plan_id = ? AND x = ? AND y = ? AND item_type IN ('device', 'group')
       `).get(floor_plan_id, x, y);
+
+      // Одно физическое устройство — одно место на плане (см. listPlacedDeviceIds).
+      // Карман "Устройства" уже размещённое не предлагает, но на стороне клиента список
+      // мог быть устаревшим (или drop сработал дважды) — и тогда у устройства
+      // появлялось ВТОРОЕ размещение-дубликат. Снимаем прежнее место, т.е. трактуем
+      // такой повторный drop как перенос, а не как второй экземпляр.
+      detachDeviceFromPlan(db, deviceId, existing ? existing.id : null);
 
       if (!existing) {
         const info = db.prepare(`
@@ -1198,6 +1860,7 @@ const planItemsRepo = {
   moveDeviceItemWithGrouping(oldItemId, floor_plan_id, deviceId, x, y) {
     const db = getDb();
     const tx = db.transaction(() => {
+      growPlanToFit(db, floor_plan_id, [[x, y]]);
       const existing = db.prepare(`
         SELECT * FROM plan_items WHERE floor_plan_id = ? AND x = ? AND y = ? AND item_type IN ('device', 'group') AND id <> ?
       `).get(floor_plan_id, x, y, oldItemId);
@@ -1434,6 +2097,17 @@ const ownershipRepo = {
   /** Закрепляет пользователя за устройством: закрывает предыдущую активную запись (если была) и открывает новую */
   assign(deviceId, userId) {
     const db = getDb();
+    // Повторное закрепление за ТЕМ ЖЕ пользователем закрывало активную запись истории
+    // и открывало новую — в истории владения появлялась пара дублей с нулевым сроком
+    // (и лишняя строка в журнале). Если ничего не меняется, просто выходим.
+    const current = db.prepare(`
+      SELECT user_id FROM device_user_history WHERE device_id = ? AND unassigned_at IS NULL
+      ORDER BY id DESC LIMIT 1
+    `).get(deviceId);
+    const ownerNow = db.prepare('SELECT owner_user_id FROM devices WHERE id = ?').get(deviceId);
+    if (current && current.user_id === userId && ownerNow && ownerNow.owner_user_id === userId) {
+      return { deviceId, userId, unchanged: true };
+    }
     const tx = db.transaction(() => {
       db.prepare(`
         UPDATE device_user_history SET unassigned_at = datetime('now')
@@ -1508,8 +2182,11 @@ const componentsRepo = {
   detach(id) {
     const db = getDb();
     const comp = db.prepare('SELECT * FROM device_components WHERE id = ?').get(id);
+    // Повторное снятие раньше перезаписывало исходную дату снятия и давало ещё одну
+    // запись в журнале — история искажалась. Теперь второй вызов ничего не делает.
+    if (!comp || comp.detached_at) return { id, alreadyDetached: true };
     db.prepare(`UPDATE device_components SET detached_at = datetime('now') WHERE id = ?`).run(id);
-    if (comp) auditLogRepo.log('component', id, 'update', `«${deviceLabelForLog(db, comp.device_id)}»: снято «${comp.description}»`);
+    auditLogRepo.log('component', id, 'update', `«${deviceLabelForLog(db, comp.device_id)}»: снято «${comp.description}»`);
     return { id };
   },
   remove(id) {
@@ -1550,8 +2227,10 @@ const peripheralsRepo = {
   detach(id) {
     const db = getDb();
     const periph = db.prepare('SELECT * FROM device_peripherals WHERE id = ?').get(id);
+    // См. componentsRepo.detach — повторный вызов не должен переписывать дату и журнал
+    if (!periph || periph.detached_at) return { id, alreadyDetached: true };
     db.prepare(`UPDATE device_peripherals SET detached_at = datetime('now') WHERE id = ?`).run(id);
-    if (periph) auditLogRepo.log('peripheral', id, 'update', `«${deviceLabelForLog(db, periph.device_id)}»: отключена «${periph.description}»`);
+    auditLogRepo.log('peripheral', id, 'update', `«${deviceLabelForLog(db, periph.device_id)}»: отключена «${periph.description}»`);
     return { id };
   },
   remove(id) {
@@ -1591,6 +2270,26 @@ const softwareRepo = {
     `).run(device_id, software_type, name, license_key, cost, note);
     auditLogRepo.log('software', info.lastInsertRowid, 'create', `«${deviceLabelForLog(db, device_id)}»: установлено ПО «${name}»`);
     return db.prepare('SELECT * FROM device_software WHERE id = ?').get(info.lastInsertRowid);
+  },
+  /** Редактирование записи об установленном ПО прямо с листа "ПО" — устройство
+   *  (device_id) и даты установки/снятия не меняем: перенос ПО на другое устройство —
+   *  это "снять на склад" + "выдать", а не правка карточки. */
+  update(id, { software_type, name, license_key = null, cost = null, note = null }) {
+    const db = getDb();
+    const before = db.prepare('SELECT * FROM device_software WHERE id = ?').get(id);
+    if (!before) throw new Error('Запись о ПО не найдена');
+    if (!SOFTWARE_TYPES.includes(software_type)) throw new Error('Недопустимый тип ПО');
+    const cleanName = (name || '').trim();
+    if (!cleanName) throw new Error('Название ПО не может быть пустым');
+    db.prepare(`
+      UPDATE device_software SET software_type = ?, name = ?, license_key = ?, cost = ?, note = ?
+      WHERE id = ?
+    `).run(software_type, cleanName, license_key, cost, note, id);
+    auditLogRepo.log('software', id, 'update',
+      before.name === cleanName
+        ? `Запись о ПО «${cleanName}» отредактирована`
+        : `Запись о ПО «${before.name}» отредактирована (переименована в «${cleanName}»)`);
+    return db.prepare('SELECT * FROM device_software WHERE id = ?').get(id);
   },
   remove(id) {
     const db = getDb();
@@ -1666,6 +2365,10 @@ const warehouseRepo = {
     const tx = db.transaction(() => {
       const comp = db.prepare('SELECT * FROM device_components WHERE id = ?').get(componentId);
       if (!comp) throw new Error('Комплектующая не найдена');
+      // Без этой проверки повторный вызов (двойной клик, либо две клиентские сессии
+      // подряд) создавал ВТОРУЮ складскую позицию из той же комплектующей — на складе
+      // появлялся дубликат. Та же защита, что и в issueToDevice.
+      if (comp.detached_at) throw new Error('Эта комплектующая уже снята с устройства');
       db.prepare(`UPDATE device_components SET detached_at = datetime('now') WHERE id = ?`).run(componentId);
       db.prepare(`
         INSERT INTO warehouse_items (category, item_type, description, cost, status, source_device_id, note)
@@ -1684,6 +2387,10 @@ const warehouseRepo = {
     const tx = db.transaction(() => {
       const sw = db.prepare('SELECT * FROM device_software WHERE id = ?').get(softwareId);
       if (!sw) throw new Error('ПО не найдено');
+      // Главная причина дублей снятого ПО на складе: повторный вызов вставлял ещё одну
+      // складскую позицию, а removed_at просто перезаписывался — одна лицензия
+      // превращалась на складе в две (и больше)
+      if (sw.removed_at) throw new Error('Это ПО уже снято с устройства');
       db.prepare(`UPDATE device_software SET removed_at = datetime('now') WHERE id = ?`).run(softwareId);
       db.prepare(`
         INSERT INTO warehouse_items (category, item_type, description, license_key, cost, status, source_device_id, note)
@@ -1760,6 +2467,7 @@ const zonesRepo = {
   },
   create({ floor_plan_id, name, cells, label_x = null, label_y = null, label_rotation = 0, label_visible = 1 }) {
     const info = getDb().prepare(`
+      -- клетки зоны тоже должны оставаться внутри границ плана
       INSERT INTO plan_zones (floor_plan_id, name, cells, label_x, label_y, label_rotation, label_visible)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(floor_plan_id, name, JSON.stringify(cells), label_x, label_y, label_rotation, label_visible ? 1 : 0);
@@ -1931,11 +2639,14 @@ const networkRepo = {
 };
 
 module.exports = {
-  initDatabase, getDb, usersRepo, devicesRepo, pingRepo,
+  setUserDataPath,
+  initDatabase, getDb, getDbReadonly, markReadonly, releaseDbLock, dbLock, usersRepo, devicesRepo, pingRepo,
   floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
   softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
   getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
+  getServerToken, getSourceKind,
+  DEFAULT_DOOR_WIDTH, DEFAULT_WIFI_RADIUS_M, WIFI_DEVICE_TYPES,
   getAllowClientWrites, setAllowClientWrites
 };

@@ -241,6 +241,12 @@ body {
 .inspector-field { margin-bottom: 8px; font-size: 13px; }
 .inspector-field label { display: block; font-size: 11px; color: #888; text-transform: uppercase; }
 .inspector-field .value { font-size: 13px; word-break: break-word; }
+
+/* Блок "Положение в клетке" в инспекторе: поворот (ползунок + число) и смещение X/Y */
+.placement-row { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+.placement-row input[type="range"] { flex: 1 1 auto; min-width: 60px; }
+.placement-num { width: 64px; flex: 0 0 auto; }
+.placement-unit { font-size: 11px; color: #888; flex: 0 0 auto; }
 .inspector-actions { margin-top: 14px; display: flex; gap: 8px; }
 .inspector-actions button { flex: 1; padding: 6px; border: 1px solid #ccc; border-radius: 6px; cursor: pointer; background: #fff; }
 .inspector-actions .danger { border-color: #e07a7a; color: #b33; }
@@ -680,3 +686,6 @@ button:hover { background: #eaeaea; }
   flex-shrink: 0;
 }
 .hint { color: #666; font-size: 13px; }
+
+/* Подсказка под полями смещения в инспекторе */
+.placement-hint { font-size: 11px; color: #888; margin: 2px 0 6px; line-height: 1.35; }

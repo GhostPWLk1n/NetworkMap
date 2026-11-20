@@ -49,6 +49,11 @@ CREATE TABLE devices (
     purchase_date     TEXT,
     warranty_until    TEXT,
     notes             TEXT,
+    wifi_radius_m     REAL CHECK (wifi_radius_m IS NULL OR (wifi_radius_m > 0 AND wifi_radius_m <= 500)),
+                        -- условный радиус охвата Wi-Fi в метрах (клетка плана = 1 м).
+                        -- NULL = брать значение по умолчанию (см. DEFAULT_WIFI_RADIUS_M).
+                        -- Именно условный: реальный охват зависит от стен и помех, план
+                        -- этого не моделирует и не претендует на расчёт
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
     CHECK (device_type = 'vm' OR host_device_id IS NULL)
@@ -135,6 +140,14 @@ CREATE TABLE floor_plans (
     grid_step         INTEGER NOT NULL DEFAULT 900,
     grid_width_cells  INTEGER NOT NULL DEFAULT 96,
     grid_height_cells INTEGER NOT NULL DEFAULT 54,
+    grid_min_x        INTEGER NOT NULL DEFAULT 0,
+    grid_min_y        INTEGER NOT NULL DEFAULT 0,
+                        -- Начало координат плана. Прямоугольник плана — это
+                        -- [grid_min_x; grid_min_x + grid_width_cells) по X и так же по Y,
+                        -- то есть он может начинаться и с ОТРИЦАТЕЛЬНОЙ клетки. Нужно
+                        -- потому, что чертят не от угла: здание легко оказывается выше и
+                        -- левее исходной точки, а от границ плана зависят заливка зон и
+                        -- привязка смещения — за границей они просто не работают.
     background_image  TEXT,   -- путь/base64 подложки, опционально
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
@@ -149,7 +162,11 @@ CREATE INDEX idx_floorplans_floor ON floor_plans(floor_id);
 CREATE TABLE plan_items (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     floor_plan_id  INTEGER NOT NULL REFERENCES floor_plans(id) ON DELETE CASCADE,
-    item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','other','group')),
+    item_type      TEXT NOT NULL CHECK (item_type IN ('desk','device','wall','door','stairs','border','other','group')),
+                    -- 'border' — условная перегородка: рисуется как стена и так же держит
+                    -- заливку зоны, но отображается тонкой линией. Нужна, чтобы разделить
+                    -- одно помещение на несколько зон, не изображая капитальную стену
+                    -- (двери в неё не вставляются, см. renderer)
     ref_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
                     -- заполнено, если item_type = 'device'; на план кладутся только
                     -- физические устройства (device_type <> 'vm') — проверяется в приложении,
@@ -159,7 +176,15 @@ CREATE TABLE plan_items (
     y              INTEGER NOT NULL,
     x2             INTEGER,            -- линейные элементы: конец отрезка; NULL для desk/device
     y2             INTEGER,
-    rotation       INTEGER NOT NULL DEFAULT 0 CHECK (rotation IN (0,90,180,270)),
+    rotation       INTEGER NOT NULL DEFAULT 0 CHECK (rotation >= 0 AND rotation < 360),
+                    -- произвольный угол 0..359: у двери кодирует hinge/swing (кратные 90),
+                    -- у лестницы — направление подъёма, у устройства — свободный поворот
+                    -- иконки (например, вдоль скошенной стены)
+    offset_x       REAL NOT NULL DEFAULT 0 CHECK (offset_x >= -0.5 AND offset_x <= 0.5),
+    offset_y       REAL NOT NULL DEFAULT 0 CHECK (offset_y >= -0.5 AND offset_y <= 0.5),
+                    -- положение внутри СВОЕЙ клетки в долях клетки (0,0 — центр):
+                    -- не зависит от размера клетки в пикселях, поэтому переживает
+                    -- смену масштаба сетки; нужно для привязки к косым стенам
     width_cells    INTEGER NOT NULL DEFAULT 1,
     height_cells   INTEGER NOT NULL DEFAULT 1,
     label          TEXT,
@@ -170,7 +195,12 @@ CREATE TABLE plan_items (
                     -- сегменте несколько роутеров — выбирается вручную. Подключение к
                     -- кабелю само по себе — в отдельной таблице cable_connections
                     -- (многие-ко-многим: многопортовый роутер может быть на нескольких)
-    group_label    TEXT    -- название группы (только для item_type='group'), например "Шкаф А1"
+    group_label    TEXT,   -- название группы (только для item_type='group'), например "Шкаф А1"
+    door_width     REAL NOT NULL DEFAULT 0.9 CHECK (door_width > 0 AND door_width <= 20)
+                    -- ширина проёма для item_type='door', в клетках. Клетка — условный
+                    -- метр, поэтому 0.9 это и 0.9 клетки, и 0.9 м. Хранится у каждой
+                    -- двери: ширины в одном помещении обычно разные, а общая настройка
+                    -- "ширина по умолчанию" ломалась бы при изменении задним числом
 );
 
 CREATE INDEX idx_planitems_plan ON plan_items(floor_plan_id);

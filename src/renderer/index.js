@@ -11,6 +11,9 @@ function initTabs() {
       document.getElementById(`tab-${btn.dataset.tab}`).classList.add('active');
       if (btn.dataset.tab === 'network') renderNetworkTab();
       if (btn.dataset.tab === 'audit') loadAuditLog();
+      // Реестр ПО собирается из двух источников (установки на устройствах + склад) и
+      // мог устареть, пока вкладка была закрыта — например, после правок с хоста
+      if (btn.dataset.tab === 'software') renderSoftwareRegistry();
     });
   });
 }
@@ -618,7 +621,18 @@ document.getElementById('users-filter-show-dismissed').addEventListener('change'
 
 let devicesCache = [];
 let clientModeActive = false; // true, если это клиент чужого хоста — формы редактирования требуют явного запроса права (см. requestEditLock)
-let clientAllowWritesFlag = false; // текущее состояние тумблера хоста (см. onLocksStateChanged) — для текста баннера
+// true, если базу уже держит другой экземпляр и она открыта только для чтения
+// (см. db/dbLock.js). Запись в этом случае отклоняет бэкенд, здесь это нужно, чтобы
+// не включать режим рисования и не показывать плашку повторно.
+let dbReadonlyActive = false;
+// 'host' | 'server' — к чему подключён клиент. Протокол один, но подписи и причины
+// отказа в записи разные (см. updateReadOnlyBanner).
+let clientSourceKind = 'host';
+// Разрешена ли запись на той стороне (см. onLocksStateChanged) — для текста плашки.
+// null = ещё не знаем: ответ приходит первым heartbeat'ом. Разделять «нельзя» и
+// «пока неизвестно» важно: иначе в первый момент плашка уверенно врёт, что запись
+// выключена, хотя сервер её разрешает.
+let clientAllowWritesFlag = null;
 let clientHeldLockKeys = new Set(); // "type:id" — объекты, на которые ЭТОТ клиент прямо сейчас имеет право (см. isNodeLocked)
 let devicesSearchState;
 
@@ -1445,7 +1459,7 @@ function buildSoftwareCard(s) {
   header.addEventListener('click', () => row.classList.toggle('expanded'));
   header.addEventListener('contextmenu', (e) => {
     e.preventDefault();
-    const items = [{ label: 'Подробнее', onClick: () => row.classList.add('expanded') }];
+    const items = [{ label: 'Редактировать', onClick: () => row.classList.add('expanded') }];
     items.push(...flagMenuItems(s.flag, async (flag) => {
       const api = s.source === 'device' ? window.api.software : window.api.warehouse;
       const updated = await api.setFlag(s.id, flag);
@@ -1457,7 +1471,15 @@ function buildSoftwareCard(s) {
       items.push({
         label: 'Снять и на склад', danger: true, onClick: async () => {
           if (!(await confirmModal(`Снять «${s.name}» с «${s.device_hostname}» и отправить на склад?`))) return;
-          await window.api.warehouse.receiveSoftware(s.id);
+          try {
+            await window.api.warehouse.receiveSoftware(s.id);
+          } catch (err) {
+            // Карточка в DOM могла устареть (ПО уже снято в другом окне/сессии) —
+            // показываем причину и просто перечитываем реестр
+            showToast(err.message || 'Не удалось снять ПО');
+            renderSoftwareRegistry();
+            return;
+          }
           renderSoftwareRegistry();
           renderWarehouse();
           fillWarehouseDragList();
@@ -1479,13 +1501,75 @@ function buildSoftwareCard(s) {
 
   const body = document.createElement('div');
   body.className = 'card-body';
+  // Устройство и статус — только для чтения: перенос ПО на другое устройство делается
+  // через "Снять и на склад" + выдачу, а не правкой полей карточки
   if (s.device_hostname) body.appendChild(field('Устройство', s.device_hostname));
-  body.appendChild(field('Тип', SOFTWARE_TYPE_LABELS[s.type] || s.type));
-  body.appendChild(field('Название', s.name));
-  body.appendChild(field('Лицензионный ключ', s.license_key || '—'));
-  body.appendChild(field('Стоимость', s.cost != null ? String(s.cost) : '—'));
   body.appendChild(field('Статус', s.statusLabel));
-  if (s.note) body.appendChild(field('Заметка', s.note));
+
+  // Редактируемая часть карточки. Запись может жить в двух таблицах (установлена на
+  // устройстве либо лежит на складе), поэтому сохраняем в разные API, но форма одна.
+  const form = document.createElement('form');
+  const typeOptions = Object.keys(SOFTWARE_TYPE_LABELS)
+    .map((t) => `<option value="${t}">${SOFTWARE_TYPE_LABELS[t]}</option>`).join('');
+  form.innerHTML = `
+    <label>Тип <select name="software_type">${typeOptions}</select></label>
+    <label>Стоимость <input name="cost" type="number" step="0.01" min="0" /></label>
+    <label class="span-2">Название <input name="name" required /></label>
+    <label class="span-2">Лицензионный ключ <input name="license_key" /></label>
+    <label class="span-2">Заметка <input name="note" /></label>
+  `;
+  form.software_type.value = s.type;
+  form.name.value = s.name || '';
+  form.license_key.value = s.license_key || '';
+  form.cost.value = s.cost ?? '';
+  form.note.value = s.note || '';
+
+  const saveRow = document.createElement('div');
+  saveRow.className = 'card-body-actions';
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'submit';
+  saveBtn.textContent = 'Сохранить';
+  const statusNote = document.createElement('span');
+  statusNote.className = 'status-note';
+  saveRow.append(saveBtn, statusNote);
+  form.appendChild(saveRow);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const common = {
+      software_type: fd.get('software_type'),
+      name: (fd.get('name') || '').trim(),
+      license_key: fd.get('license_key') || null,
+      cost: fd.get('cost') ? Number(fd.get('cost')) : null,
+      note: fd.get('note') || null
+    };
+    try {
+      handleApiErrorLocally(s.source === 'device' ? 'software:update' : 'warehouse:update');
+      if (s.source === 'device') {
+        await window.api.software.update(s.id, common);
+      } else {
+        // warehouse_items: своя схема полей (description/item_type) + обязательные
+        // category/status, которые эта форма не меняет — берём их из исходной записи
+        await window.api.warehouse.update(s.id, {
+          item_type: common.software_type,
+          description: common.name,
+          license_key: common.license_key,
+          cost: common.cost,
+          status: s.raw.status,
+          note: common.note
+        });
+      }
+    } catch (err) {
+      statusNote.textContent = `Не сохранено: ${err.message}`;
+      return;
+    }
+    statusNote.textContent = 'Сохранено ✓';
+    setTimeout(() => { statusNote.textContent = ''; }, 2000);
+    renderSoftwareRegistry();
+    if (s.source === 'warehouse') { renderWarehouse(); fillWarehouseDragList(); }
+  });
+  body.appendChild(form);
 
   const actions = document.createElement('div');
   actions.className = 'card-body-actions';
@@ -1498,7 +1582,15 @@ function buildSoftwareCard(s) {
     detachBtn.type = 'button';
     detachBtn.textContent = 'Снять и на склад';
     detachBtn.onclick = async () => {
-      await window.api.warehouse.receiveSoftware(s.id);
+      if (detachBtn.disabled) return; // двойной клик давал два дубля на складе
+      detachBtn.disabled = true;
+      try {
+        await window.api.warehouse.receiveSoftware(s.id);
+      } catch (err) {
+        showToast(err.message || 'Не удалось снять ПО');
+        detachBtn.disabled = false;
+        return;
+      }
       renderSoftwareRegistry();
       renderWarehouse();
       fillWarehouseDragList();
@@ -1545,8 +1637,12 @@ document.getElementById('software-warehouse-form').addEventListener('submit', as
 const CELL_PX = 40; // визуальный размер ячейки на экране (grid_step=900 в реальных единицах)
 const INITIAL_ZOOM = 1; // всё умещается в одну клетку — отдалять план по умолчанию больше не нужно
 const CABLE_COLOR = '#2ca02c';
-const LINE_RENDER_TYPES = ['wall', 'door', 'stairs']; // хранятся и рисуются через x,y -> x2,y2
-const TWO_CLICK_TOOLS = ['wall', 'stairs'];   // инструменты с рисованием "точка -> точка"
+const LINE_RENDER_TYPES = ['wall', 'door', 'stairs', 'border']; // хранятся и рисуются через x,y -> x2,y2
+const WALL_STROKE_PX = 6;          // толщина стены на экране — от неё считается ширина белого проёма
+const DEFAULT_WIFI_RADIUS_M = 15;  // см. DEFAULT_WIFI_RADIUS_M в main/db/index.js
+const WIFI_DEVICE_TYPES = ['router']; // у кого вообще осмысленно показывать охват
+const DEFAULT_DOOR_WIDTH = 0.9;    // клетка плана = условный метр, см. DEFAULT_DOOR_WIDTH в main/db/index.js
+const TWO_CLICK_TOOLS = ['wall', 'stairs', 'border'];   // инструменты с рисованием "точка -> точка"
 const DOOR_SNAP_THRESHOLD = 0.6;              // макс. расстояние (в клетках) от клика до стены, чтобы врезать дверь
 
 const DEVICE_COLORS = {
@@ -1581,16 +1677,58 @@ let planState = {
   // 0=зоны, 1=стены/мебель, 2=кабели, 3=оборудование; глобально, не сбрасывается по этажам.
   // 'visible' — видно и редактируется; 'locked' — видно, но нельзя двигать/удалять/рисовать
   // на этом слое; 'hidden' — не видно (и, соответственно, тоже нельзя взаимодействовать)
-  layerState: { 0: 'visible', 1: 'visible', 2: 'visible', 3: 'visible', 4: 'visible' }
+  layerState: { 0: 'visible', 1: 'visible', 2: 'visible', 3: 'visible', 4: 'visible' },
+  // Угол, под которым ставятся НОВЫЕ столы/устройства (0..359). Нужен у косых стен:
+  // выставил угол стены один раз — и весь ряд объектов ложится вдоль неё, без
+  // доворота каждого по отдельности. Глобально, не сбрасывается по этажам.
+  placementRotation: 0,
+  // Показывать ли условный охват Wi-Fi у роутеров. На насыщенном плане круги мешают,
+  // поэтому выключаются целиком; выбор запоминается между запусками.
+  showWifiCoverage: loadWifiCoveragePref()
 };
+
+/** Переключатель охвата держим в localStorage: это настройка вида у КОНКРЕТНОГО
+ *  человека, а не свойство плана — в БД ей не место (иначе один выключил бы круги
+ *  всем сразу). Доступ в try/catch: в части окружений хранилище может быть недоступно. */
+function loadWifiCoveragePref() {
+  try {
+    const raw = localStorage.getItem('nm.showWifiCoverage');
+    return raw === null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+function saveWifiCoveragePref(value) {
+  try { localStorage.setItem('nm.showWifiCoverage', value ? '1' : '0'); } catch { /* не критично */ }
+}
+
+/** Показать/скрыть все круги охвата разом, без пересборки канвы. */
+function applyWifiCoverageVisibility() {
+  if (!planState.layer) return;
+  planState.itemsById.forEach((node) => {
+    if (!node.getChildren) return;
+    node.getChildren().forEach((child) => {
+      if (child.getAttr('isWifiCoverage')) child.visible(planState.showWifiCoverage);
+    });
+  });
+  planState.layer.batchDraw();
+}
 
 /** К какому логическому слою относится тип объекта плана — используется и при отрисовке
  *  (сразу выставить видимость/блокировку), и переключателями слоёв.
  *  Зоны — слой 0, самый нижний (под стенами); кабели (отдельная сущность, не plan_item) — слой 2. */
+/** Порядок ВНУТРИ одного логического слоя. Нужен только конструктиву: дверь должна
+ *  быть выше стены (её белый проём разрывает контур стены). Остальным — 0. */
+function planSubLayerFor(itemType) {
+  return itemType === 'door' ? 1 : 0;
+}
+
 function planLayerFor(itemType) {
   if (itemType === 'device' || itemType === 'group') return 4;
   if (itemType === 'desk') return 2;
-  if (itemType === 'wall' || itemType === 'door' || itemType === 'stairs') return 1;
+  // Граница — на слое стен: это тоже конструктив, и прятать/блокировать её отдельно
+  // от стен смысла нет (см. ответ на вопрос о слое при проектировании инструмента)
+  if (itemType === 'wall' || itemType === 'door' || itemType === 'stairs' || itemType === 'border') return 1;
   return null;
 }
 
@@ -1633,12 +1771,16 @@ function isLayerLocked(layerNum) {
 function enforceLayerZOrder(node) {
   const myLayer = node.getAttr('planLayer');
   if (myLayer === null || myLayer === undefined) return;
+  const mySub = node.getAttr('planSubLayer') || 0;
   node.moveToTop();
   const children = planState.layer.getChildren();
   let below = node.zIndex() > 0 ? children[node.zIndex() - 1] : null;
   while (below) {
     const belowLayer = below.getAttr('planLayer');
-    if (belowLayer !== null && belowLayer !== undefined && belowLayer > myLayer) {
+    const belowSub = below.getAttr('planSubLayer') || 0;
+    const belowIsAbove = belowLayer !== null && belowLayer !== undefined &&
+      (belowLayer > myLayer || (belowLayer === myLayer && belowSub > mySub));
+    if (belowIsAbove) {
       node.moveDown();
       const refreshed = planState.layer.getChildren();
       below = node.zIndex() > 0 ? refreshed[node.zIndex() - 1] : null;
@@ -1659,12 +1801,13 @@ function enforceLayerZOrder(node) {
 function resortPlanLayerZOrder() {
   const children = planState.layer.getChildren().slice();
   const indexed = children.map((node, i) => ({
-    node, i, layer: node.getAttr('planLayer')
+    node, i, layer: node.getAttr('planLayer'), sub: node.getAttr('planSubLayer') || 0
   }));
   indexed.sort((a, b) => {
     const al = (a.layer === null || a.layer === undefined) ? -1 : a.layer;
     const bl = (b.layer === null || b.layer === undefined) ? -1 : b.layer;
     if (al !== bl) return al - bl;
+    if (a.sub !== b.sub) return a.sub - b.sub; // дверь выше стены — см. planSubLayerFor
     return a.i - b.i; // стабильность: сохраняем исходный относительный порядок внутри слоя
   });
   indexed.forEach(({ node }, newIndex) => node.zIndex(newIndex));
@@ -1682,6 +1825,7 @@ async function initPlan() {
   bindPlanInspectorResizer();
   bindLayerToggles();
   bindUserDragDrop();
+  bindViewportGridWatch();
 
   document.getElementById('floor-add-btn').addEventListener('click', async () => {
     const floorsNow = await window.api.floorPlans.list();
@@ -1826,15 +1970,34 @@ async function buildStageForCurrentFloor() {
   planState.deskPreviewRect = null;
   planState.panFrom = null;
 
+  // Границы плана могли отстать от содержимого — в базах, созданных до появления
+  // автоматического роста, объекты уже могли уехать за край. Подтягиваем их при
+  // открытии этажа; best-effort — у клиента без права записи это просто не сработает,
+  // и тогда сетка под видимой областью всё равно закроет дыру визуально.
+  try {
+    // Отказ здесь ожидаем и безвреден, поэтому общий тост об ошибке не нужен
+    handleApiErrorLocally('floorPlans:fitToContent');
+    const fitted = await window.api.floorPlans.fitToContent(planState.floorPlan.id);
+    if (fitted) planState.floorPlan = fitted;
+  } catch { /* нет права на запись (клиент/только чтение) — не мешаем открытию плана */ }
+
+  // Канва должна быть не меньше границ плана: прокрутка обёртки ходит именно по ней,
+  // и без этого до объектов у дальнего края было бы не доскроллить
   const width = planState.floorPlan.grid_width_cells * CELL_PX;
   const height = planState.floorPlan.grid_height_cells * CELL_PX;
 
   planState.stage = new Konva.Stage({ container: 'plan-stage', width, height });
-  planState.layer = new Konva.Layer();
+  // Слой сдвинут на начало координат плана. Координаты объектов остаются координатами
+  // ПЛАНА (клетка −12 так и хранится как −12), а слой переносит их в координаты канвы,
+  // которая всегда начинается с нуля. Без этого сдвига всё, что левее и выше начала
+  // координат, лежало бы за пределами канвы: видно только панорамой средней кнопкой,
+  // прокрутка туда не достаёт, полосы прокрутки о нём не знают.
+  const bounds = planCellBounds();
+  planState.layer = new Konva.Layer({ x: -bounds.minX * CELL_PX, y: -bounds.minY * CELL_PX });
   planState.stage.add(planState.layer);
 
-  drawGrid();
   await loadPlanItems();
+  drawGrid(); // после содержимого: сетка уходит под него (moveToBottom) и считает видимую область по уже измеренной обёртке
   bindZoomWheel();
   bindMiddleClickPan();
 
@@ -1854,22 +2017,113 @@ async function buildStageForCurrentFloor() {
   renderInspector(null);
 }
 
+/** Границы плана в клетках: [minX; maxX) x [minY; maxY).
+ *  Начало координат хранится в floor_plans.grid_min_x/grid_min_y и может быть
+ *  отрицательным, поэтому «от нуля до ширины» считать больше нельзя. У планов из старых
+ *  баз поля может не быть вовсе — тогда начало координат 0, как и было. */
+function planCellBounds() {
+  const plan = planState.floorPlan || {};
+  const minX = Number.isFinite(plan.grid_min_x) ? plan.grid_min_x : 0;
+  const minY = Number.isFinite(plan.grid_min_y) ? plan.grid_min_y : 0;
+  return {
+    minX, minY,
+    maxX: minX + (plan.grid_width_cells || 0),
+    maxY: minY + (plan.grid_height_cells || 0)
+  };
+}
+
+/** Какая часть плана сейчас реально видна, в КЛЕТКАХ.
+ *  Вид складывается из двух независимых вещей: прокрутки обёртки (#plan-stage-wrap
+ *  скроллит большую канву) и position/scale самого стейджа (панорама средней кнопкой и
+ *  зум). Поэтому считаем от обоих, иначе сетка «отстаёт» при одном из двух способов. */
+function visibleCellRange() {
+  const stage = planState.stage;
+  const layer = planState.layer;
+  const wrap = document.getElementById('plan-stage-wrap');
+  if (!stage || !layer || !wrap) return null;
+  const scale = stage.scaleX() || 1;
+  // Канва -> стейдж (зум и панорама) -> слой (сдвиг на начало координат) -> клетки
+  const toCell = (canvasPx, layerOffset) => ((canvasPx - stage.x()) / scale - layerOffset) / CELL_PX;
+  return {
+    minX: toCell(wrap.scrollLeft, layer.x()),
+    maxX: toCell(wrap.scrollLeft + wrap.clientWidth, layer.x()),
+    minY: toCell(wrap.scrollTop, layer.y()),
+    maxY: toCell(wrap.scrollTop + wrap.clientHeight, layer.y())
+  };
+}
+
+const GRID_OVERDRAW_CELLS = 6; // запас за краем окна, чтобы при панораме не было видно «шва»
+
+/**
+ * Рисует сетку под ВИДИМОЙ областью, а не один раз на размер плана.
+ *
+ * Раньше линии создавались единожды от (0,0) до размеров плана. Любой объект за этими
+ * границами оставался без подложки, да и при отдалении сетка просто заканчивалась.
+ * Теперь линии перестраиваются под текущий вид (с запасом), а границы самого плана
+ * отрисованы отдельной рамкой — чтобы было видно, где «официальный» план, а где
+ * вспомогательная сетка за его пределами.
+ */
 function drawGrid() {
-  const cols = planState.floorPlan.grid_width_cells;
-  const rows = planState.floorPlan.grid_height_cells;
-  for (let i = 0; i <= cols; i++) {
-    planState.layer.add(new Konva.Line({
-      points: [i * CELL_PX, 0, i * CELL_PX, rows * CELL_PX],
-      stroke: '#ddd', strokeWidth: 1
+  if (!planState.layer) return;
+  // Старые линии убираем целиком: их немного (десятки), пересоздать дешевле, чем
+  // пытаться переиспользовать с учётом смены диапазона
+  planState.layer.getChildren()
+    .filter((n) => n.getAttr('isGridLine'))
+    .forEach((n) => n.destroy());
+
+  const b = planCellBounds();
+  const view = visibleCellRange();
+
+  // Пока обёртка не измерена (первая отрисовка до вставки в DOM), берём границы плана
+  const fromX = view ? Math.floor(view.minX) - GRID_OVERDRAW_CELLS : b.minX;
+  const toX = view ? Math.ceil(view.maxX) + GRID_OVERDRAW_CELLS : b.maxX;
+  const fromY = view ? Math.floor(view.minY) - GRID_OVERDRAW_CELLS : b.minY;
+  const toY = view ? Math.ceil(view.maxY) + GRID_OVERDRAW_CELLS : b.maxY;
+
+  const add = (node) => {
+    node.setAttr('isGridLine', true);
+    node.listening(false); // сетка не должна перехватывать клики по объектам
+    planState.layer.add(node);
+    node.moveToBottom();
+  };
+
+  for (let i = fromX; i <= toX; i++) {
+    const insidePlan = i >= b.minX && i <= b.maxX;
+    add(new Konva.Line({
+      points: [i * CELL_PX, fromY * CELL_PX, i * CELL_PX, toY * CELL_PX],
+      // За пределами плана сетка бледнее: видно, что это вспомогательное поле
+      stroke: insidePlan ? '#ddd' : '#eeeeee', strokeWidth: 1
     }));
   }
-  for (let j = 0; j <= rows; j++) {
-    planState.layer.add(new Konva.Line({
-      points: [0, j * CELL_PX, cols * CELL_PX, j * CELL_PX],
-      stroke: '#ddd', strokeWidth: 1
+  for (let j = fromY; j <= toY; j++) {
+    const insidePlan = j >= b.minY && j <= b.maxY;
+    add(new Konva.Line({
+      points: [fromX * CELL_PX, j * CELL_PX, toX * CELL_PX, j * CELL_PX],
+      stroke: insidePlan ? '#ddd' : '#eeeeee', strokeWidth: 1
     }));
   }
-  planState.layer.draw();
+
+  // Рамка «официальных» границ плана — иначе при подложке во все стороны непонятно,
+  // где заканчивается сам план (а от его границ зависят заливка зон и привязка)
+  add(new Konva.Rect({
+    x: b.minX * CELL_PX, y: b.minY * CELL_PX,
+    width: (b.maxX - b.minX) * CELL_PX, height: (b.maxY - b.minY) * CELL_PX,
+    stroke: '#c2cad2', strokeWidth: 1.5, dash: [10, 6], fillEnabled: false
+  }));
+
+  planState.layer.batchDraw();
+}
+
+// Перерисовка сетки при смене вида — не чаще одного раза на кадр: панорама и зум
+// генерируют события пачками, и перестраивать линии на каждое из них незачем
+let gridRedrawPending = false;
+function scheduleGridRedraw() {
+  if (gridRedrawPending || !planState.layer) return;
+  gridRedrawPending = true;
+  requestAnimationFrame(() => {
+    gridRedrawPending = false;
+    if (planState.layer && planState.floorPlan) drawGrid();
+  });
 }
 
 async function loadPlanItems() {
@@ -2179,12 +2433,60 @@ document.getElementById('audit-clear-filters-btn').addEventListener('click', () 
 // Точечные объекты: стол / устройство
 // ------------------------------------------------------------
 
+/** Можно ли свободно крутить элемент на плане. У двери rotation кодирует hinge/swing,
+ *  у лестницы — направление подъёма (см. addStairsRectGlyph/rotationLabel), там это поле
+ *  занято смыслом и геометрически вращать узел нельзя. Свободный поворот — только у
+ *  точечных объектов, которые рисуются как иконка в клетке. */
+function itemSupportsFreeRotation(item) {
+  return item && (item.item_type === 'device' || item.item_type === 'desk' || item.item_type === 'group');
+}
+
+/** Зажимаем смещение внутри своей клетки: дубль clampCellOffset из main/db/index.js.
+ *  На клиенте нужен тот же предел, чтобы иконка не «прыгала» после ответа сервера. */
+function clampCellOffsetUi(value) {
+  const n = Number(value) || 0;
+  const rounded = Math.round(n * 1000) / 1000; // см. clampCellOffset в main/db/index.js
+  return Math.max(-0.5, Math.min(0.5, rounded));
+}
+
+/** Клетка-владелец — всегда ближайшая: ушёл от центра своей больше чем на половину,
+ *  значит привязываться надо к соседней. Дубль normalizeCellAndOffset из
+ *  main/db/index.js — нужен здесь, чтобы показать результат ДО ответа сервера
+ *  (иначе иконка на миг прыгала бы в одно место, а потом в другое). */
+function normalizeCellAndOffsetUi(cell, offset, min = null, max = null) {
+  const own = Number(cell) || 0;
+  const rounded = Math.round((Number(offset) || 0) * 1000) / 1000;
+  // Округление к нулю при ровной половине — правило «ушёл БОЛЬШЕ чем на половину».
+  // Math.round несимметричен (0.5 → 1, но −0.5 → 0), и объект перепривязывался бы
+  // вправо, но не влево. Дубль cellsToCarry из main/db/index.js.
+  const magnitude = Math.ceil(Math.abs(rounded) - 0.5);
+  const delta = (!rounded || magnitude <= 0) ? 0 : Math.sign(rounded) * magnitude;
+  let targetCell = own + delta;
+  // Зажимаем границами плана, а не нулём: начало координат может быть отрицательным
+  if (min !== null && Number.isFinite(min)) targetCell = Math.max(Math.floor(min), targetCell);
+  if (max !== null && Number.isFinite(max)) targetCell = Math.min(Math.floor(max) - 1, targetCell);
+  return { cell: targetCell, offset: clampCellOffsetUi(own + rounded - targetCell) };
+}
+
+/** Нормализация угла к 0..359 — дубль normalizeRotation из main/db/index.js. */
+function normalizeRotationUi(value) {
+  const n = Math.round(Number(value) || 0);
+  return ((n % 360) + 360) % 360;
+}
+
 function renderPointItem(item) {
   const planLayer = planLayerFor(item.item_type);
   const locked = planState.viewMode || (planLayer !== null && planState.layerState[planLayer] === 'locked');
+  // Поворот и смещение внутри клетки (см. миграцию v17): offset_* хранится в ДОЛЯХ
+  // клетки, поэтому переводим в пиксели здесь, а не в БД — при смене CELL_PX смещение
+  // останется пропорциональным. Вращение задаём вокруг ЦЕНТРА клетки (offsetX/offsetY
+  // Konva сдвигают точку отсчёта), иначе иконка уезжала бы по дуге от своего места.
   const group = new Konva.Group({
-    x: item.x * CELL_PX,
-    y: item.y * CELL_PX,
+    x: item.x * CELL_PX + CELL_PX / 2 + (item.offset_x || 0) * CELL_PX,
+    y: item.y * CELL_PX + CELL_PX / 2 + (item.offset_y || 0) * CELL_PX,
+    offsetX: CELL_PX / 2,
+    offsetY: CELL_PX / 2,
+    rotation: itemSupportsFreeRotation(item) ? (item.rotation || 0) : 0,
     draggable: !locked
   });
   group.setAttr('kind', 'point');
@@ -2203,6 +2505,26 @@ function renderPointItem(item) {
   const STATUS_BORDER_COLORS = { repair: '#ecc94b', storage: '#7ea6d6', decommissioned: '#999' };
   const borderColor = !isDesk && !isGroup && STATUS_BORDER_COLORS[item.device_status] ? STATUS_BORDER_COLORS[item.device_status] : '#333';
   const borderWidth = !isDesk && !isGroup && STATUS_BORDER_COLORS[item.device_status] ? 2.5 : 1;
+
+  // Условный охват Wi-Fi. Кладём ВНУТРЬ группы устройства первым ребёнком, а не
+  // отдельным узлом на канве: тогда круг сам следует за иконкой при перетаскивании,
+  // смещении внутри клетки и перерисовке — без отдельной книги учёта, которую легко
+  // забыть обновить. Круг нечувствителен к повороту группы, так что rotation не мешает.
+  // listening: false — иначе роутер можно было бы тащить, ткнув в любую точку круга.
+  if (!isDesk && !isGroup && WIFI_DEVICE_TYPES.includes(item.device_type)) {
+    const radiusM = Number(item.device_wifi_radius_m) > 0
+      ? Number(item.device_wifi_radius_m) : DEFAULT_WIFI_RADIUS_M;
+    const coverage = new Konva.Circle({
+      x: CELL_PX / 2, y: CELL_PX / 2, // локальный центр клетки (origin сдвинут offsetX/offsetY)
+      radius: radiusM * CELL_PX,      // клетка плана — условный метр
+      fill: 'rgba(74, 144, 217, 0.07)',
+      stroke: 'rgba(74, 144, 217, 0.5)', strokeWidth: 1, dash: [6, 5],
+      listening: false, perfectDrawEnabled: false
+    });
+    coverage.setAttr('isWifiCoverage', true);
+    coverage.visible(planState.showWifiCoverage);
+    group.add(coverage);
+  }
 
   const rect = new Konva.Rect({
     width: size, height: size, x: 2, y: 2,
@@ -2379,10 +2701,24 @@ function renderPointItem(item) {
   });
 
   group.on('dragend', async () => {
-    const cellX = Math.round(group.x() / CELL_PX);
-    const cellY = Math.round(group.y() / CELL_PX);
-    group.position({ x: cellX * CELL_PX, y: cellY * CELL_PX });
+    // Точка отсчёта узла — ЦЕНТР клетки (offsetX/offsetY при создании), поэтому клетка
+    // считается от центра: вычитаем полклетки обратно, прежде чем округлять.
+    const rawCellX = (group.x() - CELL_PX / 2) / CELL_PX;
+    const rawCellY = (group.y() - CELL_PX / 2) / CELL_PX;
+    const cellX = Math.round(rawCellX);
+    const cellY = Math.round(rawCellY);
+    // Остаток от округления — это и есть положение внутри клетки (доли клетки).
+    // Так "смещение относительно собственной ячейки" получается само собой из обычного
+    // перетаскивания: куда отпустил — там и стоит, но клетка-владелец определена однозначно.
+    const offsetX = clampCellOffsetUi(rawCellX - cellX);
+    const offsetY = clampCellOffsetUi(rawCellY - cellY);
+    group.position({
+      x: cellX * CELL_PX + CELL_PX / 2 + offsetX * CELL_PX,
+      y: cellY * CELL_PX + CELL_PX / 2 + offsetY * CELL_PX
+    });
     const data = group.getAttr('itemData');
+    data.offset_x = offsetX;
+    data.offset_y = offsetY;
 
     if (data.item_type === 'device') {
       // Перетаскивание уже размещённого устройства может попасть на занятую клетку —
@@ -2393,6 +2729,9 @@ function renderPointItem(item) {
       if (!result.wasGrouped) {
         data.x = cellX; data.y = cellY;
         group.setAttr('itemData', data);
+        // Клетка сохранена внутри moveDeviceItemWithGrouping; положение ВНУТРИ клетки —
+        // отдельным вызовом, т.к. это другое по смыслу изменение (и отдельная запись в журнал)
+        await window.api.planItems.setCellOffset(item.id, offsetX, offsetY);
         enforceLayerZOrder(group);
         if (planState.selectedNode === group) renderInspector(group);
         planState.layer.draw();
@@ -2432,6 +2771,7 @@ function renderPointItem(item) {
     data.x = cellX; data.y = cellY;
     group.setAttr('itemData', data);
     await window.api.planItems.move(item.id, cellX, cellY);
+    await window.api.planItems.setCellOffset(item.id, offsetX, offsetY);
     enforceLayerZOrder(group); // защитная мера — перетаскивание не должно ломать порядок слоёв
     if (planState.selectedNode === group) renderInspector(group);
     planState.layer.draw();
@@ -2633,7 +2973,31 @@ function updatePingBadgeByDeviceId(deviceId, status) {
 function lineColor(type) {
   if (type === 'wall') return '#3a3a3a';
   if (type === 'door') return '#a0724a';
+  if (type === 'border') return '#7a8a99'; // холоднее и светлее стены — видно, что это условная линия
   return '#666'; // stairs
+}
+
+/** Концы дверного проёма в пикселях канвы.
+ *  p1/p2 — концы сохранённого слота (одна клетка вдоль стены). Проём шириной door_width
+ *  (в клетках = в условных метрах) откладывается СИММЕТРИЧНО от середины слота вдоль
+ *  направления стены, поэтому ширина одинакова на осевой и на скошенной стене.
+ *  pivot/other — петля и свободный край (бит0 rotation), span — длина проёма в пикселях. */
+function doorEndpoints(item, p1, p2) {
+  const widthCells = Number(item.door_width) > 0 ? Number(item.door_width) : DEFAULT_DOOR_WIDTH;
+  const dx = p2.x - p1.x, dy = p2.y - p1.y;
+  const slotLen = Math.hypot(dx, dy) || 1;
+  const ux = dx / slotLen, uy = dy / slotLen;      // единичный вектор вдоль стены
+  const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+  const half = (widthCells * CELL_PX) / 2;
+  const a = { x: mid.x - ux * half, y: mid.y - uy * half };
+  const b = { x: mid.x + ux * half, y: mid.y + uy * half };
+  const hinge = Math.round((item.rotation || 0) / 90) % 4 & 1;
+  return {
+    a, b,
+    pivot: hinge ? b : a,
+    other: hinge ? a : b,
+    span: widthCells * CELL_PX
+  };
 }
 
 function renderLineItem(item) {
@@ -2643,33 +3007,59 @@ function renderLineItem(item) {
   group.setAttr('itemData', item);
   const planLayer = planLayerFor(item.item_type);
   group.setAttr('planLayer', planLayer);
+  // Подслой внутри слоя конструктива: дверь обязана рисоваться ПОВЕРХ стены, иначе её
+  // белый проём окажется под стеной и ничего не разорвёт. Раньше порядок держался
+  // случайно — на том, что дверь создают после стены и у неё больше id.
+  group.setAttr('planSubLayer', planSubLayerFor(item.item_type));
   if (planLayer !== null) group.visible(planState.layerState[planLayer] !== 'hidden');
 
   const p1 = { x: item.x * CELL_PX, y: item.y * CELL_PX };
   const p2 = { x: item.x2 * CELL_PX, y: item.y2 * CELL_PX };
 
   if (item.item_type === 'wall') {
-    group.add(new Konva.Line({
+    const wallLine = new Konva.Line({
       points: [p1.x, p1.y, p2.x, p2.y],
-      stroke: lineColor('wall'), strokeWidth: 6, lineCap: 'square', hitStrokeWidth: 14
-    }));
+      stroke: lineColor('wall'), strokeWidth: WALL_STROKE_PX, lineCap: 'square', hitStrokeWidth: 14
+    });
+    group.add(wallLine);
+    group.setAttr('shapeNode', wallLine);
+  } else if (item.item_type === 'border') {
+    // Условная перегородка: та же геометрия, что у стены, но тонкая линия — на плане
+    // сразу видно, что это разделитель зон, а не капитальная стена. hitStrokeWidth
+    // больше самой линии, иначе в неё почти невозможно попасть курсором.
+    const borderLine = new Konva.Line({
+      points: [p1.x, p1.y, p2.x, p2.y],
+      stroke: lineColor('border'), strokeWidth: 1.5, lineCap: 'round', hitStrokeWidth: 12
+    });
+    group.add(borderLine);
+    group.setAttr('shapeNode', borderLine);
   } else if (item.item_type === 'door') {
+    // Сохранённый отрезок — это СЛОТ (одна клетка вдоль стены), он говорит, ГДЕ дверь
+    // стоит. Фактическая ширина берётся из door_width и откладывается от середины слота
+    // вдоль стены. Так ширина получается честной и на скошенной стене: там шаг слота по
+    // узлам сетки имеет длину √2, и рисовать дверь «по слоту» значило бы 1.41 м вместо 0.9.
+    const { a, b, pivot, other, span } = doorEndpoints(item, p1, p2);
+
+    // Белый проём ПОД дверью — разрывает чёрный контур стены, иначе дверь читается как
+    // наклейка поверх целой стены. Шире самой стены, чтобы закрыть её края без щелей.
     group.add(new Konva.Line({
-      points: [p1.x, p1.y, p2.x, p2.y],
-      stroke: lineColor('door'), strokeWidth: 4, dash: [6, 3], hitStrokeWidth: 14
+      points: [a.x, a.y, b.x, b.y],
+      stroke: '#ffffff', strokeWidth: WALL_STROKE_PX + 2, lineCap: 'butt', listening: false
     }));
+    const doorLeaf = new Konva.Line({
+      points: [a.x, a.y, b.x, b.y],
+      stroke: lineColor('door'), strokeWidth: 4, dash: [6, 3], hitStrokeWidth: 14
+    });
+    group.add(doorLeaf);
+    group.setAttr('shapeNode', doorLeaf); // выделять полотно, а не белый проём под ним
     // rotation (0/90/180/270, поле общее для всех plan_items) кодирует 2 независимых
     // тумблера двери: бит0 — с какого конца петля (хинж), бит1 — в какую сторону стены открывается
     const variant = Math.round((item.rotation || 0) / 90) % 4;
-    const hinge = variant & 1;
     const swingFlip = (variant >> 1) & 1;
-    const pivot = hinge ? p2 : p1;
-    const other = hinge ? p1 : p2;
-    const len = Math.hypot(other.x - pivot.x, other.y - pivot.y);
     const lineAngleDeg = Math.atan2(other.y - pivot.y, other.x - pivot.x) * (180 / Math.PI);
     const arcRotation = swingFlip ? lineAngleDeg - 90 : lineAngleDeg;
     group.add(new Konva.Arc({
-      x: pivot.x, y: pivot.y, innerRadius: 0, outerRadius: Math.max(len, 4),
+      x: pivot.x, y: pivot.y, innerRadius: 0, outerRadius: Math.max(span, 4),
       angle: 90, rotation: arcRotation, stroke: lineColor('door'), strokeWidth: 1, dash: [2, 2]
     }));
   } else if (item.item_type === 'stairs') {
@@ -2680,10 +3070,12 @@ function renderLineItem(item) {
     const w = x2px - x1;
     const h = y2px - y1;
 
-    group.add(new Konva.Rect({
+    const stairsRect = new Konva.Rect({
       x: x1, y: y1, width: w, height: h,
       fill: '#e8e2d5', stroke: lineColor('stairs'), strokeWidth: 1.5 // без cornerRadius — острые углы
-    }));
+    });
+    group.add(stairsRect);
+    group.setAttr('shapeNode', stairsRect);
     addStairsRectGlyph(group, item.rotation || 0, x1, y1, w, h);
   }
 
@@ -2697,18 +3089,19 @@ function renderLineItem(item) {
     }
     // Клик по стене в режиме "Дверь" — врезаем дверь прямо в эту стену вместо выделения
     if (planState.mode === 'door' && item.item_type === 'wall') {
-      const pointer = planState.stage.getRelativePointerPosition();
+      const pointer = planState.layer.getRelativePointerPosition();
       handleDoorToolClick(pointer.x / CELL_PX, pointer.y / CELL_PX);
       return;
     }
     // Клик по любому конструктиву во время рисования стены — заканчиваем стену прямо в этой точке,
     // а не выделяем то, на что кликнули (иначе стену никогда не получится довести до другой стены)
-    if (planState.mode === 'wall' && planState.pendingLine) {
-      const pointer = planState.stage.getRelativePointerPosition();
+    if ((planState.mode === 'wall' || planState.mode === 'border') && planState.pendingLine) {
+      const pointer = planState.layer.getRelativePointerPosition();
       const cellX = Math.round(pointer.x / CELL_PX);
       const cellY = Math.round(pointer.y / CELL_PX);
       const start = planState.pendingLine;
-      await finalizeWall(start.x, start.y, cellX, cellY);
+      if (start.type === 'border') await finalizeBorder(start.x, start.y, cellX, cellY);
+      else await finalizeWall(start.x, start.y, cellX, cellY);
       clearPendingLine();
       return;
     }
@@ -2729,6 +3122,7 @@ function handleLineToolClick(x, y) {
   } else {
     const start = planState.pendingLine;
     if (start.type === 'wall') finalizeWall(start.x, start.y, x, y);
+    else if (start.type === 'border') finalizeBorder(start.x, start.y, x, y);
     else if (start.type === 'stairs') finalizeStairs(start.x, start.y, x, y);
     clearPendingLine();
   }
@@ -2739,6 +3133,18 @@ async function finalizeWall(x, y, x2, y2) {
   const item = await window.api.planItems.create({
     floor_plan_id: planState.floorPlan.id,
     item_type: 'wall', x, y, x2, y2
+  });
+  renderLineItem(item);
+}
+
+/** Граница — то же, что стена, геометрически: отрезок по узлам сетки. Отличие только в
+ *  отрисовке (тонкая линия) и в том, что в неё не врезаются двери. Заливку зоны она
+ *  держит наравне со стеной — см. collectWallEdgeSet/collectSlantedWalls. */
+async function finalizeBorder(x, y, x2, y2) {
+  if (x === x2 && y === y2) return;
+  const item = await window.api.planItems.create({
+    floor_plan_id: planState.floorPlan.id,
+    item_type: 'border', x, y, x2, y2
   });
   renderLineItem(item);
 }
@@ -2842,7 +3248,14 @@ function updateDoorPreview(pointer) {
   if (!nearest || nearest.dist > DOOR_SNAP_THRESHOLD) { clearDoorPreview(); return; }
   const seg = doorSegmentFromWall(nearest.data, nearest.t);
   if (!seg) { clearDoorPreview(); return; }
-  const pts = [seg.x * CELL_PX, seg.y * CELL_PX, seg.x2 * CELL_PX, seg.y2 * CELL_PX];
+  // Превью показывает проём той ширины, которой дверь реально встанет (см. doorEndpoints),
+  // иначе под курсором видна клетка, а ставится 0.9 м — и каждый раз не сходится
+  const ends = doorEndpoints(
+    { door_width: DEFAULT_DOOR_WIDTH, rotation: 0 },
+    { x: seg.x * CELL_PX, y: seg.y * CELL_PX },
+    { x: seg.x2 * CELL_PX, y: seg.y2 * CELL_PX }
+  );
+  const pts = [ends.a.x, ends.a.y, ends.b.x, ends.b.y];
   if (!planState.doorPreviewLine) {
     planState.doorPreviewLine = new Konva.Line({ points: pts, stroke: '#a0724a', strokeWidth: 6, opacity: 0.5 });
     planState.layer.add(planState.doorPreviewLine);
@@ -2860,11 +3273,14 @@ function clearDoorPreview() {
 function updateDeskPreview(pointer) {
   const cellX = Math.round(pointer.x / CELL_PX);
   const cellY = Math.round(pointer.y / CELL_PX);
-  const x = cellX * CELL_PX + 2;
-  const y = cellY * CELL_PX + 2;
+  // Превью крутим вокруг центра клетки тем же приёмом, что и сам объект (offsetX/offsetY),
+  // чтобы выбранный "угол размещения" был виден ДО клика, а не только после
+  const x = cellX * CELL_PX + CELL_PX / 2;
+  const y = cellY * CELL_PX + CELL_PX / 2;
   if (!planState.deskPreviewRect) {
     planState.deskPreviewRect = new Konva.Rect({
       x, y, width: CELL_PX - 4, height: CELL_PX - 4,
+      offsetX: CELL_PX / 2 - 2, offsetY: CELL_PX / 2 - 2,
       fill: '#c8a876', opacity: 0.4, stroke: '#c8a876', strokeWidth: 1.5,
       cornerRadius: 4, listening: false
     });
@@ -2872,6 +3288,7 @@ function updateDeskPreview(pointer) {
   } else {
     planState.deskPreviewRect.position({ x, y });
   }
+  planState.deskPreviewRect.rotation(planState.placementRotation || 0);
   planState.layer.draw();
 }
 
@@ -3013,7 +3430,7 @@ function renderCable(cable) {
     e.evt.preventDefault();
     e.cancelBubble = true;
     if (isNodeLocked(line)) { flashModeWarning('Слой заблокирован'); return; }
-    const pointer = planState.stage.getRelativePointerPosition();
+    const pointer = planState.layer.getRelativePointerPosition();
     const cellPoint = { x: pointer.x / CELL_PX, y: pointer.y / CELL_PX };
     showContextMenu(e.evt.clientX, e.evt.clientY, [
       { label: '➕ Добавить точку', onClick: () => insertPointOnCable(cable.id, cellPoint) },
@@ -3252,13 +3669,22 @@ async function removeCable(id) {
 const ZONE_FILL_COLOR = '#4a90d9';
 const ZONE_FLOOD_TOOLTIP = 'Не удалось определить замкнутую область — начните с клетки внутри контура из стен';
 
-/** Разбирает все стены на единичные рёбра сетки, которые блокируют переход между соседними клетками.
- *  Диагональные стены (нетипичный случай — двухклик не ограничен осями) в этой модели не учитываются. */
+/** Какие линейные объекты ограничивают зону. Граница — такой же ограничитель, как
+ *  стена: ровно для этого она и нужна, чтобы разделить одно помещение на несколько зон.
+ *  Дверь не ограничивает: стена, в которую она врезана, всё равно остаётся на месте и
+ *  держит заливку сама (дверь — это пометка на стене, а не разрыв в ней). */
+function blocksZoneFill(itemType) {
+  return itemType === 'wall' || itemType === 'border';
+}
+
+/** Разбирает ОСЕВЫЕ стены и границы на единичные рёбра сетки, которые блокируют переход между
+ *  соседними клетками. Скошенные стены сюда не попадают — они не ложатся на рёбра
+ *  сетки и обрабатываются геометрически (см. collectSlantedWalls/segmentsIntersect). */
 function collectWallEdgeSet() {
   const edges = new Set();
   planState.itemsById.forEach((node) => {
     const data = node.getAttr('itemData');
-    if (!data || data.item_type !== 'wall') return;
+    if (!data || !blocksZoneFill(data.item_type)) return;
     const { x, y, x2, y2 } = data;
     if (y === y2) {
       const xs = Math.min(x, x2), xe = Math.max(x, x2);
@@ -3271,18 +3697,83 @@ function collectWallEdgeSet() {
   return edges;
 }
 
+/** Скошенные (не осевые) стены — те, что нельзя разложить по рёбрам сетки.
+ *  Сразу считаем bbox: в flood fill он отсекает заведомо далёкие стены без геометрии. */
+function collectSlantedWalls() {
+  const walls = [];
+  planState.itemsById.forEach((node) => {
+    const data = node.getAttr('itemData');
+    if (!data || !blocksZoneFill(data.item_type)) return;
+    const { x, y, x2, y2 } = data;
+    if (x === x2 || y === y2) return; // осевая — уже в collectWallEdgeSet
+    walls.push({
+      x, y, x2, y2,
+      minX: Math.min(x, x2), maxX: Math.max(x, x2),
+      minY: Math.min(y, y2), maxY: Math.max(y, y2)
+    });
+  });
+  return walls;
+}
+
+function crossProduct(ox, oy, ax, ay, bx, by) {
+  return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+}
+
+/** Пересекаются ли отрезки p1p2 и p3p4. КАСАНИЕ СЧИТАЕТСЯ пересечением: это
+ *  консервативно, и лучше лишний раз не пустить заливку в соседнюю клетку, чем дать
+ *  зоне протечь наружу через скошенную стену — именно протечка и была багом.
+ *  Касание возможно только у скошенных стен: осевые стены лежат на целых координатах,
+ *  а центры клеток — на полуцелых, поэтому они никогда не совпадают. */
+function segmentsIntersect(p1, p2, p3, p4) {
+  const d1 = crossProduct(p3.x, p3.y, p4.x, p4.y, p1.x, p1.y);
+  const d2 = crossProduct(p3.x, p3.y, p4.x, p4.y, p2.x, p2.y);
+  const d3 = crossProduct(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
+  const d4 = crossProduct(p1.x, p1.y, p2.x, p2.y, p4.x, p4.y);
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) return true;
+  // Вырожденные случаи: конец одного отрезка лежит на другом (в т.ч. коллинеарность)
+  const onSegment = (ax, ay, bx, by, px, py) =>
+    Math.min(ax, bx) <= px && px <= Math.max(ax, bx) &&
+    Math.min(ay, by) <= py && py <= Math.max(ay, by);
+  if (d1 === 0 && onSegment(p3.x, p3.y, p4.x, p4.y, p1.x, p1.y)) return true;
+  if (d2 === 0 && onSegment(p3.x, p3.y, p4.x, p4.y, p2.x, p2.y)) return true;
+  if (d3 === 0 && onSegment(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y)) return true;
+  if (d4 === 0 && onSegment(p1.x, p1.y, p2.x, p2.y, p4.x, p4.y)) return true;
+  return false;
+}
+
+/** Мешает ли скошенная стена перейти из клетки (cx,cy) в (nx,ny). Переход считаем
+ *  отрезком между ЦЕНТРАМИ клеток: если его пересекает стена — пройти нельзя.
+ *  Для осевых стен такой тест дал бы тот же результат, что и рёбра сетки, но рёбра
+ *  быстрее, поэтому геометрию считаем только для скошенных. */
+function slantedWallBlocks(slanted, cx, cy, nx, ny) {
+  if (!slanted.length) return false;
+  const a = { x: cx + 0.5, y: cy + 0.5 };
+  const b = { x: nx + 0.5, y: ny + 0.5 };
+  const loX = Math.min(a.x, b.x), hiX = Math.max(a.x, b.x);
+  const loY = Math.min(a.y, b.y), hiY = Math.max(a.y, b.y);
+  for (const w of slanted) {
+    if (w.maxX < loX || w.minX > hiX || w.maxY < loY || w.minY > hiY) continue; // bbox не пересекаются
+    if (segmentsIntersect(a, b, { x: w.x, y: w.y }, { x: w.x2, y: w.y2 })) return true;
+  }
+  return false;
+}
+
 /** BFS от стартовой клетки по соседним, пока не упрёмся в стену или край сетки.
  *  Возвращает массив [x,y] клеток зоны, либо null, если что-то пошло не так (защитный предел). */
 function floodFillZone(startX, startY) {
-  const cols = planState.floorPlan.grid_width_cells;
-  const rows = planState.floorPlan.grid_height_cells;
-  if (startX < 0 || startY < 0 || startX >= cols || startY >= rows) return null;
+  // Границы плана, а не «от нуля до ширины»: начало координат может быть отрицательным
+  // (чертят не от угла). Именно эта отсечка по нулю и не давала создать зону в области
+  // выше и левее начала координат — заливка молча возвращала null.
+  const b = planCellBounds();
+  if (startX < b.minX || startY < b.minY || startX >= b.maxX || startY >= b.maxY) return null;
 
   const edges = collectWallEdgeSet();
+  const slanted = collectSlantedWalls();
   const visited = new Set([`${startX},${startY}`]);
   const queue = [[startX, startY]];
   const cells = [[startX, startY]];
-  const limit = cols * rows;
+  const limit = (b.maxX - b.minX) * (b.maxY - b.minY);
 
   while (queue.length) {
     const [cx, cy] = queue.shift();
@@ -3294,7 +3785,8 @@ function floodFillZone(startX, startY) {
     ];
     for (const { nx, ny, blocked } of moves) {
       if (blocked) continue;
-      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+      if (slantedWallBlocks(slanted, cx, cy, nx, ny)) continue;
+      if (nx < b.minX || ny < b.minY || nx >= b.maxX || ny >= b.maxY) continue;
       const key = `${nx},${ny}`;
       if (visited.has(key)) continue;
       visited.add(key);
@@ -3511,7 +4003,7 @@ function renderZoneInspector(el, node) {
 function handleStageClick(e) {
   if (e.evt && e.evt.button !== undefined && e.evt.button !== 0) return; // только левая кнопка — средняя занята панорамой
 
-  const pointer = planState.stage.getRelativePointerPosition();
+  const pointer = planState.layer.getRelativePointerPosition();
   const cellX = Math.round(pointer.x / CELL_PX);
   const cellY = Math.round(pointer.y / CELL_PX);
 
@@ -3548,7 +4040,7 @@ function handleStageClick(e) {
 }
 
 function handleStageMouseMove() {
-  const pointer = planState.stage.getRelativePointerPosition();
+  const pointer = planState.layer.getRelativePointerPosition();
   if (!pointer) return;
 
   if (planState.pendingLine) {
@@ -3564,7 +4056,7 @@ function handleStageMouseMove() {
     updateDeskPreview(pointer);
     clearDoorPreview();
     clearLineStartPreview();
-  } else if (planState.mode === 'wall' || planState.mode === 'stairs') {
+  } else if (planState.mode === 'wall' || planState.mode === 'stairs' || planState.mode === 'border') {
     updateLineStartPreview(pointer);
     clearDeskPreview();
     clearDoorPreview();
@@ -3608,7 +4100,10 @@ async function removePlanItem(id) {
 async function placeNewItem(x, y) {
   if (isLayerLocked(2)) { flashModeWarning('Слой "столы" заблокирован'); return; }
   if (planState.mode === 'desk') {
-    const item = await window.api.planItems.create({ floor_plan_id: planState.floorPlan.id, item_type: 'desk', x, y });
+    const item = await window.api.planItems.create({
+      floor_plan_id: planState.floorPlan.id, item_type: 'desk', x, y,
+      rotation: planState.placementRotation
+    });
     renderPointItem(item);
   }
 }
@@ -3638,6 +4133,15 @@ async function placeDeviceItem(deviceId, x, y) {
     const nearestCable = findNearestCablePoint({ x: x + 0.5, y: y + 0.5 });
     if (nearestCable && nearestCable.dist <= NEAREST_CABLE_THRESHOLD) {
       await window.api.cableConnections.connect(item.id, nearestCable.cableId);
+    }
+
+    // Угол размещения доворачиваем отдельным вызовом, а не параметром create: клетка
+    // могла оказаться занятой и вместо одиночного размещения образоваться группа
+    // (см. ниже) — у группы собственный угол, навязывать ей угол "последнего вставленного"
+    // устройства неправильно. Поэтому поворот применяем только в одиночной ветке.
+    if (planState.placementRotation) {
+      const rotated = await window.api.planItems.setRotation(item.id, planState.placementRotation);
+      item.rotation = rotated.rotation;
     }
 
     renderPointItem(item);
@@ -3676,6 +4180,7 @@ function bindPlanToolbar() {
   const buttons = {
     desk: document.getElementById('mode-desk'),
     wall: document.getElementById('mode-wall'),
+    border: document.getElementById('mode-border'),
     door: document.getElementById('mode-door'),
     stairs: document.getElementById('mode-stairs'),
     cable: document.getElementById('mode-cable'),
@@ -3687,6 +4192,7 @@ function bindPlanToolbar() {
   const MODE_LABELS = {
     desk: 'клик по сетке добавит стол',
     wall: 'клик — начало стены, ещё клик — конец',
+    border: 'клик — начало границы, ещё клик — конец (делит помещение на зоны)',
     door: 'клик рядом со стеной — дверь встроится в неё',
     stairs: 'клик — точка начала подъёма, ещё клик — направление (стрелка)',
     cable: 'клик — точки маршрута (по устройству или пустому месту); правый клик — завершить линию',
@@ -3709,6 +4215,19 @@ function bindPlanToolbar() {
     btn.addEventListener('click', () => setMode(planState.mode === key ? null : key));
   });
   cancelBtn.addEventListener('click', () => setMode(null));
+
+  // Угол размещения новых объектов — ползунок и число держим синхронно
+  const rotRange = document.getElementById('placement-rotation-range');
+  const rotNum = document.getElementById('placement-rotation-num');
+  const rotReset = document.getElementById('placement-rotation-reset');
+  const applyPlacementRotation = (value, syncRange, syncNum) => {
+    planState.placementRotation = normalizeRotationUi(value);
+    if (syncRange) rotRange.value = String(planState.placementRotation);
+    if (syncNum) rotNum.value = String(planState.placementRotation);
+  };
+  rotRange.addEventListener('input', () => applyPlacementRotation(rotRange.value, false, true));
+  rotNum.addEventListener('change', () => applyPlacementRotation(rotNum.value, true, true));
+  rotReset.addEventListener('click', () => applyPlacementRotation(0, true, true));
 
   planState.setToolMode = setMode; // нужен переключателю режима просмотра — сбросить активный инструмент
 }
@@ -3871,14 +4390,20 @@ function renderPlacedSearchResults(q, deviceMatchesQuery) {
   });
 }
 
-/** Переводит координаты нативного drag-события (clientX/Y) в локальные координаты канвы,
- *  учитывая текущий зум/панораму стейджа. */
+/** Переводит координаты нативного drag-события (clientX/Y) в координаты СЛОЯ — те же,
+ *  в которых лежат объекты плана (клетка × CELL_PX, начало координат может быть
+ *  отрицательным). Учитывает зум и панораму стейджа и сдвиг слоя на начало координат. */
 function clientToStagePoint(clientX, clientY) {
   const stage = planState.stage;
   const rect = stage.container().getBoundingClientRect();
   const x = clientX - rect.left;
   const y = clientY - rect.top;
-  return { x: (x - stage.x()) / stage.scaleX(), y: (y - stage.y()) / stage.scaleY() };
+  const onStage = { x: (x - stage.x()) / stage.scaleX(), y: (y - stage.y()) / stage.scaleY() };
+  // Слой сдвинут на -minX/-minY клеток (см. buildStageForCurrentFloor), поэтому из
+  // координат стейджа в координаты слоя переходим вычитанием его позиции
+  const layer = planState.layer;
+  if (!layer) return onStage;
+  return { x: onStage.x - layer.x(), y: onStage.y - layer.y() };
 }
 
 /** Находит устройство (не стол/стену), под точкой в локальных координатах канвы */
@@ -3887,8 +4412,11 @@ function findDeviceItemAtStagePoint(point) {
   planState.itemsById.forEach((node, id) => {
     const data = node.getAttr('itemData');
     if (!data || data.item_type !== 'device') return;
-    const x0 = node.x(), y0 = node.y();
-    if (point.x >= x0 && point.x <= x0 + CELL_PX && point.y >= y0 && point.y <= y0 + CELL_PX) {
+    // node.x()/y() — центр иконки (origin сдвинут в renderPointItem), поэтому
+    // проверяем попадание в квадрат вокруг центра, а не от левого верхнего угла
+    const cx = node.x(), cy = node.y();
+    if (point.x >= cx - CELL_PX / 2 && point.x <= cx + CELL_PX / 2 &&
+        point.y >= cy - CELL_PX / 2 && point.y <= cy + CELL_PX / 2) {
       found = { id, node, data };
     }
   });
@@ -3987,6 +4515,7 @@ function setZoom(newScale) {
   stage.position({ x: center.x - relatedTo.x * newScale, y: center.y - relatedTo.y * newScale });
   stage.batchDraw();
   updateZoomLabel(newScale);
+  scheduleGridRedraw();
 }
 
 /** Кнопки зума — вешаем один раз, они всегда читают planState.stage на момент клика */
@@ -4057,7 +4586,10 @@ const LAYER_STATE_RU = { visible: 'видимый', locked: 'заблокиро�
  *  клик — быстрое переключение видимый/скрыт (минуя "заблокирован"), правый клик —
  *  меню с явным выбором всех трёх состояний. */
 function bindLayerToggles() {
-  document.querySelectorAll('.layer-toggle').forEach((btn) => {
+  // Кнопка охвата Wi-Fi стоит в том же ряду и стилизована так же, но к слою не привязана:
+  // у неё нет data-layer, и без этого фильтра Number(undefined) дал бы NaN, а в
+  // planState.layerState появился бы мусорный ключ NaN
+  document.querySelectorAll('.layer-toggle[data-layer]').forEach((btn) => {
     const layerNum = Number(btn.dataset.layer);
     btn.addEventListener('click', () => {
       const next = planState.layerState[layerNum] === 'hidden' ? 'visible' : 'hidden';
@@ -4076,8 +4608,29 @@ function bindLayerToggles() {
       })));
     });
   });
+  bindWifiCoverageToggle();
   updateLayerToggleButtons();
   updateToolbarLockedState();
+}
+
+/** Кнопка «показывать охват Wi-Fi» — не слой плана, а личная настройка вида. */
+function bindWifiCoverageToggle() {
+  const btn = document.getElementById('wifi-coverage-toggle');
+  if (!btn) return;
+  const paint = () => {
+    btn.classList.toggle('state-visible', planState.showWifiCoverage);
+    btn.classList.toggle('state-hidden', !planState.showWifiCoverage);
+    btn.title = planState.showWifiCoverage
+      ? 'Охват Wi-Fi показан — клик, чтобы скрыть. Радиус задаётся у каждого роутера в инспекторе.'
+      : 'Охват Wi-Fi скрыт — клик, чтобы показать';
+  };
+  btn.addEventListener('click', () => {
+    planState.showWifiCoverage = !planState.showWifiCoverage;
+    saveWifiCoveragePref(planState.showWifiCoverage);
+    applyWifiCoverageVisibility();
+    paint();
+  });
+  paint();
 }
 
 /** Меняет состояние одного слоя и применяет последствия: видимость и draggable уже
@@ -4090,7 +4643,7 @@ function setLayerState(layerNum, newState) {
 }
 
 function updateLayerToggleButtons() {
-  document.querySelectorAll('.layer-toggle').forEach((btn) => {
+  document.querySelectorAll('.layer-toggle[data-layer]').forEach((btn) => {
     const layerNum = Number(btn.dataset.layer);
     const state = planState.layerState[layerNum];
     const icon = btn.dataset.icon;
@@ -4178,6 +4731,12 @@ function applyLayerStates() {
 
 function bindModeSwitch() {
   document.getElementById('mode-switch-btn').addEventListener('click', () => {
+    if (dbReadonlyActive) {
+      // Выйти из просмотра нечего: база открыта только для чтения, любое изменение
+      // отклонит бэкенд. Говорим это сразу, а не после непонятной ошибки сохранения.
+      showToast('🔒 База открыта только для чтения — рисование недоступно. Её держит другой экземпляр.', 'warning', 7000);
+      return;
+    }
     planState.viewMode = !planState.viewMode;
     updateModeSwitchUI();
   });
@@ -4198,7 +4757,13 @@ function updateClientWritePermissionUI(allowWrites) {
   const btn = document.getElementById('mode-switch-btn');
   if (!btn) return;
   btn.disabled = !allowWrites;
-  btn.title = allowWrites ? '' : 'Хост пока не разрешил изменения клиентам';
+  btn.title = allowWrites
+    ? ''
+    : (allowWrites === null
+      ? 'Выясняю права на изменения…'
+      : (clientSourceKind === 'server'
+        ? 'На сервере выключена запись (NM_ALLOW_WRITES=0)'
+        : 'Хост пока не разрешил изменения клиентам'));
   if (!allowWrites && !planState.viewMode) {
     // Хост выключил тумблер, пока пользователь уже был в режиме рисования — откатываем
     planState.viewMode = true;
@@ -4229,6 +4794,18 @@ function updateModeSwitchUI(initial = false) {
 /** Колесо мыши висит на конкретном объекте Stage — перевешиваем при каждой пересборке стейджа
  *  (переключение этажа создаёт новый Stage), иначе на старом объекте всё равно ничего не сработает,
  *  а вешать через bindZoomButtons() было бы дублированием при каждом переключении. */
+/** Прокрутка обёртки и изменение размера окна тоже меняют видимую область, а значит
+ *  требуют пересборки сетки. Вешается один раз: сама обёртка при смене этажа не
+ *  пересоздаётся (в отличие от стейджа). */
+let viewportGridWatchBound = false;
+function bindViewportGridWatch() {
+  if (viewportGridWatchBound) return;
+  viewportGridWatchBound = true;
+  const wrap = document.getElementById('plan-stage-wrap');
+  if (wrap) wrap.addEventListener('scroll', scheduleGridRedraw, { passive: true });
+  window.addEventListener('resize', scheduleGridRedraw);
+}
+
 function bindZoomWheel() {
   planState.stage.on('wheel', (e) => {
     e.evt.preventDefault();
@@ -4243,6 +4820,7 @@ function bindZoomWheel() {
     stage.position({ x: pointer.x - mousePointTo.x * newScale, y: pointer.y - mousePointTo.y * newScale });
     stage.batchDraw();
     updateZoomLabel(newScale);
+    scheduleGridRedraw();
   });
 }
 
@@ -4268,6 +4846,7 @@ function bindMiddleClickPan() {
     const dy = evt.clientY - planState.panFrom.y;
     stage.position({ x: planState.panFrom.stageX + dx, y: planState.panFrom.stageY + dy });
     stage.batchDraw();
+    scheduleGridRedraw(); // сетка должна следовать за видом, а не заканчиваться на краю плана
   });
 
   const stopPan = (e) => {
@@ -4399,7 +4978,9 @@ function getNodeCenterPx(node) {
     return computeZoneCentroidPx(JSON.parse(node.getAttr('zoneData').cells));
   }
   if (kind === 'point') {
-    return { x: node.x() + CELL_PX / 2, y: node.y() + CELL_PX / 2 };
+    // node.x()/y() у точечного объекта — уже ЦЕНТР (origin сдвинут в renderPointItem
+    // ради поворота вокруг центра), прибавлять полклетки больше не нужно
+    return { x: node.x(), y: node.y() };
   }
   const rect = node.getClientRect({ relativeTo: planState.layer });
   return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
@@ -4550,10 +5131,19 @@ function selectNode(node) {
  *  undefined (уничтожение чистит список детей), а .stroke() на undefined падает с
  *  "Cannot read properties of undefined (reading 'stroke')". Проверка на существование
  *  перед вызовом делает случайный промах тихим и безвредным, а не крашем интерфейса. */
+/** Какую фигуру линейного объекта красить при выделении. Раньше брался просто первый
+ *  ребёнок — и у двери это оказался БЕЛЫЙ ПРОЁМ: выделенная дверь переставала разрывать
+ *  стену, проём становился оранжевым. Поэтому нужная фигура помечается явно
+ *  (shapeNode), как это уже сделано у зон; первый ребёнок остаётся запасным вариантом
+ *  для объектов, где помечать нечего. */
+function lineHighlightShape(node) {
+  return node.getAttr('shapeNode') || node.getChildren()[0] || null;
+}
+
 function highlight(node) {
   const kind = node.getAttr('kind');
   if (kind === 'point') { const r = node.findOne('Rect'); if (r) r.stroke('#ff9900'); }
-  else if (kind === 'line') { const c = node.getChildren()[0]; if (c) c.stroke('#ff9900'); }
+  else if (kind === 'line') { const c = lineHighlightShape(node); if (c) c.stroke('#ff9900'); }
   else if (kind === 'cable') { if (node.stroke) node.stroke('#ff9900'); }
   else if (kind === 'socket') { if (node.stroke) node.stroke('#ff9900'); }
   else if (kind === 'zone') { const s = node.getAttr('shapeNode'); if (s) { s.stroke('#ff9900'); s.strokeWidth(2); } }
@@ -4562,7 +5152,11 @@ function highlight(node) {
 function unhighlight(node) {
   const kind = node.getAttr('kind');
   if (kind === 'point') { const r = node.findOne('Rect'); if (r) r.stroke('#333'); }
-  else if (kind === 'line') { const c = node.getChildren()[0]; if (c) c.stroke(lineColor(node.getAttr('itemData').item_type)); }
+  else if (kind === 'line') {
+    const c = lineHighlightShape(node);
+    const data = node.getAttr('itemData');
+    if (c) c.stroke(lineColor(data ? data.item_type : 'wall'));
+  }
   else if (kind === 'cable') { if (node.stroke) node.stroke(node.getAttr('cableData').color || CABLE_COLOR); }
   else if (kind === 'socket') { if (node.stroke) node.stroke('#333'); }
   else if (kind === 'zone') { const s = node.getAttr('shapeNode'); if (s) { s.stroke(undefined); s.strokeWidth(0); } }
@@ -4636,6 +5230,172 @@ function appendPlanItemLockButton(el, item) {
   el.appendChild(wrap);
 }
 
+/** Блок "Положение в клетке": поворот 0..359° и смещение внутри своей ячейки.
+ *  Два уровня точности: перетаскиванием мышью (грубо, см. dragend) и этими полями
+ *  (точно, когда надо подогнать иконку к косой стене). Смещение хранится в ДОЛЯХ
+ *  клетки (-0.5..+0.5), т.е. объект не может уехать за пределы своей ячейки —
+ *  клетка-владелец всегда определена однозначно, и зоны/кабели/поиск не ломаются.
+ *  Пока тянут ползунок, узел крутится/едет сразу (live-превью), в БД пишем на change. */
+function appendPlacementControls(el, item, node) {
+  if (!itemSupportsFreeRotation(item) || item.via_group) return;
+  const locked = isNodeLocked(node);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'inspector-field placement-block';
+  const label = document.createElement('label');
+  label.textContent = 'Положение в клетке';
+  label.title = 'Поворот и точное смещение внутри своей ячейки — для размещения у косых стен';
+  wrap.appendChild(label);
+
+  // --- поворот ---
+  const rotRow = document.createElement('div');
+  rotRow.className = 'placement-row';
+  const rotSlider = document.createElement('input');
+  rotSlider.type = 'range';
+  rotSlider.min = '0'; rotSlider.max = '359'; rotSlider.step = '1';
+  rotSlider.value = String(normalizeRotationUi(item.rotation));
+  rotSlider.disabled = locked;
+  const rotNum = document.createElement('input');
+  rotNum.type = 'number';
+  rotNum.min = '0'; rotNum.max = '359'; rotNum.step = '1';
+  rotNum.className = 'placement-num';
+  rotNum.value = rotSlider.value;
+  rotNum.disabled = locked;
+  const rotUnit = document.createElement('span');
+  rotUnit.className = 'placement-unit';
+  rotUnit.textContent = '°';
+  rotRow.append(rotSlider, rotNum, rotUnit);
+  wrap.appendChild(rotRow);
+
+  const previewRotation = (deg) => { node.rotation(deg); planState.layer.batchDraw(); };
+  const saveRotation = async (deg) => {
+    const normalized = normalizeRotationUi(deg);
+    rotSlider.value = String(normalized);
+    rotNum.value = String(normalized);
+    previewRotation(normalized);
+    const updated = await window.api.planItems.setRotation(item.id, normalized);
+    item.rotation = updated.rotation;
+    node.setAttr('itemData', item);
+  };
+  rotSlider.oninput = () => { rotNum.value = rotSlider.value; previewRotation(Number(rotSlider.value)); };
+  rotSlider.onchange = () => saveRotation(Number(rotSlider.value));
+  rotNum.onchange = () => saveRotation(Number(rotNum.value));
+
+  // Быстрые углы — 90° шагами нужны чаще всего (обычные прямые стены)
+  const quickRow = document.createElement('div');
+  quickRow.className = 'card-body-actions';
+  [0, 90, 180, 270].forEach((deg) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = `${deg}°`;
+    b.disabled = locked;
+    b.onclick = () => saveRotation(deg);
+    quickRow.appendChild(b);
+  });
+  wrap.appendChild(quickRow);
+
+  // --- смещение ---
+  const offLabel = document.createElement('label');
+  offLabel.textContent = 'Смещение от центра клетки (в долях клетки)';
+  offLabel.title = 'Больше половины клетки — объект перепривяжется к соседней, ' +
+    'а остаток станет смещением уже от её центра';
+  wrap.appendChild(offLabel);
+
+  const offRow = document.createElement('div');
+  offRow.className = 'placement-row';
+  const mkOffsetInput = (value) => {
+    const inp = document.createElement('input');
+    inp.type = 'number';
+    // Диапазон шире половины клетки СОЗНАТЕЛЬНО: ввести 0.8 должно быть можно, это
+    // осмысленное «перенеси в соседнюю клетку и сдвинь на -0.2», а не ошибка ввода
+    inp.min = '-3'; inp.max = '3'; inp.step = '0.05';
+    inp.className = 'placement-num';
+    inp.value = String(clampCellOffsetUi(value));
+    inp.disabled = locked;
+    return inp;
+  };
+  const offX = mkOffsetInput(item.offset_x);
+  const offY = mkOffsetInput(item.offset_y);
+  const lx = document.createElement('span'); lx.className = 'placement-unit'; lx.textContent = 'X';
+  const ly = document.createElement('span'); ly.className = 'placement-unit'; ly.textContent = 'Y';
+  offRow.append(lx, offX, ly, offY);
+  wrap.appendChild(offRow);
+
+  const offHint = document.createElement('div');
+  offHint.className = 'placement-hint';
+  offHint.textContent = 'Больше ±0.5 — привязка перейдёт к соседней клетке.';
+  wrap.appendChild(offHint);
+
+  /** Живое превью: считаем ту же перепривязку, что сделает сервер, и показываем объект
+   *  сразу на итоговом месте — иначе иконка прыгала бы сначала за границу своей клетки,
+   *  а после ответа сервера ещё раз, в центр соседней. */
+  const previewOffset = (cellX, cellY, ox, oy) => {
+    node.position({
+      x: cellX * CELL_PX + CELL_PX / 2 + ox * CELL_PX,
+      y: cellY * CELL_PX + CELL_PX / 2 + oy * CELL_PX
+    });
+    planState.layer.batchDraw();
+  };
+  const saveOffset = async () => {
+    const plan = planState.floorPlan || {};
+    // На сервер уходит ИМЕННО введённое значение, относительно ТЕКУЩЕЙ клетки: перенос
+    // считает он сам (см. setCellOffset). Отправить уже нормализованное — значит
+    // отправить «смещение 0.3 от новой клетки», и никакого переноса не случится.
+    const offXRaw = Number(offX.value) || 0;
+    const offYRaw = Number(offY.value) || 0;
+    const b = planCellBounds();
+    const nx = normalizeCellAndOffsetUi(item.x, offXRaw, b.minX, b.maxX);
+    const ny = normalizeCellAndOffsetUi(item.y, offYRaw, b.minY, b.maxY);
+    const cellChanged = nx.cell !== item.x || ny.cell !== item.y;
+    // Поля и иконку сразу показываем в итоговом виде — но запрос уже сформирован выше
+    offX.value = String(nx.offset);
+    offY.value = String(ny.offset);
+    previewOffset(nx.cell, ny.cell, nx.offset, ny.offset);
+
+    let updated;
+    try {
+      handleApiErrorLocally('planItems:setCellOffset'); // отказ тут ожидаемый, покажем его сами
+      updated = await window.api.planItems.setCellOffset(item.id, offXRaw, offYRaw);
+    } catch (err) {
+      // Чаще всего — целевая клетка занята другим устройством (объединять в группу по
+      // правке числа было бы неожиданно). Возвращаем и поля, и иконку на место.
+      offX.value = String(item.offset_x || 0);
+      offY.value = String(item.offset_y || 0);
+      previewOffset(item.x, item.y, item.offset_x || 0, item.offset_y || 0);
+      showToast(err.message, 'warning', 8000);
+      return;
+    }
+    item.x = updated.x;
+    item.y = updated.y;
+    item.offset_x = updated.offset_x;
+    item.offset_y = updated.offset_y;
+    node.setAttr('itemData', item);
+    if (cellChanged) {
+      // Сменилась клетка — значит поменялись и «Координаты», и зона в инспекторе,
+      // и порядок отрисовки, и доступность клетки для других объектов
+      enforceLayerZOrder(node);
+      fillDevicePicker();
+      renderInspector(node);
+    }
+  };
+  offX.onchange = saveOffset;
+  offY.onchange = saveOffset;
+
+  const resetBtn = document.createElement('button');
+  resetBtn.type = 'button';
+  resetBtn.className = 'tool-btn';
+  resetBtn.textContent = '⟲ В центр клетки, 0°';
+  resetBtn.disabled = locked;
+  resetBtn.onclick = async () => {
+    offX.value = '0'; offY.value = '0';
+    await saveOffset();
+    await saveRotation(0);
+  };
+  wrap.appendChild(resetBtn);
+
+  el.appendChild(wrap);
+}
+
 function renderInspector(node) {
   const el = document.getElementById('inspector-content');
   if (!node) { el.innerHTML = ''; el.className = 'inspector-empty'; el.textContent = 'Ничего не выбрано'; return; }
@@ -4649,6 +5409,7 @@ function renderInspector(node) {
     if (item.item_type === 'desk') {
       el.appendChild(field('Тип', 'Стол'));
       el.appendChild(field('Координаты', `x=${item.x}, y=${item.y}`));
+      appendPlacementControls(el, item, node);
       if (item.review_note) el.appendChild(field('⚠️ На проверку', item.review_note));
     } else if (item.item_type === 'group') {
       el.appendChild(field('Тип', 'Группа устройств (шкаф)'));
@@ -4656,6 +5417,7 @@ function renderInspector(node) {
       el.appendChild(field('Устройств внутри', String(item.member_count ?? '—')));
       el.appendChild(field('Координаты', `x=${item.x}, y=${item.y}`));
       appendPlanItemLockButton(el, item);
+      appendPlacementControls(el, item, node);
 
       const openPanelBtn = document.createElement('button');
       openPanelBtn.type = 'button';
@@ -4692,6 +5454,7 @@ function renderInspector(node) {
         // (см. openGroupPanel), а не к отдельным устройствам внутри неё
         el.appendChild(field('Координаты', `x=${item.x}, y=${item.y}`));
         appendPlanItemLockButton(el, item);
+        appendPlacementControls(el, item, node);
         const itemZone = findZoneForCell(item.x, item.y);
         if (itemZone) el.appendChild(field('Зона', itemZone.name));
         if (item.review_note) el.appendChild(field('⚠️ На проверку', item.review_note));
@@ -4712,6 +5475,50 @@ function renderInspector(node) {
         renderDeviceCableConnectionsSection(cableConnBody, item, node);
       } else {
         if (item.device_ip) appendPingButton(el, item);
+      }
+
+      if (WIFI_DEVICE_TYPES.includes(item.device_type)) {
+        // Условный радиус охвата. Клетка плана — метр, поэтому значение в метрах сразу
+        // читается на плане как радиус в клетках. Пусто = значение по умолчанию.
+        const wifiWrap = document.createElement('div');
+        wifiWrap.className = 'inspector-field';
+        const wifiLabel = document.createElement('label');
+        wifiLabel.textContent = 'Условный охват Wi-Fi, м';
+        wifiWrap.appendChild(wifiLabel);
+        const wifiRow = document.createElement('div');
+        wifiRow.className = 'placement-row';
+        const wifiInput = document.createElement('input');
+        wifiInput.type = 'number';
+        wifiInput.min = '1'; wifiInput.max = '500'; wifiInput.step = '1';
+        wifiInput.className = 'placement-num';
+        wifiInput.placeholder = String(DEFAULT_WIFI_RADIUS_M);
+        wifiInput.value = item.device_wifi_radius_m == null ? '' : String(item.device_wifi_radius_m);
+        wifiInput.disabled = isNodeLocked(node);
+        const wifiUnit = document.createElement('span');
+        wifiUnit.className = 'placement-unit';
+        wifiUnit.textContent = 'м';
+        wifiRow.append(wifiInput, wifiUnit);
+        wifiWrap.appendChild(wifiRow);
+        const wifiHint = document.createElement('div');
+        wifiHint.className = 'placement-hint';
+        wifiHint.textContent = `Пусто — ${DEFAULT_WIFI_RADIUS_M} м по умолчанию. Охват условный: стены и помехи план не учитывает. ` +
+          'Скрыть все круги разом — кнопка 📡 над планом.';
+        wifiWrap.appendChild(wifiHint);
+        wifiInput.onchange = async () => {
+          let updated;
+          try {
+            handleApiErrorLocally('devices:setWifiRadius');
+            updated = await window.api.devices.setWifiRadius(item.ref_id, wifiInput.value === '' ? null : wifiInput.value);
+          } catch (err) {
+            wifiInput.value = item.device_wifi_radius_m == null ? '' : String(item.device_wifi_radius_m);
+            showToast(err.message, 'warning', 7000);
+            return;
+          }
+          item.device_wifi_radius_m = updated.wifi_radius_m;
+          wifiInput.value = updated.wifi_radius_m == null ? '' : String(updated.wifi_radius_m);
+          refreshPointItemVisual(item); // круг рисуется внутри группы устройства
+        };
+        el.appendChild(wifiWrap);
       }
 
       if (item.device_type === 'router' || item.device_type === 'switch') {
@@ -4801,7 +5608,7 @@ function renderInspector(node) {
     }
   } else if (kind === 'line') {
     const item = node.getAttr('itemData');
-    const typeLabels = { wall: 'Стена', door: 'Дверь', stairs: 'Лестница' };
+    const typeLabels = { wall: 'Стена', door: 'Дверь', stairs: 'Лестница', border: 'Граница' };
     el.appendChild(field('Тип', typeLabels[item.item_type] || item.item_type));
 
     if (item.item_type === 'stairs') {
@@ -4816,6 +5623,57 @@ function renderInspector(node) {
     }
 
     if (item.item_type === 'door') {
+      // Ширина проёма. Клетка плана — условный метр, поэтому значение читается и как
+      // метры, и как доли клетки; стандартная дверь — 0.9.
+      const widthWrap = document.createElement('div');
+      widthWrap.className = 'inspector-field';
+      const widthLabel = document.createElement('label');
+      widthLabel.textContent = 'Ширина проёма, м';
+      widthWrap.appendChild(widthLabel);
+      const widthRow = document.createElement('div');
+      widthRow.className = 'placement-row';
+      const widthInput = document.createElement('input');
+      widthInput.type = 'number';
+      widthInput.min = '0.1'; widthInput.max = '20'; widthInput.step = '0.1';
+      widthInput.className = 'placement-num';
+      widthInput.value = String(item.door_width ?? DEFAULT_DOOR_WIDTH);
+      widthInput.disabled = isNodeLocked(node);
+      const widthUnit = document.createElement('span');
+      widthUnit.className = 'placement-unit';
+      widthUnit.textContent = 'м';
+      widthRow.append(widthInput, widthUnit);
+      widthWrap.appendChild(widthRow);
+
+      const presetRow = document.createElement('div');
+      presetRow.className = 'card-body-actions';
+      [0.7, 0.9, 1.2, 1.5].forEach((w) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = `${w}`;
+        b.title = `${w} м`;
+        b.disabled = isNodeLocked(node);
+        b.onclick = () => { widthInput.value = String(w); applyDoorWidth(); };
+        presetRow.appendChild(b);
+      });
+      widthWrap.appendChild(presetRow);
+
+      const applyDoorWidth = async () => {
+        let updated;
+        try {
+          handleApiErrorLocally('planItems:setDoorWidth');
+          updated = await window.api.planItems.setDoorWidth(item.id, widthInput.value);
+        } catch (err) {
+          widthInput.value = String(item.door_width ?? DEFAULT_DOOR_WIDTH);
+          showToast(err.message, 'warning', 7000);
+          return;
+        }
+        item.door_width = updated.door_width;
+        widthInput.value = String(updated.door_width);
+        refreshLineItemVisual(item); // проём перерисовывается целиком, вместе с дугой открывания
+      };
+      widthInput.onchange = applyDoorWidth;
+      el.appendChild(widthWrap);
+
       const actions = document.createElement('div');
       actions.className = 'card-body-actions';
       const flipBtn = document.createElement('button');
@@ -5115,8 +5973,10 @@ async function finishGroupPanelIconDragOut(clientX, clientY) {
   if (!overMainPlan) return; // отпущено не над планом — ничего не делаем
 
   const localPoint = clientToStagePoint(clientX, clientY);
-  const targetX = Math.max(0, Math.round(localPoint.x / CELL_PX - 0.5));
-  const targetY = Math.max(0, Math.round(localPoint.y / CELL_PX - 0.5));
+  // Без Math.max(0, ...): начало координат плана может быть отрицательным, и зажимать
+  // сброшенное устройство к нулю значило бы телепортировать его в другой угол здания
+  const targetX = Math.round(localPoint.x / CELL_PX - 0.5);
+  const targetY = Math.round(localPoint.y / CELL_PX - 0.5);
   const floorPlanId = planState.floorPlan.id;
 
   const removeResult = await window.api.planItems.removeFromGroup(groupItemId, deviceId);
@@ -5690,7 +6550,21 @@ function buildAttachableList(rows, typeLabels, onDetach, options = {}) {
     if (!isClosed) {
       const btn = document.createElement('button');
       btn.textContent = detachLabel;
-      btn.onclick = async () => { await onDetach(r.id); onChanged(); };
+      // Кнопку гасим на время запроса: двойной клик по "На склад" отправлял ДВА
+      // запроса и раньше создавал на складе два дубля одной и той же позиции
+      // (бэкенд это теперь тоже отбивает, см. receiveSoftware/receiveComponent).
+      btn.onclick = async () => {
+        if (btn.disabled) return;
+        btn.disabled = true;
+        try {
+          await onDetach(r.id);
+        } catch (err) {
+          showToast(err.message || 'Не удалось выполнить операцию');
+          btn.disabled = false;
+          return;
+        }
+        onChanged();
+      };
       li.appendChild(btn);
     }
     ul.appendChild(li);
@@ -5833,7 +6707,10 @@ function portableRelaunchWarning() {
 async function refreshDbSettingsInfo() {
   const info = await window.api.settings.getDbInfo();
   cachedIsPortable = !!info.isPortable;
-  document.getElementById('db-current-path').textContent = info.mode === 'client' ? '(на удалённом хосте)' : (info.path || '—');
+  const isServerSource = info.mode === 'client' && info.sourceKind === 'server';
+  document.getElementById('db-current-path').textContent = info.mode === 'client'
+    ? (isServerSource ? '(на выделенном сервере)' : '(на удалённом хосте)')
+    : (info.path || '—');
 
   const badge = document.getElementById('db-current-badge');
   badge.textContent = info.isDefault ? 'по умолчанию' : 'своя (сетевая или другая)';
@@ -5858,10 +6735,18 @@ async function refreshDbSettingsInfo() {
     allowWritesRow.classList.remove('hidden');
     document.getElementById('db-allow-writes-checkbox').checked = await window.api.settings.getAllowClientWrites();
   } else if (info.mode === 'client') {
-    sharedStatusEl.textContent = `🔌 Вы подключены как клиент к ${info.remoteHost}.`;
+    sharedStatusEl.textContent = isServerSource
+      ? `🖧 Вы работаете через выделенный сервер ${info.remoteHost}.`
+      : `🔌 Вы подключены как клиент к хосту ${info.remoteHost}.`;
     sharedStatusEl.classList.add('is-client');
     clientsEl.classList.add('hidden');
     allowWritesRow.classList.add('hidden');
+    // Адрес уже подставлен в поле сервера — чтобы было видно, куда подключены, и можно
+    // было переподключиться, не вспоминая адрес заново
+    if (isServerSource) {
+      const serverHostField = document.getElementById('db-server-host-input');
+      if (serverHostField && !serverHostField.value) serverHostField.value = info.remoteHost || '';
+    }
   } else {
     sharedStatusEl.textContent = 'Обычный режим — БД открыта только этим приложением.';
     clientsEl.classList.add('hidden');
@@ -6049,6 +6934,41 @@ function bindDbSettingsModal() {
     const result = await window.api.settings.setClientMode(remoteHost);
     if (result && result.success === false) sharedStatusNote.textContent = `Ошибка: ${result.error}`;
   });
+
+  // --- выделенный сервер (см. server/index.js) ---
+  const serverNote = document.getElementById('db-server-status-note');
+  const serverHostInput = document.getElementById('db-server-host-input');
+  const serverTokenInput = document.getElementById('db-server-token-input');
+
+  /** Текст по результату диагностики. Отличать «адрес не отвечает» от «ключ не принят»
+   *  принципиально: иначе человек ищет проблему в сети, когда дело в ключе. */
+  function describeServerCheck(check) {
+    if (check.ok) return '✅ Сервер отвечает, ключ принят.';
+    if (check.reason === 'token-format') return `🔑 ${check.error}`;
+    if (check.reason === 'token') return '🔑 Сервер доступен, но ключ не принят — сверьте его с NM_TOKEN на сервере.';
+    if (check.reason === 'timeout') return `⏱ ${check.error} Проверьте, что контейнер запущен и порт открыт.`;
+    return `⚠️ ${check.error || 'Не удалось связаться с сервером.'}`;
+  }
+
+  document.getElementById('db-server-check-btn').addEventListener('click', async () => {
+    const remoteHost = serverHostInput.value.trim();
+    if (!remoteHost) { serverNote.textContent = 'Укажите адрес сервера (ip:порт).'; return; }
+    serverNote.textContent = 'Проверяю…';
+    const check = await window.api.settings.diagnoseServer(remoteHost, serverTokenInput.value);
+    serverNote.textContent = describeServerCheck(check);
+  });
+
+  document.getElementById('db-server-connect-btn').addEventListener('click', async () => {
+    const remoteHost = serverHostInput.value.trim();
+    if (!remoteHost) { serverNote.textContent = 'Укажите адрес сервера (ip:порт).'; return; }
+    if (!(await confirmModal(
+      `Подключиться к серверу ${remoteHost}? Собственная БД перестанет использоваться — все данные будут ` +
+      'браться с сервера. Приложение перезапустится.' + portableRelaunchWarning()
+    ))) return;
+    serverNote.textContent = 'Проверяю подключение…';
+    const result = await window.api.settings.setServerMode(remoteHost, serverTokenInput.value);
+    if (result && result.success === false) serverNote.textContent = describeServerCheck(result);
+  });
 }
 
 
@@ -6071,6 +6991,32 @@ function showToast(message, type = 'error', durationMs = 5000) {
   return toast;
 }
 
+/** Плашка «база открыта только для чтения» — база уже занята другим живым экземпляром
+ *  (см. db/dbLock.js). Отдельно от клиентской плашки: там причина и выход другие. */
+function showReadonlyBanner(readonlyInfo) {
+  const banner = document.getElementById('read-only-banner');
+  banner.innerHTML = '';
+  banner.classList.remove('hidden');
+  banner.classList.add('banner-danger');
+
+  const msg = document.createElement('span');
+  const who = readonlyInfo.heldBy
+    ? `Её уже открыли на «${readonlyInfo.heldBy.hostname}»${readonlyInfo.heldBy.user ? ` (${readonlyInfo.heldBy.user})` : ''}.`
+    : (readonlyInfo.reason || '');
+  const mismatch = readonlyInfo.schemaMismatch
+    ? ' Обновление структуры базы тоже отложено — для него нужен монопольный доступ.'
+    : '';
+  msg.textContent = `🔒 Только чтение. ${who} Изменения сохранить не получится — ` +
+    'закройте приложение там, где база открыта, либо работайте через сервер.' + mismatch;
+  banner.appendChild(msg);
+
+  const settingsBtn = document.createElement('button');
+  settingsBtn.type = 'button';
+  settingsBtn.textContent = '⚙️ Настройки БД';
+  settingsBtn.onclick = () => document.getElementById('db-settings-btn').click();
+  banner.appendChild(settingsBtn);
+}
+
 /** Обновляет баннер под актуальный статус связи с хостом И текущее разрешение на
  *  запись — вызывается при старте, при каждой смене статуса связи и при каждом
  *  изменении тумблера хоста (см. onHostConnectivityChanged/onLocksStateChanged ниже).
@@ -6080,14 +7026,30 @@ function updateReadOnlyBanner(remoteHost, reachable) {
   banner.innerHTML = '';
   banner.classList.remove('hidden', 'banner-danger');
 
+  // Протокол у хоста и у выделенного сервера один, но причины отказа разные: у хоста
+  // запись включает человек тумблером, у сервера — переменная окружения. Писать
+  // «хост пока не разрешил», когда человек подключён к серверу, значит отправить его
+  // искать несуществующий тумблер.
+  const isServer = clientSourceKind === 'server';
   const msg = document.createElement('span');
   if (reachable === false) {
     banner.classList.add('banner-danger');
-    msg.textContent = `⚠️ Связь с хостом ${remoteHost} потеряна — данные могут быть устаревшими. Редактирование недоступно.`;
+    // «Связь с сервером/хостом» — творительный падеж; у подключения («подключено к
+    // серверу») он другой, поэтому формы не переиспользуем, а пишем каждую отдельно
+    const withWhom = isServer ? `сервером ${remoteHost}` : `хостом ${remoteHost}`;
+    msg.textContent = `⚠️ Связь с ${withWhom} потеряна — данные могут быть устаревшими. Редактирование недоступно.`;
+  } else if (clientAllowWritesFlag === null) {
+    msg.textContent = isServer
+      ? `🖧 Подключено к серверу ${remoteHost} — выясняю права на изменения…`
+      : `🔌 Подключено к хосту ${remoteHost} — выясняю права на изменения…`;
   } else if (clientAllowWritesFlag) {
-    msg.textContent = `🔌 Подключено к хосту ${remoteHost}. Хост разрешил изменения — откройте объект и запросите право редактирования.`;
+    msg.textContent = isServer
+      ? `🖧 Работа через сервер ${remoteHost}. Изменения разрешены — откройте объект и запросите право редактирования.`
+      : `🔌 Подключено к хосту ${remoteHost}. Хост разрешил изменения — откройте объект и запросите право редактирования.`;
   } else {
-    msg.textContent = `🔌 Только просмотр — подключено к хосту ${remoteHost}. Хост пока не разрешил изменения клиентам.`;
+    msg.textContent = isServer
+      ? `🖧 Только просмотр — сервер ${remoteHost} открыт для чтения (на нём выключена запись).`
+      : `🔌 Только просмотр — подключено к хосту ${remoteHost}. Хост пока не разрешил изменения клиентам.`;
   }
   banner.appendChild(msg);
 
@@ -6103,7 +7065,24 @@ function updateReadOnlyBanner(remoteHost, reachable) {
 // чтобы при обрыве связи не засыпать пользователя десятком одинаковых тостов подряд —
 // несколько запросов вполне могут упасть почти одновременно.
 let lastApiErrorToastAt = 0;
+
+// Каналы, по которым вызывающий код показывает ошибку САМ (своим тостом, подписью в
+// карточке и т.п.). Без этого одна неудача давала два уведомления разом: собственное
+// и общее — особенно заметно на ожидаемых отказах вроде «клетка занята», которые и так
+// объяснены по-человечески. Запись живёт пару секунд: ровно на время запроса.
+const locallyHandledApiErrors = new Map(); // channel -> до какого момента не трогать
+function handleApiErrorLocally(channel) {
+  locallyHandledApiErrors.set(channel, Date.now() + 15000);
+}
+function isApiErrorHandledLocally(channel) {
+  const until = locallyHandledApiErrors.get(channel);
+  if (!until) return false;
+  locallyHandledApiErrors.delete(channel); // одноразово — на следующий сбой снова общий тост
+  return Date.now() < until;
+}
+
 window.addEventListener('api-error', (e) => {
+  if (isApiErrorHandledLocally(e.detail.channel)) return;
   const now = Date.now();
   if (now - lastApiErrorToastAt < 4000) return;
   lastApiErrorToastAt = now;
@@ -6125,8 +7104,31 @@ window.addEventListener('api-error', (e) => {
     showToast(info.startupNotice, 'warning', 9000);
   }
 
+  if (info.readonly && info.readonly.readonly) {
+    // База занята другим экземпляром — приложение всё равно запустилось и данные видны,
+    // но писать нельзя. Канву сразу в режим просмотра; остальные вкладки защищены на
+    // бэкенде (см. dbChannels.js), и отказ там всплывает обычным тостом ошибки.
+    dbReadonlyActive = true;
+    planState.viewMode = true;
+    showReadonlyBanner(info.readonly);
+    const btn = document.getElementById('db-settings-btn');
+    btn.classList.add('has-warning');
+    btn.title = info.readonly.reason || 'База открыта только для чтения';
+  }
+
+  // Замок могли отобрать уже во время работы — тогда переходим в только чтение на ходу
+  window.api.events.onDbReadonlyChanged((ro) => {
+    if (!ro || !ro.readonly || dbReadonlyActive) return;
+    dbReadonlyActive = true;
+    planState.viewMode = true;
+    applyLayerStates();
+    showReadonlyBanner(ro);
+    showToast('🔒 База перешла в режим только чтения — её занял другой экземпляр. Изменения сохранить не получится.', 'warning', 12000);
+  });
+
   if (info.mode === 'client') {
     clientModeActive = true;
+    clientSourceKind = info.sourceKind === 'server' ? 'server' : 'host';
     // Только просмотр по умолчанию, пока не узнаем реальное состояние тумблера хоста
     // (см. ниже onLocksStateChanged) — безопасный старт. Бэкенд в любом случае
     // отклоняет любые попытки записи независимо от состояния интерфейса (см.
@@ -6140,8 +7142,9 @@ window.addEventListener('api-error', (e) => {
     // (см. heartbeat в main/index.js), баннер и тост обновляются без перезапуска.
     window.api.events.onHostConnectivityChanged(({ reachable, remoteHost }) => {
       updateReadOnlyBanner(remoteHost, reachable);
-      if (reachable) showToast('✅ Связь с хостом восстановлена', 'success', 4000);
-      else showToast('⚠️ Связь с хостом потеряна — проверьте сеть', 'warning', 8000);
+      const subject = clientSourceKind === 'server' ? 'сервером' : 'хостом';
+      if (reachable) showToast(`✅ Связь с ${subject} восстановлена`, 'success', 4000);
+      else showToast(`⚠️ Связь с ${subject} потеряна — проверьте сеть`, 'warning', 8000);
     });
 
     // Данные отданы из локального кэша (сети сейчас нет) — троттлим тем же способом,
