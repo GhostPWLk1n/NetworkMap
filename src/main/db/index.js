@@ -2349,12 +2349,12 @@ const warehouseRepo = {
     return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(info.lastInsertRowid);
   },
   /** Редактирование складской карточки — не трогает source/target (это история, а не поле формы) */
-  update(id, { item_type, description, license_key = null, cost = null, status, note = null }) {
-    if (!WAREHOUSE_STATUSES.includes(status)) throw new Error('Недопустимый статус');
+  update(id, { item_type, description, license_key = null, cost = null, status, preserveStatus = false, note = null }) {
+    if (!preserveStatus && !WAREHOUSE_STATUSES.includes(status)) throw new Error('Недопустимый статус');
     getDb().prepare(`
-      UPDATE warehouse_items SET item_type = ?, description = ?, license_key = ?, cost = ?, status = ?, note = ?
+      UPDATE warehouse_items SET item_type = ?, description = ?, license_key = ?, cost = ?, status = COALESCE(?, status), note = ?
       WHERE id = ?
-    `).run(item_type, description, license_key, cost, status, note, id);
+    `).run(item_type, description, license_key, cost, preserveStatus ? null : status, note, id);
     auditLogRepo.log('warehouse_item', id, 'update', `Складская запись «${description}» отредактирована`);
     return getDb().prepare('SELECT * FROM warehouse_items WHERE id = ?').get(id);
   },
@@ -2406,11 +2406,11 @@ const warehouseRepo = {
    *  и закрывает складскую (status='issued'). */
   issueToDevice(itemId, deviceId) {
     const db = getDb();
-    let logText;
     const tx = db.transaction(() => {
       const item = db.prepare('SELECT * FROM warehouse_items WHERE id = ?').get(itemId);
       if (!item) throw new Error('Позиция склада не найдена');
-      if (item.removed_at) throw new Error('Эта позиция уже выдана');
+      if (item.removed_at || item.status === 'issued') throw new Error('Эта позиция уже выдана');
+      if (item.status === 'written_off') throw new Error('Эта позиция списана');
 
       if (item.category === 'component') {
         db.prepare(`
@@ -2424,13 +2424,16 @@ const warehouseRepo = {
         `).run(deviceId, item.item_type, item.description, item.license_key, item.cost, 'выдано со склада');
       }
 
-      db.prepare(`UPDATE warehouse_items SET removed_at = datetime('now'), target_device_id = ?, status = 'issued' WHERE id = ?`)
-        .run(deviceId, itemId);
-      logText = `«${item.description}» выдано на «${deviceLabelForLog(db, deviceId)}»`;
+      const { removed_at } = db.prepare(`
+        UPDATE warehouse_items SET removed_at = datetime('now'), target_device_id = ?, status = 'issued' WHERE id = ?
+        RETURNING removed_at
+      `).get(deviceId, itemId);
+      auditLogRepo.log('warehouse_item', itemId, 'update',
+        `«${item.description}» выдано на «${deviceLabelForLog(db, deviceId)}»`);
+      return removed_at;
     });
-    tx();
-    auditLogRepo.log('warehouse_item', itemId, 'update', logText);
-    return { itemId, deviceId };
+    const removedAt = tx();
+    return { itemId, deviceId, removedAt };
   },
   /** Быстрая смена статуса без правки остальных полей (например, "получено" или "списано") */
   setStatus(id, status) {

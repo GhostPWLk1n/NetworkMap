@@ -635,6 +635,7 @@ let clientSourceKind = 'host';
 let clientAllowWritesFlag = null;
 let clientHeldLockKeys = new Set(); // "type:id" — объекты, на которые ЭТОТ клиент прямо сейчас имеет право (см. isNodeLocked)
 let devicesSearchState;
+const deviceCardOpeners = new WeakMap();
 
 let deviceEquipmentIndex = new Map(); // device.id -> "GPU RTX 4090 монитор Dell..." — для поиска по установленному оборудованию
 
@@ -758,21 +759,17 @@ function buildDeviceCard(d) {
   if (badge) header.appendChild(badge);
   header.appendChild(chevron);
   header.addEventListener('click', () => {
-    row.classList.toggle('expanded');
-    if (!row.classList.contains('expanded') && editLockControls) {
-      // Свернули карточку — освобождаем право сразу, не дожидаясь протухания за минуту
-      // бездействия, чтобы объект быстрее стал доступен другим (только режим клиента)
-      editLockControls.releaseIfHeld();
-    }
-    if (row.classList.contains('expanded') && !extrasLoaded) {
-      extrasLoaded = true;
-      refreshExtras();
+    if (row.classList.contains('expanded')) {
+      row.classList.remove('expanded');
+      editLockControls?.releaseIfHeld();
+    } else {
+      expandCard();
     }
   });
   header.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showContextMenu(e.clientX, e.clientY, [
-      { label: 'Редактировать', onClick: () => row.classList.add('expanded') },
+      { label: 'Редактировать', onClick: expandCard },
       { label: '📍 Найти на плане', onClick: () => findDeviceOnPlan(d.id) },
       ...flagMenuItems(d.flag, async (flag) => {
         const updated = await window.api.devices.setFlag(d.id, flag);
@@ -960,8 +957,24 @@ function buildDeviceCard(d) {
   extras.textContent = 'Загрузка…';
   body.appendChild(extras);
   let extrasLoaded = false;
-  let refreshExtras;
-  refreshExtras = () => renderDeviceExtras(extras, d.id, refreshExtras);
+  let extrasRequest;
+  const refreshExtras = () => renderDeviceExtras(extras, d.id, refreshExtras);
+  function expandCard() {
+    row.classList.add('expanded');
+    if (extrasLoaded || extrasRequest) return;
+    extras.textContent = 'Загрузка…';
+    extrasRequest = refreshExtras()
+      .then(() => { extrasLoaded = true; })
+      .catch(() => {
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Повторить загрузку';
+        retry.onclick = expandCard;
+        extras.replaceChildren('Не удалось загрузить данные устройства. ', retry);
+      })
+      .finally(() => { extrasRequest = null; });
+  }
+  deviceCardOpeners.set(row, expandCard);
 
   row.append(header, body);
   return row;
@@ -1046,18 +1059,25 @@ async function findCableOnPlan(cableId) {
 
 /** Переключает на лист "Устройства", сбрасывает фильтры (чтобы карточка точно попала в выдачу),
  *  разворачивает нужную карточку и прокручивает к ней. Используется из инспектора плана и из зон. */
-function openDeviceCard(deviceId) {
+async function openDeviceCard(deviceId) {
   document.querySelector('.tab-btn[data-tab="devices"]').click();
   const input = document.getElementById('devices-search-input');
   input.value = '';
   if (devicesSearchState) devicesSearchState.query = '';
   document.getElementById('devices-filter-type').value = '';
   document.getElementById('devices-filter-status').value = '';
+  document.getElementById('devices-filter-no-owner').checked = false;
+  if (!devicesCache.some((d) => d.id === deviceId)) {
+    try { await renderDevices(); } catch { return; } // Ошибку показывает обработчик API.
+  }
+  if (devicesCache.some((d) => d.id === deviceId && d.status === 'decommissioned')) {
+    document.getElementById('devices-filter-show-decommissioned').checked = true;
+  }
   applyDevicesFilter();
-  requestAnimationFrame(() => {
-    const card = document.querySelector(`#device-cards .card-row[data-device-id="${deviceId}"]`);
-    if (card) { card.classList.add('expanded'); card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-  });
+  const card = document.querySelector(`#device-cards .card-row[data-device-id="${deviceId}"]`);
+  if (!card) return;
+  deviceCardOpeners.get(card)?.();
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 /** То же самое, но для листа "Пользователи" — используется из карточки владельца устройства */
@@ -1153,11 +1173,62 @@ document.getElementById('import-pc-info-folder-btn').addEventListener('click', a
 
 let warehouseCache = [];
 let warehouseSearchState;
+let warehouseRequest;
+const warehouseIssues = new Map();
+const warehouseIssuesInProgress = new Set();
 const WAREHOUSE_STATUS_LABELS = { ordered: 'в заказе', in_stock: 'в наличии', issued: 'выдано', written_off: 'списано' };
 
+function isWarehouseItemUnissued(item) {
+  return !item.removed_at && item.status !== 'issued';
+}
+
+function canIssueWarehouseItem(item) {
+  return isWarehouseItemUnissued(item) && item.status !== 'written_off';
+}
+
+function loadWarehouseRows() {
+  if (!warehouseRequest) {
+    warehouseRequest = window.api.warehouse.list().then((rows) => rows.map((row) => {
+      // После сетевой записи чтение может вернуть старый офлайн-кэш.
+      const issue = warehouseIssues.get(row.id);
+      if (!issue) return row;
+      if (!row.removed_at) return { ...row, ...issue };
+      warehouseIssues.delete(row.id);
+      return row;
+    })).finally(() => { warehouseRequest = null; });
+  }
+  return warehouseRequest;
+}
+
 async function renderWarehouse() {
-  warehouseCache = await window.api.warehouse.list();
+  warehouseCache = await loadWarehouseRows();
   applyWarehouseFilter();
+}
+
+async function issueWarehouseItem(itemId, deviceId) {
+  if (warehouseIssuesInProgress.has(itemId) || warehouseIssues.has(itemId)) return false;
+  warehouseIssuesInProgress.add(itemId);
+  try {
+    const result = await window.api.warehouse.issueToDevice(itemId, deviceId);
+    const issue = {
+      status: 'issued', removed_at: result.removedAt,
+      target_device_id: deviceId,
+      target_device_hostname: devicesCache.find((d) => d.id === deviceId)?.hostname
+    };
+    warehouseIssues.set(itemId, issue);
+    warehouseCache = warehouseCache.map((row) => row.id === itemId ? { ...row, ...issue } : row);
+    warehouseDragCache = warehouseDragCache.filter((row) => row.id !== itemId);
+    softwareCache = softwareCache.filter((entry) => entry.source !== 'warehouse' || entry.id !== itemId);
+    applyWarehouseFilter();
+    applyWarehouseDragFilter();
+    applySoftwareFilter();
+    await Promise.allSettled([renderWarehouse(), fillWarehouseDragList(), renderSoftwareRegistry()]);
+    return true;
+  } catch {
+    return false; // Ошибку записи показывает общий обработчик API.
+  } finally {
+    warehouseIssuesInProgress.delete(itemId);
+  }
 }
 
 function applyWarehouseFilter() {
@@ -1173,7 +1244,7 @@ function applyWarehouseFilter() {
       .filter(Boolean).join(' ');
     const matchesText = !query || matchesQuery(haystack, query, state);
     const matchesCategory = !categoryFilter || w.category === categoryFilter;
-    const matchesStock = !inStockOnly || !w.removed_at;
+    const matchesStock = !inStockOnly || isWarehouseItemUnissued(w);
     return matchesText && matchesCategory && matchesStock;
   });
 
@@ -1311,7 +1382,7 @@ function buildWarehouseCard(w) {
   form.appendChild(actions);
   body.appendChild(form);
 
-  if (!w.removed_at && w.status !== 'written_off') {
+  if (canIssueWarehouseItem(w)) {
     const issueWrap = document.createElement('div');
     issueWrap.className = 'inspector-add-form';
     const deviceSelect = document.createElement('select');
@@ -1325,11 +1396,10 @@ function buildWarehouseCard(w) {
     issueBtn.type = 'button';
     issueBtn.textContent = 'Выдать на устройство';
     issueBtn.onclick = async () => {
-      if (!deviceSelect.value) return;
-      await window.api.warehouse.issueToDevice(w.id, Number(deviceSelect.value));
-      renderWarehouse();
-      fillWarehouseDragList();
-      renderSoftwareRegistry();
+      if (!deviceSelect.value || issueBtn.disabled) return;
+      issueBtn.disabled = true;
+      try { await issueWarehouseItem(w.id, Number(deviceSelect.value)); }
+      finally { issueBtn.disabled = false; }
     };
     issueWrap.append(deviceSelect, issueBtn);
     body.appendChild(issueWrap);
@@ -1385,12 +1455,16 @@ document.getElementById('warehouse-form').addEventListener('submit', async (e) =
 
 let softwareCache = [];
 let softwareSearchState;
+let softwareRegistryRequest = 0;
 
 async function renderSoftwareRegistry() {
-  const [installed, stockSoftware] = await Promise.all([
+  const request = ++softwareRegistryRequest;
+  const [installed, warehouse] = await Promise.all([
     window.api.software.listActive(),
-    window.api.warehouse.list('software')
+    loadWarehouseRows()
   ]);
+  if (request !== softwareRegistryRequest) return;
+  const stockSoftware = warehouse.filter((row) => row.category === 'software' && isWarehouseItemUnissued(row));
   softwareCache = [
     ...installed.map((s) => normalizeSoftwareEntry(s, 'device')),
     ...stockSoftware.map((w) => normalizeSoftwareEntry(w, 'warehouse'))
@@ -1402,14 +1476,14 @@ async function renderSoftwareRegistry() {
 function normalizeSoftwareEntry(raw, source) {
   if (source === 'device') {
     return {
-      source, raw, id: raw.id, type: raw.software_type, name: raw.name,
+      source, id: raw.id, type: raw.software_type, name: raw.name,
       license_key: raw.license_key, cost: raw.cost, note: raw.note, flag: raw.flag,
       device_hostname: raw.device_hostname, device_id: raw.device_id,
       statusLabel: `установлено на «${raw.device_hostname}»`
     };
   }
   return {
-    source, raw, id: raw.id, type: raw.item_type, name: raw.description,
+    source, id: raw.id, type: raw.item_type, name: raw.description,
     license_key: raw.license_key, cost: raw.cost, note: raw.note, flag: raw.flag,
     device_hostname: null, device_id: null, warehouseStatus: raw.status,
     statusLabel: WAREHOUSE_STATUS_LABELS[raw.status] || raw.status
@@ -1518,11 +1592,11 @@ function buildSoftwareCard(s) {
     <label class="span-2">Лицензионный ключ <input name="license_key" /></label>
     <label class="span-2">Заметка <input name="note" /></label>
   `;
-  form.software_type.value = s.type;
-  form.name.value = s.name || '';
-  form.license_key.value = s.license_key || '';
-  form.cost.value = s.cost ?? '';
-  form.note.value = s.note || '';
+  form.elements.namedItem('software_type').value = s.type;
+  form.elements.namedItem('name').value = s.name || '';
+  form.elements.namedItem('license_key').value = s.license_key || '';
+  form.elements.namedItem('cost').value = s.cost ?? '';
+  form.elements.namedItem('note').value = s.note || '';
 
   const saveRow = document.createElement('div');
   saveRow.className = 'card-body-actions';
@@ -1536,6 +1610,7 @@ function buildSoftwareCard(s) {
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (saveBtn.disabled) return;
     const fd = new FormData(form);
     const common = {
       software_type: fd.get('software_type'),
@@ -1544,25 +1619,31 @@ function buildSoftwareCard(s) {
       cost: fd.get('cost') ? Number(fd.get('cost')) : null,
       note: fd.get('note') || null
     };
+    if (!common.name) {
+      statusNote.textContent = 'Введите название ПО';
+      return;
+    }
+    saveBtn.disabled = true;
     try {
       handleApiErrorLocally(s.source === 'device' ? 'software:update' : 'warehouse:update');
       if (s.source === 'device') {
         await window.api.software.update(s.id, common);
       } else {
-        // warehouse_items: своя схема полей (description/item_type) + обязательные
-        // category/status, которые эта форма не меняет — берём их из исходной записи
         await window.api.warehouse.update(s.id, {
           item_type: common.software_type,
           description: common.name,
           license_key: common.license_key,
           cost: common.cost,
-          status: s.raw.status,
+          status: s.warehouseStatus, // Для совместимости со старыми хостами.
+          preserveStatus: true,
           note: common.note
         });
       }
     } catch (err) {
       statusNote.textContent = `Не сохранено: ${err.message}`;
       return;
+    } finally {
+      saveBtn.disabled = false;
     }
     statusNote.textContent = 'Сохранено ✓';
     setTimeout(() => { statusNote.textContent = ''; }, 2000);
@@ -4303,9 +4384,13 @@ function renderUserDragList(users) {
 let warehouseDragCache = [];
 
 async function fillWarehouseDragList() {
-  const all = await window.api.warehouse.list();
-  warehouseDragCache = all.filter((w) => !w.removed_at); // только то, что реально лежит на складе
-  renderWarehouseDragList(warehouseDragCache);
+  warehouseDragCache = (await loadWarehouseRows()).filter(canIssueWarehouseItem);
+  applyWarehouseDragFilter();
+}
+
+function applyWarehouseDragFilter(query = document.getElementById('plan-tools-search').value.trim().toLowerCase()) {
+  renderWarehouseDragList(!query ? warehouseDragCache : warehouseDragCache.filter((w) =>
+    `${w.description} ${w.item_type}`.toLowerCase().includes(query)));
 }
 
 function renderWarehouseDragList(items) {
@@ -4350,8 +4435,7 @@ function applyPlanToolsSearch() {
   });
   renderUserDragList(matchedUsers);
 
-  renderWarehouseDragList(!q ? warehouseDragCache : warehouseDragCache.filter((w) =>
-    `${w.description} ${w.item_type}`.toLowerCase().includes(q)));
+  applyWarehouseDragFilter(q);
 
   renderPlacedSearchResults(q, deviceMatchesQuery);
 }
@@ -4484,10 +4568,7 @@ function bindUserDragDrop() {
       refreshPointItemVisual(target.data);
       return; // refreshPointItemVisual уже перерисовал инспектор, если было выделено
     } else if (payload.type === 'warehouse') {
-      await window.api.warehouse.issueToDevice(payload.id, target.data.ref_id);
-      await fillWarehouseDragList(); // выданная позиция должна пропасть из кармана
-      renderWarehouse();
-      renderSoftwareRegistry(); // если выдали ПО — новая установка должна появиться в реестре
+      if (!(await issueWarehouseItem(payload.id, target.data.ref_id))) return;
     }
 
     if (planState.selectedNode === target.node) renderInspector(target.node);
@@ -7197,15 +7278,18 @@ window.addEventListener('api-error', (e) => {
     if (!changes || changes.length === 0) return;
     renderUsers();
     renderDevices();
-    renderWarehouse();
-    renderSoftwareRegistry();
+    if (changes.some((change) => ['device', 'warehouse_item', 'software'].includes(change.entity_type))) {
+      renderWarehouse();
+      fillWarehouseDragList();
+      renderSoftwareRegistry();
+    }
     const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
     if (activeTab === 'network') renderNetworkTab();
     if (activeTab === 'audit') loadAuditLog();
     // План обновляется в фоне ВСЕГДА, не только когда эта вкладка сейчас видна —
     // канва существует независимо от того, какая вкладка активна (просто скрыта CSS),
     // так что к моменту, когда пользователь на неё переключится, она уже будет свежей
-    fillDevicePicker(); fillUserDragList(); fillWarehouseDragList();
+    fillDevicePicker(); fillUserDragList();
     await applyPlanChangesQuietly(changes);
 
     const summaryText = changes.length === 1
