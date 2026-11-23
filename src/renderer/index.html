@@ -464,6 +464,8 @@
         <div id="bitrix-changes"></div>
       </div>
       <div class="modal-actions">
+        <button id="bitrix-setup-from-sync-btn" type="button" class="bitrix-setup-link">⚙ Подключение…</button>
+        <span class="spacer"></span>
         <button id="bitrix-cancel-btn" type="button">Закрыть</button>
         <button id="bitrix-apply-btn" type="button" class="primary" disabled>Сохранить в NetworkMap</button>
       </div>
@@ -520,6 +522,46 @@
         <button id="invoice-cancel-btn" type="button">Закрыть</button>
         <button id="invoice-edit-btn" type="button" class="hidden">Редактировать</button>
         <button id="invoice-save-btn" type="button" class="primary hidden">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Мастер «Настроить Битрикс24» (задача #11): адрес портала → вебхук на портале →
+       ссылка → проверка доступа → сохранение bitrix.yml у владельца базы. -->
+  <div id="bitrix-setup-modal" class="modal-overlay hidden">
+    <div class="modal-box bitrix-box bitrix-setup-box" role="dialog" aria-labelledby="bitrix-setup-title">
+      <div class="modal-title" id="bitrix-setup-title">Настроить Битрикс24</div>
+      <div id="bitrix-setup-current" class="bitrix-status"></div>
+      <div id="bitrix-setup-client" class="bitrix-setup-client hidden"></div>
+      <div id="bitrix-setup-body">
+        <ol class="bitrix-setup-steps">
+          <li>
+            <label for="bitrix-setup-portal">Адрес портала</label>
+            <div class="bitrix-search-row">
+              <input id="bitrix-setup-portal" autocomplete="off" placeholder="company.bitrix24.ru" />
+              <button id="bitrix-setup-open-portal" type="button">Открыть Битрикс24</button>
+            </div>
+          </li>
+          <li>
+            На портале откроется раздел «Разработчикам». Выберите
+            <b>Готовые сценарии → Другое → Входящий вебхук</b>, в правах доступа отметьте
+            <b>Пользователи (базовое)</b> — <code>user_basic</code> — и сохраните вебхук.
+          </li>
+          <li>
+            <label for="bitrix-setup-webhook">Скопируйте поле <b>«Вебхук для вызова REST API»</b> и вставьте сюда</label>
+            <input id="bitrix-setup-webhook" type="password" autocomplete="off" spellcheck="false"
+                   placeholder="https://company.bitrix24.ru/rest/1/…/" />
+            <div class="bitrix-setup-hint">Подойдёт и ссылка из генератора запросов с методом в конце — лишнее будет отброшено.
+              Ссылка содержит ключ доступа: после сохранения она здесь не показывается.</div>
+          </li>
+        </ol>
+        <div id="bitrix-setup-status" class="bitrix-status hidden" role="status"></div>
+        <div id="bitrix-setup-result" class="bitrix-setup-result hidden"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="bitrix-setup-close" type="button">Закрыть</button>
+        <button id="bitrix-setup-check" type="button">Проверить доступ</button>
+        <button id="bitrix-setup-save" type="button" class="primary" disabled>Сохранить</button>
       </div>
     </div>
   </div>
@@ -645,6 +687,15 @@
       </div>
       <div id="db-server-status-note" class="status-note"></div>
 
+      <hr class="db-section-divider" />
+
+      <div class="modal-title">Битрикс24</div>
+      <p class="search-advanced-note db-explainer">
+        Подключение для синхронизации карточек пользователей: входящий вебхук с правом
+        «Пользователи (базовое)». Настраивается там, где хранится база.
+      </p>
+      <button id="bitrix-setup-open-btn" type="button" class="tool-btn">🔗 Настроить Битрикс24…</button>
+
       <div class="modal-actions">
         <button id="db-settings-close" type="button">Закрыть</button>
       </div>
@@ -655,5 +706,6 @@
   <script src="../shared/invoiceMath.js"></script>
   <script src="index.js"></script>
   <script src="invoices.js"></script>
+  <script src="bitrixSetup.js"></script>
 </body>
 </html>
