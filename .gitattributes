@@ -1,0 +1,3 @@
+# PDF — двоичные файлы: без построчного diff и без замены концов строк (autocrlf на
+# Windows испортил бы контрольные суммы тестовых счетов, см. tests/fixtures/invoices)
+*.pdf binary

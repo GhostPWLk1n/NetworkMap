@@ -3,7 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { fork } = require('child_process');
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const {
   // Репозитории здесь нужны только там, где логика шире одного канала данных:
   // auditLogRepo — уведомления об изменениях. Сами каналы живут в shared/dbChannels.js.
@@ -16,6 +16,7 @@ const {
 const { importExcel } = require('./import');
 const { parsePcInfoFile, parsePcInfoFolder, applyPcInfoImport } = require('./pcInfoImport');
 const { DB_CHANNELS } = require('../shared/dbChannels');
+const { registerInvoiceIpc } = require('./invoiceFiles');
 const { startRpcServer } = require('./rpcServer');
 const { rpcCall, rpcPing, rpcDiagnose } = require('./rpcClient');
 const { publishHostMarker, updateHostMarker, removeHostMarker, readHostMarker, findActiveMarkersInDir, cleanupStaleMarkersInDir } = require('./discovery');
@@ -169,9 +170,16 @@ function registerIpcHandlers() {
 
   ipcMain.handle('app:version', () => app.getVersion());
 
+  // Счета поставщиков (задача #8): выбор и разбор PDF, открытие и сохранение оригинала —
+  // локально, в любом режиме. Сама запись в базу — каналы invoices:* из dbChannels.
+  registerInvoiceIpc({ ipcMain, dialog, shell, getWindow: () => mainWindow });
+
   if (mode === 'client') {
     const remoteHost = getRemoteHost();
-    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn, noCache }]) => {
+    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn, noCache, timeoutMs }]) => {
+      // timeoutMs — для каналов, которые везут файлы (оригинал счёта до 5 МБ): по
+      // медленному VPN 10 секунд на них может не хватить
+      const rpcTimeout = timeoutMs || 10000;
       ipcMain.handle(channel, async (_event, payload) => {
         const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
         if (write || noCache) {
@@ -183,10 +191,10 @@ function registerIpcHandlers() {
           // жёсткому правилу "запись = нет", без всякой возможности это разрешить.
           // Кэшировать write-результаты не нужно (не идемпотентные операции) и
           // повторять из кэша при сбое сети тоже нельзя — просто пробрасываем ошибку.
-          return rpcCall(remoteHost, channel, payload, 10000, clientInfo, serverToken);
+          return rpcCall(remoteHost, channel, payload, rpcTimeout, clientInfo, serverToken);
         }
         try {
-          const result = await rpcCall(remoteHost, channel, payload, 10000, clientInfo, serverToken);
+          const result = await rpcCall(remoteHost, channel, payload, rpcTimeout, clientInfo, serverToken);
           saveToCache(channel, payload, result); // свежий успешный ответ — обновляем локальный кэш
           return result;
         } catch (err) {

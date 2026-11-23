@@ -10,6 +10,8 @@
   "scripts": {
     "postinstall": "electron-rebuild -f -w better-sqlite3",
     "start": "electron .",
+    "test:invoices": "node tests/invoice-parser.test.js && node tests/invoices-db.test.js",
+    "test:invoices-electron": "electron tests/electron/invoice-smoke.js",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:win:portable": "electron-builder --win portable",
@@ -24,6 +26,7 @@
   "dependencies": {
     "better-sqlite3": "^11.3.0",
     "konva": "^10.3.1",
+    "pdfjs-dist": "5.4.530",
     "xlsx": "^0.18.5"
   },
   "build": {
@@ -31,7 +34,12 @@
     "productName": "NetworkMap",
     "files": [
       "src/**/*",
-      "package.json"
+      "package.json",
+      "!node_modules/pdfjs-dist/{build,web,image_decoders,types,wasm,iccs}/**",
+      "!node_modules/pdfjs-dist/legacy/{web,image_decoders}/**",
+      "!node_modules/pdfjs-dist/**/*.{map,d.mts,d.ts}",
+      "!node_modules/pdfjs-dist/legacy/build/{pdf.min.mjs,pdf.worker.min.mjs,pdf.sandbox*.mjs}",
+      "!node_modules/@napi-rs/**"
     ],
     "directories": {
       "output": "dist"

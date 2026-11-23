@@ -14,6 +14,8 @@ function initTabs() {
       // Реестр ПО собирается из двух источников (установки на устройствах + склад) и
       // мог устареть, пока вкладка была закрыта — например, после правок с хоста
       if (btn.dataset.tab === 'software') renderSoftwareRegistry();
+      // Реестр счетов (задача #8, src/renderer/invoices.js) — свежий список при каждом открытии
+      if (btn.dataset.tab === 'invoices') renderInvoices();
     });
   });
 }
@@ -7822,6 +7824,7 @@ window.addEventListener('api-error', (e) => {
       fillWarehouseDragList();
       renderSoftwareRegistry();
     }
+    if (changes.some((change) => change.entity_type === 'invoice')) renderInvoices();
     const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
     if (activeTab === 'network') renderNetworkTab();
     if (activeTab === 'audit') loadAuditLog();

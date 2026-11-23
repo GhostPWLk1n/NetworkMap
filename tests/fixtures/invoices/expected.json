@@ -1,0 +1,695 @@
+{
+  "invoice-3pages.pdf": {
+    "number": "ВТ-2026/1187",
+    "invoice_date": "2026-11-12",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "410075.00",
+    "vat_amount": "68345.83",
+    "amount_due": "410075.00",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "NB-1450",
+        "name": "Ноутбук Вымышленный Pro 14, 16 ГБ ОЗУ, SSD 512 ГБ",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "84500.00",
+        "amount": "253500.00"
+      },
+      {
+        "code": "MN-2701",
+        "name": "Монитор 27\" Условный IPS 2560x1440",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "23990.00",
+        "amount": "71970.00"
+      },
+      {
+        "code": "SW-OS-11",
+        "name": "Лицензия операционной системы, бессрочная, электронная поставка",
+        "quantity": "3",
+        "unit": "лиц",
+        "price": "17800.00",
+        "amount": "53400.00"
+      },
+      {
+        "code": "SW-AV-1Y",
+        "name": "Антивирус Пример на 1 год, продление",
+        "quantity": "10",
+        "unit": "лиц",
+        "price": "1450.50",
+        "amount": "14505.00"
+      },
+      {
+        "code": "SRV-SET",
+        "name": "Настройка рабочих мест и перенос данных",
+        "quantity": "6",
+        "unit": "ч",
+        "price": "2200.00",
+        "amount": "13200.00"
+      },
+      {
+        "code": null,
+        "name": "Доставка до склада покупателя",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "3500.00",
+        "amount": "3500.00"
+      }
+    ],
+    "items_declared": 6,
+    "expected_warnings": [],
+    "pages": 3
+  },
+  "invoice-long-table.pdf": {
+    "number": "2026-0450",
+    "invoice_date": "2026-11-03",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "1959083.75",
+    "vat_amount": "326513.96",
+    "amount_due": "1959083.75",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "SRV-R740",
+        "name": "Сервер стоечный Условный R740, 2×CPU, 256 ГБ ОЗУ, без дисков, с салазками и кабелем управления",
+        "quantity": "1",
+        "unit": "шт",
+        "price": "612000.00",
+        "amount": "612000.00"
+      },
+      {
+        "code": "SSD-3840",
+        "name": "Накопитель SSD 3,84 ТБ SAS для сервера",
+        "quantity": "8",
+        "unit": "шт",
+        "price": "41250.00",
+        "amount": "330000.00"
+      },
+      {
+        "code": "UPS-3000",
+        "name": "Источник бесперебойного питания 3000 ВА, стоечный",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "96400.00",
+        "amount": "192800.00"
+      },
+      {
+        "code": "SW-48P",
+        "name": "Коммутатор управляемый 48 портов PoE+, 4 порта SFP+",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "128900.00",
+        "amount": "257800.00"
+      },
+      {
+        "code": "PATCH-1M",
+        "name": "Патч-корд медный категории 6, 1 метр",
+        "quantity": "96",
+        "unit": "шт",
+        "price": "145.00",
+        "amount": "13920.00"
+      },
+      {
+        "code": "PATCH-3M",
+        "name": "Патч-корд медный категории 6, 3 метра",
+        "quantity": "48",
+        "unit": "шт",
+        "price": "210.00",
+        "amount": "10080.00"
+      },
+      {
+        "code": "RACK-42U",
+        "name": "Шкаф телекоммуникационный напольный 42U 600×1000",
+        "quantity": "1",
+        "unit": "шт",
+        "price": "74300.00",
+        "amount": "74300.00"
+      },
+      {
+        "code": "PDU-16",
+        "name": "Блок распределения питания 16 розеток",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "9850.00",
+        "amount": "19700.00"
+      },
+      {
+        "code": "SW-VIRT",
+        "name": "Лицензия платформы виртуализации на 2 процессора, подписка на 1 год",
+        "quantity": "1",
+        "unit": "лиц",
+        "price": "187000.00",
+        "amount": "187000.00"
+      },
+      {
+        "code": "SW-BKP",
+        "name": "Лицензия системы резервного копирования на 10 виртуальных машин",
+        "quantity": "1",
+        "unit": "лиц",
+        "price": "93500.00",
+        "amount": "93500.00"
+      },
+      {
+        "code": "SW-MON",
+        "name": "Подписка на систему мониторинга, 50 узлов, 12 месяцев",
+        "quantity": "1",
+        "unit": "лиц",
+        "price": "48000.00",
+        "amount": "48000.00"
+      },
+      {
+        "code": "SRV-MNT",
+        "name": "Монтаж оборудования в шкаф и коммутация",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "35000.00",
+        "amount": "35000.00"
+      },
+      {
+        "code": "SRV-CFG",
+        "name": "Настройка виртуализации и резервного копирования",
+        "quantity": "16",
+        "unit": "ч",
+        "price": "3500.00",
+        "amount": "56000.00"
+      },
+      {
+        "code": "SRV-DOC",
+        "name": "Подготовка исполнительной документации",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "15000.00",
+        "amount": "15000.00"
+      },
+      {
+        "code": "KB-RU",
+        "name": "Клавиатура проводная, русская раскладка",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "890.50",
+        "amount": "4452.50"
+      },
+      {
+        "code": "MS-OPT",
+        "name": "Мышь оптическая проводная",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "450.25",
+        "amount": "2251.25"
+      },
+      {
+        "code": "HDMI-2",
+        "name": "Кабель HDMI 2 метра",
+        "quantity": "4",
+        "unit": "шт",
+        "price": "320.00",
+        "amount": "1280.00"
+      },
+      {
+        "code": null,
+        "name": "Доставка и подъём на этаж",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "6000.00",
+        "amount": "6000.00"
+      }
+    ],
+    "items_declared": 18,
+    "expected_warnings": [],
+    "pages": 3
+  },
+  "invoice-vat-columns.pdf": {
+    "number": "INV-77/26",
+    "invoice_date": "2026-11-05",
+    "supplier_name": "ИП Примеров Пример Примерович",
+    "supplier_inn": "771234567859",
+    "supplier_kpp": null,
+    "buyer_name": "АО «Условный Завод»",
+    "buyer_inn": "6602007893",
+    "buyer_kpp": "660201001",
+    "currency": "USD",
+    "total_amount": "2898.00",
+    "vat_amount": "579.60",
+    "amount_due": "3477.60",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "LIC-DB-1",
+        "name": "Подписка на СУБД, 1 ядро, 12 месяцев",
+        "quantity": "4",
+        "unit": "лиц",
+        "price": "350.00",
+        "amount": "1680.00",
+        "vat_rate": "20%",
+        "vat_amount": "280.00"
+      },
+      {
+        "code": "LIC-IDE",
+        "name": "Подписка на среду разработки",
+        "quantity": "2",
+        "unit": "лиц",
+        "price": "149.00",
+        "amount": "357.60",
+        "vat_rate": "20%",
+        "vat_amount": "59.60"
+      },
+      {
+        "code": "SUP-STD",
+        "name": "Техническая поддержка, стандарт",
+        "quantity": "1",
+        "unit": "мес",
+        "price": "1200.00",
+        "amount": "1440.00",
+        "vat_rate": "20%",
+        "vat_amount": "240.00"
+      }
+    ],
+    "items_declared": null,
+    "expected_warnings": [],
+    "pages": 1
+  },
+  "invoice-mismatch.pdf": {
+    "number": "15",
+    "invoice_date": "2026-10-20",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "31800.00",
+    "vat_amount": null,
+    "amount_due": "31800.00",
+    "vat_note": "Без налога (НДС)",
+    "items": [
+      {
+        "code": "CAB-UTP",
+        "name": "Кабель витая пара, бухта 305 м",
+        "quantity": "2",
+        "unit": "бух",
+        "price": "9800.00",
+        "amount": "19600.00"
+      },
+      {
+        "code": "RJ45-100",
+        "name": "Коннектор RJ-45, упаковка 100 шт",
+        "quantity": "3",
+        "unit": "уп",
+        "price": "650.00",
+        "amount": "1960.00"
+      },
+      {
+        "code": null,
+        "name": "Прокладка кабеля, за метр",
+        "quantity": "120",
+        "unit": "м",
+        "price": "85.00",
+        "amount": "10200.00"
+      }
+    ],
+    "items_declared": 3,
+    "expected_warnings": [
+      "line_amount",
+      "items_total"
+    ],
+    "pages": 1
+  },
+  "invoice-scan.pdf": {
+    "no_text_layer": true,
+    "pages": 1
+  },
+  "invoice-1c-centered.pdf": {
+    "number": "0001-77",
+    "invoice_date": "2026-12-01",
+    "supplier_name": "ИП Примеров Пример Примерович",
+    "supplier_inn": "771234567859",
+    "supplier_kpp": null,
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "81346.00",
+    "vat_amount": null,
+    "amount_due": "81346.00",
+    "vat_note": "НДС не облагается",
+    "items": [
+      {
+        "code": null,
+        "name": "Картридж лазерный совместимый (партия 1)",
+        "quantity": "1",
+        "unit": "шт",
+        "price": "4.00",
+        "amount": "4.00"
+      },
+      {
+        "code": null,
+        "name": "Бумага офисная А4, 500 листов (партия 2)",
+        "quantity": "2",
+        "unit": "пач",
+        "price": "389.90",
+        "amount": "779.80"
+      },
+      {
+        "code": null,
+        "name": "Заправка картриджа (партия 3)",
+        "quantity": "3",
+        "unit": null,
+        "price": "650.00",
+        "amount": "1950.00"
+      },
+      {
+        "code": null,
+        "name": "Флеш-накопитель 64 ГБ (партия 4)",
+        "quantity": "4",
+        "unit": "шт",
+        "price": "719.00",
+        "amount": "2876.00"
+      },
+      {
+        "code": null,
+        "name": "Гарнитура USB с микрофоном (партия 5)",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "2450.00",
+        "amount": "12250.00"
+      },
+      {
+        "code": null,
+        "name": "Удлинитель сетевой 5 розеток, 3 м (партия 6)",
+        "quantity": "1",
+        "unit": "шт",
+        "price": "980.00",
+        "amount": "980.00"
+      },
+      {
+        "code": null,
+        "name": "Веб-камера Full HD (партия 7)",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "3290.00",
+        "amount": "6580.00"
+      },
+      {
+        "code": null,
+        "name": "Батарейки AA, упаковка 4 шт (партия 8)",
+        "quantity": "3",
+        "unit": "уп",
+        "price": "310.00",
+        "amount": "930.00"
+      },
+      {
+        "code": null,
+        "name": "Картридж лазерный совместимый (партия 9)",
+        "quantity": "4",
+        "unit": "шт",
+        "price": "4.00",
+        "amount": "16.00"
+      },
+      {
+        "code": null,
+        "name": "Бумага офисная А4, 500 листов (партия 10)",
+        "quantity": "5",
+        "unit": "пач",
+        "price": "389.90",
+        "amount": "1949.50"
+      },
+      {
+        "code": null,
+        "name": "Заправка картриджа (партия 11)",
+        "quantity": "1",
+        "unit": null,
+        "price": "650.00",
+        "amount": "650.00"
+      },
+      {
+        "code": null,
+        "name": "Флеш-накопитель 64 ГБ (партия 12)",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "719.00",
+        "amount": "1438.00"
+      },
+      {
+        "code": null,
+        "name": "Гарнитура USB с микрофоном (партия 13)",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "2450.00",
+        "amount": "7350.00"
+      },
+      {
+        "code": null,
+        "name": "Удлинитель сетевой 5 розеток, 3 м (партия 14)",
+        "quantity": "4",
+        "unit": "шт",
+        "price": "980.00",
+        "amount": "3920.00"
+      },
+      {
+        "code": null,
+        "name": "Веб-камера Full HD (партия 15)",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "3290.00",
+        "amount": "16450.00"
+      },
+      {
+        "code": null,
+        "name": "Батарейки AA, упаковка 4 шт (партия 16)",
+        "quantity": "1",
+        "unit": "уп",
+        "price": "310.00",
+        "amount": "310.00"
+      },
+      {
+        "code": null,
+        "name": "Картридж лазерный совместимый (партия 17)",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "4.00",
+        "amount": "8.00"
+      },
+      {
+        "code": null,
+        "name": "Бумага офисная А4, 500 листов (партия 18)",
+        "quantity": "3",
+        "unit": "пач",
+        "price": "389.90",
+        "amount": "1169.70"
+      },
+      {
+        "code": null,
+        "name": "Заправка картриджа (партия 19)",
+        "quantity": "4",
+        "unit": null,
+        "price": "650.00",
+        "amount": "2600.00"
+      },
+      {
+        "code": null,
+        "name": "Флеш-накопитель 64 ГБ (партия 20)",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "719.00",
+        "amount": "3595.00"
+      },
+      {
+        "code": null,
+        "name": "Гарнитура USB с микрофоном (партия 21)",
+        "quantity": "1",
+        "unit": "шт",
+        "price": "2450.00",
+        "amount": "2450.00"
+      },
+      {
+        "code": null,
+        "name": "Удлинитель сетевой 5 розеток, 3 м (партия 22)",
+        "quantity": "2",
+        "unit": "шт",
+        "price": "980.00",
+        "amount": "1960.00"
+      },
+      {
+        "code": null,
+        "name": "Веб-камера Full HD (партия 23)",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "3290.00",
+        "amount": "9870.00"
+      },
+      {
+        "code": null,
+        "name": "Батарейки AA, упаковка 4 шт (партия 24)",
+        "quantity": "4",
+        "unit": "уп",
+        "price": "310.00",
+        "amount": "1240.00"
+      },
+      {
+        "code": null,
+        "name": "Картридж лазерный совместимый (партия 25)",
+        "quantity": "5",
+        "unit": "шт",
+        "price": "4.00",
+        "amount": "20.00"
+      }
+    ],
+    "items_declared": 25,
+    "expected_warnings": [],
+    "pages": 2
+  },
+  "invoice-wordwise.pdf": {
+    "number": "ВТ-2026/1187",
+    "invoice_date": "2026-11-12",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "410075.00",
+    "vat_amount": "68345.83",
+    "amount_due": "410075.00",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "NB-1450",
+        "name": "Ноутбук Вымышленный Pro 14, 16 ГБ ОЗУ, SSD 512 ГБ",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "84500.00",
+        "amount": "253500.00"
+      },
+      {
+        "code": "MN-2701",
+        "name": "Монитор 27\" Условный IPS 2560x1440",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "23990.00",
+        "amount": "71970.00"
+      },
+      {
+        "code": "SW-OS-11",
+        "name": "Лицензия операционной системы, бессрочная, электронная поставка",
+        "quantity": "3",
+        "unit": "лиц",
+        "price": "17800.00",
+        "amount": "53400.00"
+      },
+      {
+        "code": "SW-AV-1Y",
+        "name": "Антивирус Пример на 1 год, продление",
+        "quantity": "10",
+        "unit": "лиц",
+        "price": "1450.50",
+        "amount": "14505.00"
+      },
+      {
+        "code": "SRV-SET",
+        "name": "Настройка рабочих мест и перенос данных",
+        "quantity": "6",
+        "unit": "ч",
+        "price": "2200.00",
+        "amount": "13200.00"
+      },
+      {
+        "code": null,
+        "name": "Доставка до склада покупателя",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "3500.00",
+        "amount": "3500.00"
+      }
+    ],
+    "items_declared": 6,
+    "expected_warnings": [],
+    "pages": 3
+  },
+  "invoice-cid-no-tounicode.pdf": {
+    "number": "ВТ-2026/1187",
+    "invoice_date": "2026-11-12",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "410075.00",
+    "vat_amount": "68345.83",
+    "amount_due": "410075.00",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "NB-1450",
+        "name": "Ноутбук Вымышленный Pro 14, 16 ГБ ОЗУ, SSD 512 ГБ",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "84500.00",
+        "amount": "253500.00"
+      },
+      {
+        "code": "MN-2701",
+        "name": "Монитор 27\" Условный IPS 2560x1440",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "23990.00",
+        "amount": "71970.00"
+      },
+      {
+        "code": "SW-OS-11",
+        "name": "Лицензия операционной системы, бессрочная, электронная поставка",
+        "quantity": "3",
+        "unit": "лиц",
+        "price": "17800.00",
+        "amount": "53400.00"
+      },
+      {
+        "code": "SW-AV-1Y",
+        "name": "Антивирус Пример на 1 год, продление",
+        "quantity": "10",
+        "unit": "лиц",
+        "price": "1450.50",
+        "amount": "14505.00"
+      },
+      {
+        "code": "SRV-SET",
+        "name": "Настройка рабочих мест и перенос данных",
+        "quantity": "6",
+        "unit": "ч",
+        "price": "2200.00",
+        "amount": "13200.00"
+      },
+      {
+        "code": null,
+        "name": "Доставка до склада покупателя",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "3500.00",
+        "amount": "3500.00"
+      }
+    ],
+    "items_declared": 6,
+    "expected_warnings": [],
+    "pages": 3
+  },
+  "invoice-unreadable.pdf": {
+    "pages": 3,
+    "unreadable": true
+  }
+}
