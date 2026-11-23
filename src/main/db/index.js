@@ -1332,12 +1332,20 @@ function diffBitrixFields(localUser, profile) {
   });
 }
 
-function bitrixFingerprint(bitrixId, target, changes) {
+/** Отпечаток всего, что оператор видел перед сохранением. Кроме изменений полей сюда
+ *  входит то, что показывается, но в карточку не пишется: активность (иначе профиль,
+ *  ставший неактивным после предпросмотра, сохранился бы без предупреждения), остальные
+ *  предупреждения, ID подразделений и источник телефона. */
+function bitrixFingerprint(bitrixId, target, changes, profile, warnings) {
   const canonical = JSON.stringify({
-    v: 1,
+    v: 2,
     bitrixId,
     target: { mode: target.mode, userId: target.userId || null },
-    changes: changes.map((c) => [c.field, c.from, c.to, c.action])
+    changes: changes.map((c) => [c.field, c.from, c.to, c.action]),
+    active: profile.active === undefined ? null : profile.active,
+    warnings: [...warnings].sort(),
+    departmentIds: [...(profile.departmentIds || [])],
+    phoneSource: profile.phoneSource || null
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
@@ -1430,12 +1438,12 @@ function buildBitrixPlan(profile, requestedTarget) {
   } else {
     plan.canApply = true;
   }
-  plan.fingerprint = bitrixFingerprint(bitrixId, plan.target, plan.changes);
+  plan.fingerprint = bitrixFingerprint(bitrixId, plan.target, plan.changes, profile, warnings);
   return plan;
 }
 
 function staleBitrixPreview() {
-  return new Error('Данные изменились после предпросмотра (в Битрикс24, в карточке или в связи с ней). ' +
+  return new Error('Данные изменились после предпросмотра (в Битрикс24 — включая активность сотрудника, в карточке или в связи с ней). ' +
     'Нажмите «Найти» ещё раз и проверьте изменения перед сохранением.');
 }
 

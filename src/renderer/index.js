@@ -714,14 +714,28 @@ async function bitrixRequestPreview(bitrixId, target, busyLabel) {
   }
 }
 
+/** Аннулирует показанный предпросмотр: сохранить по нему больше нельзя, пока не будет
+ *  нового успешного поиска и выбора карточки. Вызывается при ЛЮБОЙ правке поля ID и при
+ *  отказе проверки ввода — иначе в окне мог остаться «живой» предпросмотр прошлого
+ *  сотрудника, и кнопка сохранила бы его данные при другом ID в поле. Ответы на запросы,
+ *  которые ещё в пути, тоже отбрасываются (requestSeq). */
+function bitrixInvalidatePreview() {
+  bitrixUi.requestSeq++;
+  bitrixUi.bitrixId = null;
+  bitrixUi.preview = null;
+  bitrixUi.choice = null;
+  bitrixEl('bitrix-result').classList.add('hidden');
+  bitrixEl('bitrix-apply-btn').disabled = true;
+  bitrixSetBusy(false);
+}
+
 function bitrixSearch() {
   const raw = bitrixEl('bitrix-id-input').value.trim();
+  bitrixInvalidatePreview(); // новый поиск — прошлый предпросмотр и выбор карточки больше не действуют
   if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
-    bitrixEl('bitrix-result').classList.add('hidden');
     bitrixSetStatus('Введите ID сотрудника — целое положительное число (его видно в адресе профиля в Битрикс24).', 'error');
     return;
   }
-  bitrixUi.choice = null; // новый поиск — выбор карточки делается заново
   bitrixRequestPreview(Number(raw), null, 'Запрашиваю профиль в Битрикс24…');
 }
 
@@ -953,6 +967,13 @@ function renderBitrixChanges(p) {
 async function bitrixApply() {
   const p = bitrixUi.preview;
   if (!p || !p.canApply) return;
+  // Вторая линия защиты: сохраняем только сотрудника, ID которого сейчас в поле. Правка
+  // поля и так аннулирует предпросмотр, но расхождение здесь не должно дойти до записи.
+  if (bitrixEl('bitrix-id-input').value.trim() !== String(bitrixUi.bitrixId)) {
+    bitrixInvalidatePreview();
+    bitrixSetStatus('ID в поле изменился — нажмите «Найти», чтобы проверить этого сотрудника.', 'error');
+    return;
+  }
   const seq = ++bitrixUi.requestSeq;
   bitrixSetBusy(true, 'Сохраняю…');
   try {
@@ -984,6 +1005,13 @@ async function bitrixApply() {
 
 bitrixEl('bitrix-sync-btn').addEventListener('click', () => openBitrixModal());
 bitrixEl('bitrix-search-form').addEventListener('submit', (e) => { e.preventDefault(); bitrixSearch(); });
+bitrixEl('bitrix-id-input').addEventListener('input', () => {
+  // Предпросмотр относится к конкретному ID — после любой правки поля он недействителен.
+  // Подсказку «нажмите Найти» показываем, только если было что аннулировать.
+  const hadPreview = !!(bitrixUi.preview || bitrixUi.bitrixId);
+  bitrixInvalidatePreview();
+  bitrixSetStatus(hadPreview ? 'ID изменён — нажмите «Найти».' : '');
+});
 bitrixEl('bitrix-apply-btn').addEventListener('click', bitrixApply);
 bitrixEl('bitrix-cancel-btn').addEventListener('click', closeBitrixModal);
 bitrixEl('bitrix-modal').addEventListener('keydown', (e) => { if (e.key === 'Escape') closeBitrixModal(); });

@@ -100,6 +100,13 @@ function configCandidates(ctx = {}) {
   return [...new Set(list.map((p) => path.resolve(p)))];
 }
 
+/** Адрес этой же машины. Только для него допустим обычный HTTP: запрос не выходит в
+ *  сеть (так устроены проверки с фиктивным порталом). */
+function isLoopbackHost(hostname) {
+  const h = String(hostname || '').toLowerCase();
+  return h === 'localhost' || h === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
 function normalizeWebhookUrl(raw) {
   if (!raw) {
     throw new BitrixError('config_invalid', 'В bitrix.yml не заполнено поле webhook_url.');
@@ -114,6 +121,13 @@ function normalizeWebhookUrl(raw) {
   const shapeHint = 'webhook_url в bitrix.yml должен иметь вид https://<портал>/rest/<ID пользователя>/<ключ>/';
   if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:')) {
     throw new BitrixError('config_invalid', `${shapeHint}.`);
+  }
+  // Ключ вебхука — часть адреса, поэтому по обычному HTTP он уходил бы в сеть открытым
+  // текстом. Исключение — только адрес этой же машины.
+  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+    throw new BitrixError('config_insecure',
+      'webhook_url в bitrix.yml должен начинаться с https:// — ключ вебхука передаётся в самом адресе, ' +
+      'и по обычному HTTP его видно в сети.');
   }
   if (url.search || url.hash || url.username || url.password) {
     throw new BitrixError('config_invalid', `${shapeHint} — без параметров после «?» и «#».`);
