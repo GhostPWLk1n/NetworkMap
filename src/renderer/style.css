@@ -810,3 +810,22 @@ button:hover { background: #eaeaea; }
 .invoice-box button.primary, #invoices-upload-btn.primary { font-weight: 600; border-color: #888; background: #e9e9e9; }
 .invoice-box button:disabled { opacity: 0.55; cursor: default; }
 .invoice-box .danger-btn { color: #b3261e; border-color: #e3a29c; }
+
+/* --- Мастер «Настроить Битрикс24» (задача #11) --- */
+#bitrix-setup-modal { z-index: 250; } /* поверх окна настроек БД и окна синхронизации */
+.bitrix-box .modal-actions .spacer { flex: 1; }
+.bitrix-setup-link { font-size: 12px; }
+.bitrix-setup-steps { margin: 0 0 12px; padding-left: 20px; font-size: 13px; line-height: 1.45; }
+.bitrix-setup-steps li { margin-bottom: 12px; }
+.bitrix-setup-steps label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; }
+.bitrix-setup-box input { margin-bottom: 4px; }
+.bitrix-setup-box .bitrix-search-row input { margin-bottom: 0; flex: 1; }
+.bitrix-setup-hint { font-size: 11px; color: #888; }
+.bitrix-setup-client { font-size: 13px; line-height: 1.5; margin-bottom: 12px; }
+.bitrix-setup-client.hidden, .bitrix-setup-result.hidden, #bitrix-setup-body.hidden { display: none; }
+.bitrix-setup-result { border: 1px solid #e3e3e3; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
+.bitrix-setup-result ul { margin: 4px 0; padding-left: 18px; }
+.bitrix-setup-result .ok { color: #1d6b3d; }
+.bitrix-setup-result .bad { color: #8a1f17; }
+.bitrix-setup-result .unknown { color: #7a5a00; }
+.bitrix-status.warning { background: #fff8e1; color: #6d5200; border: 1px solid #f0dc9a; }

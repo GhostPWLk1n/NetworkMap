@@ -300,12 +300,13 @@ function networkError(err, timeoutMs) {
     `Не удалось связаться с Битрикс24${code ? ` (${code})` : ''}: нет сети или неверный адрес портала в webhook_url.`);
 }
 
-/** Один вызов user.get → разобранный ответ { result: [...], next?, total? }. Все ошибки —
- *  BitrixError с заранее известным текстом. */
-async function callUserGet(config, params) {
+/** Один вызов метода REST → разобранный ответ { result, next?, total? }. Все ошибки —
+ *  BitrixError с заранее известным текстом. Методы — только фиксированные методы чтения
+ *  из этого модуля (user.get, user.fields, scope). */
+async function callMethod(config, method, params) {
   let res;
   try {
-    res = await fetch(`${config.webhookUrl}user.get.json`, {
+    res = await fetch(`${config.webhookUrl}${method}.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(params),
@@ -329,7 +330,16 @@ async function callUserGet(config, params) {
 
   if (body && body.error) throw apiError(body.error, res.status);
   if (!res.ok) throw httpError(res.status);
-  if (!body || !Array.isArray(body.result)) {
+  if (!body || body.result === undefined) {
+    throw new BitrixError('bad_response', 'Ответ Битрикс24 не распознан — проверьте, что webhook_url указывает на портал Битрикс24.');
+  }
+  return body;
+}
+
+/** user.get → ответ, у которого result — список. */
+async function callUserGet(config, params) {
+  const body = await callMethod(config, 'user.get', params);
+  if (!Array.isArray(body.result)) {
     throw new BitrixError('bad_response', 'Ответ Битрикс24 не распознан — проверьте, что webhook_url указывает на портал Битрикс24.');
   }
   return body;
@@ -490,6 +500,151 @@ async function searchBitrixUsers(rawQuery, start = 0, ctx = {}) {
   }
 }
 
+// ------------------------------------------------------------
+// Мастер подключения (задача #11): адрес портала, ссылка вебхука, проверка, запись
+// ------------------------------------------------------------
+
+/** Адрес портала из поля мастера → «host[:port]» в нижнем регистре. Принимает и
+ *  «company.bitrix24.ru», и «https://company.bitrix24.ru/…». */
+function normalizePortalHost(raw) {
+  let text = String(raw == null ? '' : raw).trim();
+  if (!text) throw new BitrixError('portal_empty', 'Укажите адрес портала Битрикс24, например company.bitrix24.ru.');
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) text = `https://${text}`;
+  let url;
+  try { url = new URL(text); } catch { url = null; }
+  const host = url ? url.host.toLowerCase() : '';
+  const okShape = /^[a-z0-9.-]+(:\d{1,5})?$/.test(host) && (host.includes('.') || isLoopbackHost(url.hostname));
+  if (!url || !okShape || url.username || url.password) {
+    throw new BitrixError('portal_invalid', 'Адрес портала указан неверно — нужен домен вида company.bitrix24.ru.');
+  }
+  return host;
+}
+
+/**
+ * Ссылка из поля мастера → базовый адрес вебхука «https://портал/rest/<ID>/<ключ>/».
+ * Принимает и базовую ссылку, и ссылку из генератора запросов — с методом в конце
+ * (…/user.get.json) и параметрами после «?». Домен должен совпасть с указанным
+ * порталом. Текст ссылки ни в одном сообщении не повторяется: в нём ключ.
+ */
+function normalizeWebhookInput(raw, portalHost) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) throw new BitrixError('input_empty', 'Вставьте ссылку «Вебхук для вызова REST API» со страницы вебхука.');
+  let url;
+  try { url = new URL(text); } catch { url = null; }
+  const shape = 'Это не ссылка вебхука. Скопируйте поле «Вебхук для вызова REST API» — она выглядит как https://<портал>/rest/<число>/<ключ>/.';
+  if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) {
+    throw new BitrixError('input_invalid', shape);
+  }
+  if (url.protocol === 'http:' && !isLoopbackHost(url.hostname)) {
+    throw new BitrixError('input_insecure', 'Ссылка должна начинаться с https:// — ключ вебхука передаётся в самом адресе.');
+  }
+  const m = /^\/rest\/(\d{1,10})\/([A-Za-z0-9_-]{4,128})(?:\/.*)?$/.exec(url.pathname);
+  if (!m) throw new BitrixError('input_invalid', shape);
+  if (portalHost && url.host.toLowerCase() !== String(portalHost).toLowerCase()) {
+    throw new BitrixError('input_other_domain',
+      `Ссылка ведёт на другой домен, а не на портал ${portalHost}. Проверьте адрес портала или скопируйте ссылку с нужного портала.`);
+  }
+  return `${url.protocol}//${url.host.toLowerCase()}/rest/${m[1]}/${m[2]}/`;
+}
+
+const CHECK_FIELDS = ['EMAIL', 'WORK_PHONE', 'UF_WEB_SITES'];
+
+/**
+ * Проверка доступа по ссылке до записи в bitrix.yml: читает ли вебхук пользователей и
+ * есть ли на портале нужные поля. Три фиксированных метода чтения:
+ *  - user.get (только ID одного активного сотрудника) — право читать пользователей;
+ *  - user.fields — какие поля профиля доступны (наличие значения у конкретного
+ *    сотрудника — отдельный вопрос, его здесь не проверяем);
+ *  - scope — права вебхука, чтобы назвать причину (user_brief вместо user_basic).
+ * → { readUsers, scopes, fields: { EMAIL, WORK_PHONE, UF_WEB_SITES }, problems, warnings, canSave }
+ */
+async function checkWebhookAccess(webhookUrl, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const config = { webhookUrl, timeoutMs };
+  try {
+    await callUserGet(config, { filter: { ACTIVE: true }, select: ['ID'], start: 0 });
+    let scopes = null;
+    try {
+      const sc = await callMethod(config, 'scope', {});
+      if (Array.isArray(sc.result)) scopes = sc.result.filter((x) => typeof x === 'string' && /^[a-z0-9_.]{1,40}$/i.test(x));
+    } catch { scopes = null; } // метод scope есть не везде — без него просто не назовём права
+    let available = null;
+    try {
+      const uf = await callMethod(config, 'user.fields', {});
+      if (uf.result && typeof uf.result === 'object') available = new Set(Object.keys(uf.result));
+    } catch { available = null; }
+    const fields = {};
+    CHECK_FIELDS.forEach((f) => { fields[f] = available ? available.has(f) : null; });
+    const problems = [];
+    const warnings = [];
+    const briefOnly = scopes && scopes.includes('user_brief') && !scopes.includes('user_basic') && !scopes.includes('user');
+    if (briefOnly || fields.EMAIL === false || fields.WORK_PHONE === false) {
+      problems.push(briefOnly
+        ? 'У вебхука право «Пользователи (краткое)» — user_brief: email и телефон недоступны. Создайте вебхук с правом «Пользователи (базовое)» — user_basic.'
+        : 'Поля EMAIL и WORK_PHONE недоступны этому вебхуку. Нужно право «Пользователи (базовое)» — user_basic.');
+    }
+    if (available === null) warnings.push('Портал не вернул список полей (user.fields) — доступность полей не проверена.');
+    else if (fields.UF_WEB_SITES === false) warnings.push('Поля «Другие сайты» (UF_WEB_SITES) на портале нет — номер ПК из Битрикс24 не будет заполняться.');
+    return { readUsers: true, scopes, fields, problems, warnings, canSave: problems.length === 0 };
+  } catch (err) {
+    if (err instanceof BitrixError) {
+      err.message = redactSecrets(err.message, webhookUrl);
+      throw err;
+    }
+    throw new BitrixError('internal', `Проверка не выполнена: ${redactSecrets(err && err.message, webhookUrl)}`);
+  }
+}
+
+/** Новый текст bitrix.yml: заменяет (или добавляет) webhook_url, остальные строки —
+ *  timeout_ms, комментарии — сохраняются как были. */
+function upsertWebhookInYaml(text, webhookUrl) {
+  const line = `webhook_url: "${webhookUrl}"`;
+  if (!text) {
+    return `# Подключение к Битрикс24 (входящий вебхук с правом user_basic).\n# Записано мастером «Настроить Битрикс24». Ключ — в адресе: не публикуйте этот файл.\n${line}\n`;
+  }
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const eol = text.includes('\r\n') ? '\r\n' : '\n';
+  const lines = text.slice(bom.length).split(/\r?\n/);
+  let replaced = false;
+  const out = lines.map((l) => {
+    if (!replaced && /^webhook_url\s*:/.test(l)) { replaced = true; return line; }
+    if (replaced && /^webhook_url\s*:/.test(l)) return null; // дубль ключа — оставляем один
+    return l;
+  }).filter((l) => l !== null);
+  if (!replaced) {
+    if (out.length && out[out.length - 1] === '') out.splice(out.length - 1, 0, line);
+    else out.push(line);
+  }
+  let result = out.join(eol);
+  if (!result.endsWith(eol)) result += eol;
+  return bom + result;
+}
+
+/** Куда мастер запишет bitrix.yml: тот же порядок, что при чтении. NM_BITRIX_CONFIG —
+ *  только он; иначе — уже действующий файл; иначе — первый вариант (рядом с базой). */
+function resolveConfigTarget(ctx = {}) {
+  const candidates = configCandidates(ctx);
+  const found = candidates.find((p) => { try { return fs.statSync(p).isFile(); } catch { return false; } });
+  return found || candidates[0] || null;
+}
+
+/** Состояние подключения для мастера — без адреса вебхука: только домен и путь к файлу. */
+function describeBitrixConfig(ctx = {}) {
+  const target = resolveConfigTarget(ctx);
+  try {
+    const cfg = loadBitrixConfig(ctx);
+    return { configured: true, domain: new URL(cfg.webhookUrl).host, source: cfg.source, target, error: null };
+  } catch (err) {
+    const exists = target && (() => { try { return fs.statSync(target).isFile(); } catch { return false; } })();
+    return {
+      configured: false,
+      domain: null,
+      source: exists ? target : null,
+      target,
+      error: err && err.code === 'not_configured' ? null : (err && err.message) || null
+    };
+  }
+}
+
 module.exports = {
   CONFIG_FILE_NAME,
   DEFAULT_TIMEOUT_MS,
@@ -506,5 +661,11 @@ module.exports = {
   extractPcNumber,
   normalizeSearchQuery,
   lookupBitrixUser,
-  searchBitrixUsers
+  searchBitrixUsers,
+  normalizePortalHost,
+  normalizeWebhookInput,
+  checkWebhookAccess,
+  upsertWebhookInYaml,
+  resolveConfigTarget,
+  describeBitrixConfig
 };

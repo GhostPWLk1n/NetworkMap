@@ -10,13 +10,14 @@ const {
   initDatabase, auditLogRepo, getDbReadonly, markReadonly, releaseDbLock, dbLock,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
   getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
-  getServerToken, getSourceKind,
+  getServerToken, getSourceKind, getUserDataDir,
   getAllowClientWrites, setAllowClientWrites
 } = require('./db');
 const { importExcel } = require('./import');
 const { parsePcInfoFile, parsePcInfoFolder, applyPcInfoImport } = require('./pcInfoImport');
 const { DB_CHANNELS } = require('../shared/dbChannels');
 const { registerInvoiceIpc } = require('./invoiceFiles');
+const { registerBitrixSetupIpc } = require('./bitrixSetup');
 const { startRpcServer } = require('./rpcServer');
 const { rpcCall, rpcPing, rpcDiagnose } = require('./rpcClient');
 const { publishHostMarker, updateHostMarker, removeHostMarker, readHostMarker, findActiveMarkersInDir, cleanupStaleMarkersInDir } = require('./discovery');
@@ -173,6 +174,16 @@ function registerIpcHandlers() {
   // Счета поставщиков (задача #8): выбор и разбор PDF, открытие и сохранение оригинала —
   // локально, в любом режиме. Сама запись в базу — каналы invoices:* из dbChannels.
   registerInvoiceIpc({ ipcMain, dialog, shell, getWindow: () => mainWindow });
+
+  // Мастер «Настроить Битрикс24» (задача #11): пишет bitrix.yml у процесса, владеющего
+  // базой (локально и у хоста). Только локальный IPC — ссылка вебхука в сеть не уходит.
+  registerBitrixSetupIpc({
+    ipcMain, shell,
+    getContext: () => ({
+      mode, dbPath: mode === 'client' ? null : getCurrentDbPath(), dataDir: getUserDataDir(),
+      sourceKind: mode === 'client' ? getSourceKind() : null, remoteHost: mode === 'client' ? getRemoteHost() : null
+    })
+  });
 
   if (mode === 'client') {
     const remoteHost = getRemoteHost();

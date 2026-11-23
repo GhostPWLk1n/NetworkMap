@@ -88,6 +88,14 @@ contextBridge.exposeInMainWorld('api', {
     openFile: (file) => invoke('invoices:openFile', file),
     saveFileAs: (file) => invoke('invoices:saveFileAs', file)
   },
+  // Мастер «Настроить Битрикс24» (задача #11) — локально; ссылка вебхука в окно не
+  // возвращается, «Сохранить» передаёт только идентификатор успешной проверки
+  bitrixSetup: {
+    status: () => invoke('bitrixSetup:status'),
+    openPortal: (portal) => invoke('bitrixSetup:openPortal', portal),
+    check: (portal, webhook) => invoke('bitrixSetup:check', { portal, webhook }),
+    save: (checkId) => invoke('bitrixSetup:save', { checkId })
+  },
   devices: {
     list: () => invoke('devices:list'),
     create: (payload) => invoke('devices:create', payload),
