@@ -28,7 +28,7 @@ const {
   getDbReadonly, getCurrentDbPath, getUserDataDir
 } = require('../main/db');
 const { pingHost } = require('../main/ping');
-const { lookupBitrixUser } = require('../main/bitrix');
+const { lookupBitrixUser, searchBitrixUsers } = require('../main/bitrix');
 
 /** Где искать bitrix.yml — у процесса, который владеет базой (см. bitrix.js). Эти
  *  каналы выполняются только там: клиент шлёт их по RPC на сервер или хост. */
@@ -51,6 +51,13 @@ const DB_CHANNELS = {
     noCache: true,
     fn: async ({ bitrixId, target = null } = {}) =>
       bitrixSyncRepo.preview(await lookupBitrixUser(bitrixId, bitrixContext()), target)
+  },
+  // Поиск по имени, фамилии или ФИО (задача #10): одна страница результатов за вызов
+  'bitrix:search': {
+    write: false,
+    noCache: true,
+    fn: async ({ query, start = 0 } = {}) =>
+      bitrixSyncRepo.annotateSearch(await searchBitrixUsers(query, start, bitrixContext()))
   },
   'bitrix:apply': {
     write: true,

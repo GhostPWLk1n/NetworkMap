@@ -1,8 +1,9 @@
 // bitrix.js
 //
-// Чтение профиля сотрудника из Битрикс24 — первый этап односторонней синхронизации
-// Битрикс24 → NetworkMap (задача #3). Только ЧТЕНИЕ: единственный вызываемый метод —
-// user.get. Ничего в Битрикс24 отсюда не создаётся и не меняется.
+// Чтение профиля сотрудника из Битрикс24 — односторонняя синхронизация Битрикс24 →
+// NetworkMap (задачи #3, #10). Только ЧТЕНИЕ: единственный вызываемый метод — user.get
+// (по ID и поиск по имени через filter.NAME_SEARCH). Ничего в Битрикс24 отсюда не
+// создаётся и не меняется.
 //
 // Где это выполняется. Только в процессе, который ВЛАДЕЕТ базой: локальный Electron,
 // Electron-хост или выделенный сервер. Клиент сюда не попадает никогда — его запросы
@@ -31,10 +32,15 @@ const MAX_TIMEOUT_MS = 9000;
 
 // Явный список полей для select: запрашиваем только то, что показываем и сохраняем.
 // Лишние персональные данные (дата рождения, адрес, фото) до нас просто не доходят.
+// UF_WEB_SITES — поле профиля «Другие сайты»: в нём у сотрудников записан номер ПК (#10).
 const USER_FIELDS = [
   'ID', 'ACTIVE', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'EMAIL',
-  'WORK_POSITION', 'WORK_PHONE', 'PERSONAL_MOBILE', 'WORK_DEPARTMENT', 'UF_DEPARTMENT'
+  'WORK_POSITION', 'WORK_PHONE', 'PERSONAL_MOBILE', 'WORK_DEPARTMENT', 'UF_DEPARTMENT', 'UF_WEB_SITES'
 ];
+// Для списка найденных по имени — только то, что помогает различить тёзок
+const SEARCH_FIELDS = ['ID', 'ACTIVE', 'NAME', 'LAST_NAME', 'SECOND_NAME', 'WORK_POSITION', 'WORK_DEPARTMENT', 'UF_DEPARTMENT'];
+const SEARCH_MIN_LENGTH = 2;
+const SEARCH_MAX_LENGTH = 100;
 
 /** Ошибка с заранее известным, безопасным текстом. code — для тестов и для интерфейса
  *  (например, чтобы отличить «не настроено» от «нет сети»).
@@ -294,15 +300,15 @@ function networkError(err, timeoutMs) {
     `Не удалось связаться с Битрикс24${code ? ` (${code})` : ''}: нет сети или неверный адрес портала в webhook_url.`);
 }
 
-/** Сырые поля сотрудника из user.get — только из USER_FIELDS, остальное отбрасываем. */
-async function fetchBitrixUser(config, bitrixIdRaw) {
-  const bitrixId = normalizeBitrixId(bitrixIdRaw);
+/** Один вызов user.get → разобранный ответ { result: [...], next?, total? }. Все ошибки —
+ *  BitrixError с заранее известным текстом. */
+async function callUserGet(config, params) {
   let res;
   try {
     res = await fetch(`${config.webhookUrl}user.get.json`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ filter: { ID: bitrixId }, select: USER_FIELDS }),
+      body: JSON.stringify(params),
       signal: AbortSignal.timeout(config.timeoutMs),
       // Переадресацию не выполняем: POST с ключом не должен уходить по адресу, которого
       // нет в конфигурации, а сам факт переадресации обычно значит «http вместо https»
@@ -326,6 +332,13 @@ async function fetchBitrixUser(config, bitrixIdRaw) {
   if (!body || !Array.isArray(body.result)) {
     throw new BitrixError('bad_response', 'Ответ Битрикс24 не распознан — проверьте, что webhook_url указывает на портал Битрикс24.');
   }
+  return body;
+}
+
+/** Сырые поля сотрудника из user.get — только из USER_FIELDS, остальное отбрасываем. */
+async function fetchBitrixUser(config, bitrixIdRaw) {
+  const bitrixId = normalizeBitrixId(bitrixIdRaw);
+  const body = await callUserGet(config, { filter: { ID: bitrixId }, select: USER_FIELDS });
   const raw = body.result.find((u) => u && Number(u.ID) === bitrixId);
   if (!raw) {
     throw new BitrixError('user_not_found',
@@ -352,6 +365,32 @@ function parseActive(v) {
   if (v === true || v === 'Y' || v === 'true' || v === 1 || v === '1') return true;
   if (v === false || v === 'N' || v === 'false' || v === 0 || v === '0') return false;
   return null;
+}
+
+/**
+ * Номер ПК из поля «Другие сайты» (UF_WEB_SITES): строка цифр как есть, с ведущими нулями
+ * («ПК № 0042» → «0042»). Номер берётся, только если в поле ровно одна группа цифр (одна и
+ * та же может повторяться). Пусто, нет цифр, несколько разных чисел — номера нет, и ничего
+ * не угадываем: разные числа не склеиваем, ссылки из поля не открываем.
+ * → { pcNumber, pcStatus: 'ok'|'empty'|'no_digits'|'ambiguous', pcSourceText }
+ */
+function extractPcNumber(value) {
+  let parts = [];
+  if (Array.isArray(value)) parts = value;
+  else if (value && typeof value === 'object') parts = Object.values(value);
+  else parts = [value];
+  const text = parts
+    .filter((v) => typeof v === 'string' || typeof v === 'number')
+    .map((v) => String(v).replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(' ');
+  if (!text) return { pcNumber: null, pcStatus: 'empty', pcSourceText: null };
+  // Для показа оператору — как текст, без разметки и ограниченной длины
+  const shown = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  const groups = [...new Set(text.match(/\d+/g) || [])];
+  if (groups.length === 0) return { pcNumber: null, pcStatus: 'no_digits', pcSourceText: shown };
+  if (groups.length > 1 || groups[0].length > 32) return { pcNumber: null, pcStatus: 'ambiguous', pcSourceText: shown };
+  return { pcNumber: groups[0], pcStatus: 'ok', pcSourceText: shown };
 }
 
 /**
@@ -382,7 +421,8 @@ function mapBitrixProfile(raw) {
     departmentIds,
     email: cleanText(raw.EMAIL),
     phone: workPhone || mobile || null,
-    phoneSource: workPhone ? 'WORK_PHONE' : (mobile ? 'PERSONAL_MOBILE' : null)
+    phoneSource: workPhone ? 'WORK_PHONE' : (mobile ? 'PERSONAL_MOBILE' : null),
+    ...extractPcNumber(raw.UF_WEB_SITES)
   };
 }
 
@@ -407,10 +447,54 @@ async function lookupBitrixUser(bitrixId, ctx = {}) {
   }
 }
 
+/** Текст поиска по имени: 2–100 символов, без управляющих; чисто цифры — это ID, не имя. */
+function normalizeSearchQuery(raw) {
+  const q = String(raw == null ? '' : raw).replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!q) throw new BitrixError('bad_query', 'Введите ID сотрудника, фамилию, имя или ФИО.');
+  if (/^\d+$/.test(q)) throw new BitrixError('bad_query', 'Это похоже на ID — ищите по ID.');
+  if (q.length < SEARCH_MIN_LENGTH) throw new BitrixError('bad_query', `Для поиска по имени введите хотя бы ${SEARCH_MIN_LENGTH} буквы.`);
+  if (q.length > SEARCH_MAX_LENGTH) throw new BitrixError('bad_query', `Слишком длинный запрос (больше ${SEARCH_MAX_LENGTH} символов).`);
+  return q;
+}
+
+/**
+ * Поиск сотрудников по имени, фамилии или ФИО: user.get с filter.NAME_SEARCH, одна
+ * страница за вызов (Битрикс24 отдаёт по 50). start — смещение из next прошлой страницы.
+ * → { query, items: [{ bitrixId, fullName, position, department, departmentIds, active }], next, total }
+ */
+async function searchBitrixUsers(rawQuery, start = 0, ctx = {}) {
+  const query = normalizeSearchQuery(rawQuery);
+  const offset = Number.isInteger(start) && start > 0 && start < 100000 ? start : 0;
+  const config = loadBitrixConfig(ctx);
+  try {
+    const params = { filter: { NAME_SEARCH: query }, select: SEARCH_FIELDS, sort: 'LAST_NAME', order: 'ASC' };
+    if (offset) params.start = offset;
+    const body = await callUserGet(config, params);
+    const items = body.result
+      .filter((u) => u && Number.isInteger(Number(u.ID)) && Number(u.ID) > 0)
+      .map((u) => {
+        const p = mapBitrixProfile(u);
+        return { bitrixId: p.bitrixId, fullName: p.fullName, position: p.position, department: p.department,
+          departmentIds: p.departmentIds, active: p.active };
+      });
+    const next = Number.isInteger(Number(body.next)) && Number(body.next) > offset ? Number(body.next) : null;
+    const total = Number.isInteger(Number(body.total)) ? Number(body.total) : null;
+    return { query, start: offset, items, next, total };
+  } catch (err) {
+    if (err instanceof BitrixError) {
+      err.message = redactSecrets(err.message, config.webhookUrl);
+      throw err;
+    }
+    throw new BitrixError('internal',
+      `Не удалось выполнить поиск в Битрикс24: ${redactSecrets(err && err.message, config.webhookUrl)}`);
+  }
+}
+
 module.exports = {
   CONFIG_FILE_NAME,
   DEFAULT_TIMEOUT_MS,
   USER_FIELDS,
+  SEARCH_FIELDS,
   BitrixError,
   parseSimpleYaml,
   configCandidates,
@@ -419,5 +503,8 @@ module.exports = {
   normalizeBitrixId,
   fetchBitrixUser,
   mapBitrixProfile,
-  lookupBitrixUser
+  extractPcNumber,
+  normalizeSearchQuery,
+  lookupBitrixUser,
+  searchBitrixUsers
 };

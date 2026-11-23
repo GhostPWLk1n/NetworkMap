@@ -41,7 +41,7 @@ let lastConnectWarning = null; // строка предупреждения, е�
 // { readonly, heldBy, reason, schemaMismatch?, openError? }
 let readonlyState = { readonly: false, heldBy: null, reason: null };
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
 const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
@@ -503,6 +503,7 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 19) migrateToV19();
   if (db.pragma('user_version', { simple: true }) < 20) migrateToV20();
   if (db.pragma('user_version', { simple: true }) < 21) migrateToV21();
+  if (db.pragma('user_version', { simple: true }) < 22) migrateToV22();
 }
 
 /**
@@ -1288,6 +1289,17 @@ function migrateToV21() {
   tx();
 }
 
+/** v21 -> v22: номер ПК из профиля Битрикс24 в карточке пользователя (задача #10). */
+function migrateToV22() {
+  console.log('[db] миграция схемы v21 -> v22 (номер ПК из Битрикс24)');
+  const tx = db.transaction(() => {
+    const columns = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+    if (!columns.includes('bitrix_pc_number')) db.exec('ALTER TABLE users ADD COLUMN bitrix_pc_number TEXT;');
+    db.pragma('user_version = 22');
+  });
+  tx();
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -1371,7 +1383,10 @@ const BITRIX_SYNC_FIELDS = [
   { field: 'position', label: 'Должность', profileKey: 'position' },
   { field: 'department', label: 'Подразделение', profileKey: 'department' },
   { field: 'email', label: 'Email', profileKey: 'email' },
-  { field: 'phone', label: 'Телефон', profileKey: 'phone' }
+  { field: 'phone', label: 'Телефон', profileKey: 'phone' },
+  // Задача #10: из поля «Другие сайты». Нет однозначного номера — значит пусто, и
+  // ранее сохранённый номер остаётся (правило «пустое не стирает» ниже)
+  { field: 'bitrix_pc_number', label: 'Номер ПК из Битрикс24', profileKey: 'pcNumber' }
 ];
 
 function localText(v) {
@@ -1409,7 +1424,9 @@ function bitrixFingerprint(bitrixId, target, changes, profile, warnings) {
     active: profile.active === undefined ? null : profile.active,
     warnings: [...warnings].sort(),
     departmentIds: [...(profile.departmentIds || [])],
-    phoneSource: profile.phoneSource || null
+    phoneSource: profile.phoneSource || null,
+    pcStatus: profile.pcStatus || null,
+    pcSourceText: profile.pcSourceText || null
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
@@ -1417,7 +1434,8 @@ function bitrixFingerprint(bitrixId, target, changes, profile, warnings) {
 function publicUserRow(u) {
   return u ? {
     id: u.id, full_name: u.full_name, department: u.department, position: u.position,
-    email: u.email, phone: u.phone, status: u.status, bitrix_id: u.bitrix_id ?? null
+    email: u.email, phone: u.phone, status: u.status, bitrix_id: u.bitrix_id ?? null,
+    bitrix_pc_number: u.bitrix_pc_number ?? null
   } : null;
 }
 
@@ -1434,6 +1452,8 @@ function buildBitrixPlan(profile, requestedTarget) {
   const warnings = [];
   if (profile.active === false) warnings.push('inactive');
   if (!profile.department && profile.departmentIds && profile.departmentIds.length) warnings.push('department_ids_only');
+  if (profile.pcStatus === 'ambiguous') warnings.push('pc_number_ambiguous');
+  if (profile.pcStatus === 'no_digits') warnings.push('pc_number_no_digits');
 
   const plan = {
     bitrixId,
@@ -1449,6 +1469,21 @@ function buildBitrixPlan(profile, requestedTarget) {
     fingerprint: null,
     targetUser: null
   };
+
+  // strict — привязка, начатая из конкретной карточки (кнопка «Связать с Битрикс24»):
+  // только эта карточка, без создания новой и без переназначения чужой связи
+  const strict = !!(requestedTarget && requestedTarget.strict);
+  if (strict && (requestedTarget.mode !== 'link' && requestedTarget.mode !== 'linked')) {
+    plan.needsTarget = true;
+    plan.blockReason = 'Привязка из карточки сохраняет связь только с этой карточкой.';
+    return plan;
+  }
+  if (strict && linked && linked.id !== Number(requestedTarget.userId)) {
+    plan.needsTarget = true;
+    plan.blockReason = `Этот сотрудник Битрикс24 уже связан с карточкой «${linked.full_name}». ` +
+      'Привязка из карточки не переназначает существующие связи — выберите другого сотрудника.';
+    return plan;
+  }
 
   let targetUser = null;
   if (linked) {
@@ -1514,6 +1549,19 @@ function staleBitrixPreview() {
 const bitrixSyncRepo = {
   FIELDS: BITRIX_SYNC_FIELDS,
 
+  /** Результаты поиска по имени + с какой карточкой NetworkMap уже связан каждый
+   *  найденный сотрудник (чтобы оператор сразу видел занятые профили). Ничего не пишет. */
+  annotateSearch(result) {
+    const stmt = getDb().prepare('SELECT id, full_name FROM users WHERE bitrix_id = ?');
+    return {
+      ...result,
+      items: result.items.map((it) => {
+        const u = stmt.get(it.bitrixId);
+        return { ...it, linkedUser: u ? { id: u.id, full_name: u.full_name } : null };
+      })
+    };
+  },
+
   /** Предпросмотр: ничего не пишет. Возвращает план и отпечаток для apply. */
   preview(profile, requestedTarget = null) {
     const plan = buildBitrixPlan(profile, requestedTarget);
@@ -1546,8 +1594,8 @@ const bitrixSyncRepo = {
         const values = {};
         plan.changes.forEach((c) => { values[c.field] = c.to; });
         const info = db.prepare(`
-          INSERT INTO users (full_name, department, position, email, phone, bitrix_id, bitrix_synced_at)
-          VALUES (@full_name, @department, @position, @email, @phone, @bitrix_id, datetime('now'))
+          INSERT INTO users (full_name, department, position, email, phone, bitrix_pc_number, bitrix_id, bitrix_synced_at)
+          VALUES (@full_name, @department, @position, @email, @phone, @bitrix_pc_number, @bitrix_id, datetime('now'))
         `).run({ ...values, bitrix_id: plan.bitrixId });
         userId = Number(info.lastInsertRowid);
         auditLogRepo.log('user', userId, 'create',

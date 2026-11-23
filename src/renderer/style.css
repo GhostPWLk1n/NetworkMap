@@ -628,6 +628,18 @@ body {
 .bitrix-changes-table tr.is-quiet td { color: #999; }
 .bitrix-changes-table .hint { display: block; font-size: 11px; color: #999; font-weight: normal; }
 .user-bitrix-link { font-size: 12px; color: #777; margin-top: 6px; }
+.user-bitrix-link button { margin-left: 4px; }
+.bitrix-fixed-target { font-size: 13px; background: #eef4fb; border: 1px solid #c9dcf0; border-radius: 6px; padding: 7px 10px; margin-bottom: 10px; }
+.bitrix-fixed-target.hidden, .bitrix-results.hidden { display: none; }
+.bitrix-results { border: 1px solid #e3e3e3; border-radius: 8px; margin-bottom: 12px; max-height: 260px; overflow-y: auto; }
+.bitrix-results-head { font-size: 12px; color: #777; padding: 6px 10px; border-bottom: 1px solid #eee; position: sticky; top: 0; background: #fff; }
+.bitrix-result { display: block; width: 100%; text-align: left; border: none; border-bottom: 1px solid #f0f0f0; background: #fff; padding: 7px 10px; font-size: 13px; cursor: pointer; border-radius: 0; }
+.bitrix-result:hover { background: #f5f8fc; }
+.bitrix-result.selected { background: #e8f0fb; box-shadow: inset 3px 0 0 #4a7fc1; }
+.bitrix-result-name { font-weight: 600; margin-right: 6px; }
+.bitrix-result-meta { color: #777; font-size: 12px; display: block; margin-top: 2px; }
+.bitrix-result .bitrix-badge { margin-left: 4px; }
+.bitrix-results-more { display: block; margin: 6px auto; padding: 4px 12px; font-size: 12px; }
 
 #db-settings-btn { margin-left: auto; font-size: 12px; white-space: nowrap; }
 #db-settings-btn.has-warning { background: #fff3e0; border-color: #f0b96a; }

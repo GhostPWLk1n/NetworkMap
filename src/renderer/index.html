@@ -449,13 +449,15 @@
     <div class="modal-box bitrix-box">
       <div class="modal-title">Карточка из Битрикс24</div>
       <form id="bitrix-search-form" class="bitrix-search">
-        <label for="bitrix-id-input">ID сотрудника в Битрикс24</label>
+        <div id="bitrix-fixed-target" class="bitrix-fixed-target hidden"></div>
+        <label for="bitrix-id-input">ID сотрудника, фамилия, имя или ФИО</label>
         <div class="bitrix-search-row">
-          <input id="bitrix-id-input" inputmode="numeric" autocomplete="off" placeholder="например, 128" />
+          <input id="bitrix-id-input" autocomplete="off" placeholder="например, 128 или Иванов Иван" />
           <button id="bitrix-search-btn" type="submit">Найти</button>
         </div>
       </form>
       <div id="bitrix-status" class="bitrix-status hidden" role="status"></div>
+      <div id="bitrix-results" class="bitrix-results hidden"></div>
       <div id="bitrix-result" class="hidden">
         <div id="bitrix-profile" class="bitrix-profile"></div>
         <div id="bitrix-target" class="bitrix-target"></div>
