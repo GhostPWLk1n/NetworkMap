@@ -460,6 +460,13 @@ function parseInvoice(extracted) {
     notes.push('В PDF нет текстового слоя (похоже на скан) — распознать нечего. Заполните поля вручную, исходный файл сохранится вместе с карточкой.');
     return { fields, items: [], itemsDeclared: null, recognized: {}, hasText: false, notes };
   }
+  if (extracted.unreadable) {
+    // Текстовый слой есть, но буквы в нём не читаются: шрифты без таблицы символов
+    // (ToUnicode), и восстановить её из встроенного шрифта не удалось. Распознавать
+    // такой текст — значит гадать, поэтому форма остаётся пустой
+    notes.push('Текст в PDF есть, но он не читается: шрифты документа сохранены без таблицы символов. Заполните поля вручную по оригиналу — исходный файл сохранится вместе с карточкой.');
+    return { fields, items: [], itemsDeclared: null, recognized: {}, hasText: false, unreadable: true, notes };
+  }
   const all = pages.flatMap((p) => p.lines);
 
   for (const l of all) {

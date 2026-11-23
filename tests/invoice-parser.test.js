@@ -38,6 +38,18 @@ const ITEM_FIELDS = ['code', 'name', 'quantity', 'unit', 'price', 'amount', 'vat
     const parsed = parseInvoice(extracted);
     check('число страниц', extracted.pageCount === exp.pages, String(extracted.pageCount));
 
+    if (exp.unreadable) {
+      check('текст есть, но нечитаем — ничего не выдумано', extracted.unreadable === true && parsed.items.length === 0 &&
+        Object.values(parsed.fields).every((v) => v === null));
+      check('оператору сказано заполнить вручную', parsed.notes.some((n) => /не читается/.test(n)));
+      continue;
+    }
+    if (/cid-no-tounicode/.test(file)) {
+      check('шрифты без ToUnicode восстановлены по cmap встроенного шрифта', extracted.recoveredFonts.length === 2 && !extracted.unreadable,
+        extracted.recoveredFonts.join(', '));
+    } else {
+      check('восстановление не понадобилось', extracted.recoveredFonts.length === 0 && !extracted.unreadable);
+    }
     if (exp.no_text_layer) {
       check('текстового слоя нет — ничего не выдумано', !parsed.hasText && parsed.items.length === 0 &&
         Object.values(parsed.fields).every((v) => v === null));
@@ -71,6 +83,15 @@ const ITEM_FIELDS = ['code', 'name', 'quantity', 'unit', 'price', 'amount', 'vat
     check('предупреждения о расхождениях', JSON.stringify(codes) === JSON.stringify(wantCodes),
       `${codes.join(',') || 'нет'}${JSON.stringify(codes) === JSON.stringify(wantCodes) ? '' : ` (ожидалось ${wantCodes.join(',') || 'нет'})`}`);
   }
+
+  console.log('\n=== Пути к данным pdf.js');
+  const { toPdfjsDir, pdfjsAssetDir } = require('../src/main/invoicePdf');
+  check('путь Windows → прямые слеши и «/» в конце',
+    toPdfjsDir('C:\\Program Files\\NetworkMap\\resources\\app.asar\\node_modules\\pdfjs-dist\\cmaps') ===
+    'C:/Program Files/NetworkMap/resources/app.asar/node_modules/pdfjs-dist/cmaps/');
+  check('путь к cmaps кончается на «/» и без «\\»', /\/cmaps\/$/.test(pdfjsAssetDir('cmaps')) && !pdfjsAssetDir('cmaps').includes('\\'));
+  check('файлы pdf.js находятся по этому пути', fs.existsSync(`${pdfjsAssetDir("cmaps")}78-H.bcmap`) &&
+    fs.readdirSync(pdfjsAssetDir('standard_fonts')).length > 0);
 
   console.log('\n=== Неправильные файлы');
   for (const [name, data, code] of [
