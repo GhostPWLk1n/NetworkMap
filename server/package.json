@@ -1,6 +1,6 @@
 {
   "name": "network-map-server",
-  "version": "1.49.0",
+  "version": "1.50.0",
   "description": "Выделенный сервер базы NetworkMap — держит базу постоянно и обслуживает подключённые экземпляры приложения",
   "private": true,
   "license": "MIT",
