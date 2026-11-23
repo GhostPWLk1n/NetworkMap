@@ -17,6 +17,7 @@
 const crypto = require('crypto');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { findRecoverableFonts, textStats, readableRatio, mapCidString } = require('./pdfFontRecovery');
 
 // Предел согласован с RPC: файл идёт на сервер в base64 (+33 %) внутри JSON, а сервер
 // принимает тело запроса до 8 МБ (rpcServer.js). 5 МБ с запасом укладываются.
@@ -103,10 +104,17 @@ function loadPdfjs() {
   return pdfjsPromise;
 }
 
-/** Папка с данными pdf.js (cmaps, standard_fonts) — со слешем в конце: pdf.js
- *  дописывает к ней имя файла. */
+/** Путь к папке для pdf.js: прямые слеши и «/» в конце. pdf.js дописывает к нему имя
+ *  файла и при открытии документа требует, чтобы путь кончался именно на «/» — с «\\»
+ *  Windows getDocument отказывает, и не открывается ни один PDF. Node на Windows читает
+ *  пути с прямыми слешами (и внутри asar тоже). */
+function toPdfjsDir(p) {
+  return String(p).replace(/\\/g, '/').replace(/\/*$/, '/');
+}
+
+/** Папка с данными pdf.js (cmaps, standard_fonts). */
 function pdfjsAssetDir(name) {
-  return path.join(path.dirname(require.resolve('pdfjs-dist/package.json')), name) + path.sep;
+  return toPdfjsDir(path.join(path.dirname(require.resolve('pdfjs-dist/package.json')), name));
 }
 
 class InvoicePdfError extends Error {
@@ -182,6 +190,68 @@ function groupLines(items) {
     });
 }
 
+/** Шрифты страницы, текст которых не читается (номера глифов вместо букв и т. п.). */
+function unreadableFonts(items) {
+  const byFont = new Map();
+  items.forEach((it) => {
+    if (typeof it.str !== 'string' || !it.fontName) return;
+    const acc = byFont.get(it.fontName) || { readable: 0, unreadable: 0 };
+    const t = textStats(it.str);
+    acc.readable += t.readable;
+    acc.unreadable += t.unreadable;
+    byFont.set(it.fontName, acc);
+  });
+  const bad = new Set();
+  byFont.forEach((acc, font) => { if (acc.unreadable >= 3 && readableRatio(acc) < 0.6) bad.add(font); });
+  return bad;
+}
+
+/**
+ * Перечитывает текст страницы и переводит строки нечитаемых шрифтов через cmap их
+ * встроенного TrueType (см. pdfFontRecovery.js). Шрифт сопоставляется по имени BaseFont;
+ * перевод принимается, только если текст стал читаемым. → { items, fonts } или null.
+ */
+async function recoverPageItems(page, badFonts, recoverable) {
+  try {
+    await page.getOperatorList(); // после этого pdf.js знает имена шрифтов страницы
+  } catch { return null; }
+  const plan = new Map(); // fontName pdf.js -> cidToUnicode
+  badFonts.forEach((fontName) => {
+    let info = null;
+    try { info = page.commonObjs.get(fontName); } catch { info = null; }
+    const name = info && info.name;
+    if (!name) return;
+    const candidates = recoverable.filter((r) => r.baseFont === name);
+    if (candidates.length === 1) plan.set(fontName, candidates[0].cidToUnicode);
+  });
+  if (!plan.size) return null;
+  // Без нормализации Юникода: иначе pdf.js «исправит» часть номеров глифов (лигатуры и
+  // т. п.) раньше, чем мы их переведём
+  const raw = (await page.getTextContent({ disableNormalization: true })).items;
+  const fonts = new Set();
+  const mapped = raw.map((it) => {
+    const table = plan.get(it.fontName);
+    if (!table || typeof it.str !== 'string') return it;
+    return { ...it, str: mapCidString(it.str, table) };
+  });
+  plan.forEach((_t, fontName) => {
+    const acc = { readable: 0, unreadable: 0 };
+    mapped.forEach((it) => {
+      if (it.fontName !== fontName) return;
+      const t = textStats(it.str);
+      acc.readable += t.readable;
+      acc.unreadable += t.unreadable;
+    });
+    if (readableRatio(acc) >= 0.8) fonts.add(fontName);
+  });
+  if (!fonts.size) return null;
+  // Переводим только те шрифты, у которых перевод действительно дал читаемый текст
+  const items = raw.map((it) => (fonts.has(it.fontName) && typeof it.str === 'string'
+    ? { ...it, str: mapCidString(it.str, plan.get(it.fontName)) }
+    : it));
+  return { items, fonts: [...fonts].map((f) => { try { return page.commonObjs.get(f).name; } catch { return f; } }) };
+}
+
 /**
  * Текст PDF по страницам. buffer — содержимое файла.
  * Возвращает { pageCount, hasText, pages: [{ number, width, height, lines }] }.
@@ -224,18 +294,44 @@ async function extractPdfText(buffer) {
       throw new InvoicePdfError('too_many_pages', `В PDF ${doc.numPages} страниц — для счёта это слишком много (предел ${MAX_PAGES}).`);
     }
     const pages = [];
+    let recoverable = null; // шрифты без ToUnicode — ищутся в файле, только если понадобились
+    const recoveredFonts = new Set();
     for (let n = 1; n <= doc.numPages; n++) {
       const page = await doc.getPage(n);
       const viewport = page.getViewport({ scale: 1 });
-      const content = await page.getTextContent();
-      pages.push({ number: n, width: viewport.width, height: viewport.height, lines: groupLines(content.items) });
+      let items = (await page.getTextContent()).items;
+      const bad = unreadableFonts(items);
+      if (bad.size) {
+        if (recoverable === null) recoverable = findRecoverableFonts(buffer);
+        if (recoverable.length) {
+          const fixed = await recoverPageItems(page, bad, recoverable);
+          if (fixed) {
+            items = fixed.items;
+            fixed.fonts.forEach((f) => recoveredFonts.add(f));
+          }
+        }
+      }
+      pages.push({ number: n, width: viewport.width, height: viewport.height, lines: groupLines(items) });
       page.cleanup();
     }
     const textChars = pages.reduce((s, p) => s + p.lines.reduce((t, l) => t + l.text.replace(/\s/g, '').length, 0), 0);
-    return { pageCount: doc.numPages, hasText: textChars >= 20, pages };
+    // Текст есть, но он не читается (шрифты без таблицы символов, которую не удалось
+    // восстановить): распознавать нечего — форма предложит заполнить счёт вручную
+    const stats = pages.reduce((acc, p) => {
+      p.lines.forEach((l) => { const t = textStats(l.text); acc.readable += t.readable; acc.unreadable += t.unreadable; });
+      return acc;
+    }, { readable: 0, unreadable: 0 });
+    const unreadable = textChars >= 20 && readableRatio(stats) < 0.6;
+    return {
+      pageCount: doc.numPages,
+      hasText: textChars >= 20,
+      unreadable,
+      recoveredFonts: [...recoveredFonts],
+      pages
+    };
   } finally {
     await doc.destroy();
   }
 }
 
-module.exports = { MAX_PDF_BYTES, MAX_PAGES, InvoicePdfError, extractPdfText, groupLines, sha256, looksLikePdf, installDomMatrixPolyfill };
+module.exports = { MAX_PDF_BYTES, MAX_PAGES, InvoicePdfError, extractPdfText, groupLines, sha256, looksLikePdf, installDomMatrixPolyfill, toPdfjsDir, pdfjsAssetDir };
