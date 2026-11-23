@@ -395,6 +395,11 @@ function smallListNote(text) {
 
 let usersCache = [];
 let usersSearchState;
+// Карточка пользователя → функция «раскрыть и загрузить устройства». Все точки входа
+// (заголовок, пункт «Редактировать», переход с плана) раскрывают карточку через неё, а не
+// добавляют класс expanded напрямую — иначе раздел устройств остаётся на «Загрузка…»
+// (задача #7). Так же устроены карточки устройств — deviceCardOpeners.
+const userCardOpeners = new WeakMap();
 
 async function renderUsers() {
   usersCache = await window.api.users.list();
@@ -445,16 +450,13 @@ function buildUserCard(u) {
   if (badge) header.appendChild(badge);
   header.appendChild(chevron);
   header.addEventListener('click', () => {
-    row.classList.toggle('expanded');
-    if (row.classList.contains('expanded') && !devicesLoaded) {
-      devicesLoaded = true;
-      refreshUserDevices();
-    }
+    if (row.classList.contains('expanded')) row.classList.remove('expanded');
+    else expandCard();
   });
   header.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showContextMenu(e.clientX, e.clientY, [
-      { label: 'Редактировать', onClick: () => row.classList.add('expanded') },
+      { label: 'Редактировать', onClick: expandCard },
       u.bitrix_id
         ? { label: '🔄 Обновить из Битрикс24', onClick: () => openBitrixModal(u.bitrix_id) }
         : { label: '🔗 Найти в Битрикс24…', onClick: () => openBitrixModal() },
@@ -543,8 +545,26 @@ function buildUserCard(u) {
   devicesExtras.textContent = 'Загрузка…';
   body.appendChild(devicesExtras);
   let devicesLoaded = false;
-  let refreshUserDevices;
-  refreshUserDevices = () => renderUserDevices(devicesExtras, u.id);
+  let devicesRequest = null;
+  /** Раскрывает карточку и при первом раскрытии загружает устройства. Пока запрос идёт,
+   *  повторное раскрытие нового запроса не отправляет; после ошибки — сообщение и кнопка
+   *  повтора. Только чтение: связи и история в базе от открытия не меняются. */
+  function expandCard() {
+    row.classList.add('expanded');
+    if (devicesLoaded || devicesRequest) return;
+    devicesExtras.textContent = 'Загрузка…';
+    devicesRequest = renderUserDevices(devicesExtras, u.id)
+      .then(() => { devicesLoaded = true; })
+      .catch(() => {
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Повторить загрузку';
+        retry.onclick = expandCard;
+        devicesExtras.replaceChildren('Не удалось загрузить устройства пользователя. ', retry);
+      })
+      .finally(() => { devicesRequest = null; });
+  }
+  userCardOpeners.set(row, expandCard);
 
   row.append(header, body);
   return row;
@@ -1585,18 +1605,32 @@ async function openDeviceCard(deviceId) {
   card.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-/** То же самое, но для листа "Пользователи" — используется из карточки владельца устройства */
-function openUserCard(userId) {
+/** То же самое для листа «Пользователи» — переход с плана к владельцу устройства.
+ *  Фильтры сбрасываются, чтобы карточка точно попала в выдачу; если владелец уволен, а
+ *  уволенные скрыты, их показ включается — открыть нужно именно его карточку (задача #7). */
+async function openUserCard(userId) {
   document.querySelector('.tab-btn[data-tab="users"]').click();
   const input = document.getElementById('users-search-input');
   input.value = '';
   if (usersSearchState) usersSearchState.query = '';
   document.getElementById('users-filter-department').value = '';
+  // Список берём свежим: владельца могли добавить или уволить после последней загрузки
+  // (например, с другого рабочего места), и тогда по устаревшему статусу карточка
+  // осталась бы скрытой фильтром. Если чтение не удалось, работаем с тем, что есть.
+  try { await renderUsers(); } catch { /* ошибку показывает обработчик API */ }
+  const user = usersCache.find((u) => u.id === userId);
+  if (!user) {
+    await alertModal('Этот пользователь не найден — возможно, его карточку удалили.');
+    return;
+  }
+  if (user.status === 'dismissed') {
+    document.getElementById('users-filter-show-dismissed').checked = true;
+  }
   applyUsersFilter();
-  requestAnimationFrame(() => {
-    const card = document.querySelector(`#user-cards .card-row[data-user-id="${userId}"]`);
-    if (card) { card.classList.add('expanded'); card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-  });
+  const card = document.querySelector(`#user-cards .card-row[data-user-id="${userId}"]`);
+  if (!card) return;
+  userCardOpeners.get(card)?.();
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 document.getElementById('import-excel-btn').addEventListener('click', async () => {
