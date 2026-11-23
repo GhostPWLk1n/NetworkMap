@@ -548,6 +548,8 @@ function normalizeWebhookInput(raw, portalHost) {
 }
 
 const CHECK_FIELDS = ['EMAIL', 'WORK_PHONE', 'UF_WEB_SITES'];
+// Ошибки, после которых ответа просто нет: проверка не завершена
+const TRANSIENT_CODES = new Set(['timeout', 'network', 'tls', 'server_error', 'rate_limited', 'redirect', 'bad_response', 'internal']);
 
 /**
  * Проверка доступа по ссылке до записи в bitrix.yml: читает ли вебхук пользователей и
@@ -562,29 +564,41 @@ async function checkWebhookAccess(webhookUrl, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const config = { webhookUrl, timeoutMs };
   try {
     await callUserGet(config, { filter: { ACTIVE: true }, select: ['ID'], start: 0 });
+    const problems = [];
+    const warnings = [];
+    // Незавершённая проверка (тайм-аут, обрыв, ошибка сервера) — не «поле отсутствует», а
+    // «не знаем»: сохранять по такой проверке нельзя, иначе рабочую ссылку заменит
+    // непроверенная (замечание приёмки #11)
+    const incomplete = (what, err) => problems.push(`${what} не завершена: ${String((err && err.message) || 'нет ответа').replace(/ ?в webhook_url( в bitrix\.yml)?/g, '')} Сохранить можно после успешной повторной проверки.`);
     let scopes = null;
     try {
       const sc = await callMethod(config, 'scope', {});
       if (Array.isArray(sc.result)) scopes = sc.result.filter((x) => typeof x === 'string' && /^[a-z0-9_.]{1,40}$/i.test(x));
-    } catch { scopes = null; } // метод scope есть не везде — без него просто не назовём права
+    } catch (err) {
+      // Метод scope есть не везде, и без него мы лишь не назовём права. Но тайм-аут или
+      // обрыв значит, что проверка не завершена
+      if (err instanceof BitrixError && TRANSIENT_CODES.has(err.code)) incomplete('Проверка прав вебхука (scope)', err);
+    }
     let available = null;
     try {
       const uf = await callMethod(config, 'user.fields', {});
-      if (uf.result && typeof uf.result === 'object') available = new Set(Object.keys(uf.result));
-    } catch { available = null; }
+      if (uf.result && typeof uf.result === 'object' && !Array.isArray(uf.result)) available = new Set(Object.keys(uf.result));
+      else problems.push('Портал не вернул список полей (user.fields) — проверка полей не завершена. Сохранить можно после успешной повторной проверки.');
+    } catch (err) {
+      incomplete('Проверка полей (user.fields)', err);
+    }
     const fields = {};
     CHECK_FIELDS.forEach((f) => { fields[f] = available ? available.has(f) : null; });
-    const problems = [];
-    const warnings = [];
     const briefOnly = scopes && scopes.includes('user_brief') && !scopes.includes('user_basic') && !scopes.includes('user');
     if (briefOnly || fields.EMAIL === false || fields.WORK_PHONE === false) {
       problems.push(briefOnly
         ? 'У вебхука право «Пользователи (краткое)» — user_brief: email и телефон недоступны. Создайте вебхук с правом «Пользователи (базовое)» — user_basic.'
         : 'Поля EMAIL и WORK_PHONE недоступны этому вебхуку. Нужно право «Пользователи (базовое)» — user_basic.');
     }
-    if (available === null) warnings.push('Портал не вернул список полей (user.fields) — доступность полей не проверена.');
-    else if (fields.UF_WEB_SITES === false) warnings.push('Поля «Другие сайты» (UF_WEB_SITES) на портале нет — номер ПК из Битрикс24 не будет заполняться.');
-    return { readUsers: true, scopes, fields, problems, warnings, canSave: problems.length === 0 };
+    // Необязательное поле: его отсутствие в УСПЕШНОМ ответе — только предупреждение
+    if (available && fields.UF_WEB_SITES === false) warnings.push('Поля «Другие сайты» (UF_WEB_SITES) на портале нет — номер ПК из Битрикс24 не будет заполняться.');
+    const safe = (list) => list.map((t) => redactSecrets(t, webhookUrl));
+    return { readUsers: true, scopes, fields, problems: safe(problems), warnings: safe(warnings), canSave: problems.length === 0 };
   } catch (err) {
     if (err instanceof BitrixError) {
       err.message = redactSecrets(err.message, webhookUrl);

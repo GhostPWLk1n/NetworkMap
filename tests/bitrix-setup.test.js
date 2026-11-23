@@ -43,6 +43,12 @@ const server = http.createServer((req, res) => {
     if (!['user.get', 'user.fields', 'scope'].includes(method)) return send(400, { error: 'UNEXPECTED_METHOD' });
     if (key === 'bad00key') return send(401, { error: 'INVALID_CREDENTIALS' });
     if (key === 'slow0key') return setTimeout(() => send(200, { result: [] }), 9500);
+    // user.get и scope отвечают, а user.fields зависает / падает; scope зависает; scope нет
+    if (key === 'fslow0key' && method === 'user.fields') return setTimeout(() => send(200, { result: ALL_FIELDS }), 9500);
+    if (key === 'f500key' && method === 'user.fields') return send(500, {});
+    if (key === 'flist0key' && method === 'user.fields') return send(200, { result: [] });
+    if (key === 'sslow0key' && method === 'scope') return setTimeout(() => send(200, { result: ['user_basic'] }), 9500);
+    if (key === 'scopenf0key' && method === 'scope') return send(400, { error: 'ERROR_METHOD_NOT_FOUND' });
     if (key === 'cal00key') {
       if (method === 'scope') return send(200, { result: ['calendar'] });
       return send(401, { error: 'insufficient_scope' });
@@ -124,6 +130,21 @@ const server = http.createServer((req, res) => {
   const t0 = Date.now();
   await rejects('тайм-аут', () => call('bitrixSetup:check', { portal: HOST, webhook: url('slow0key') }), /не ответил/);
   check('…в пределах тайм-аута', Date.now() - t0 < 9000, `${Date.now() - t0} мс`);
+  console.log('  — незавершённые проверки (замечание приёмки PR #14)');
+  const fslow = await spy('bitrixSetup:check', { portal: HOST, webhook: url('fslow0key') });
+  check('user.fields не ответил — сохранить нельзя', !fslow.canSave && !fslow.checkId && /Проверка полей \(user\.fields\) не завершена/.test(fslow.problems.join(' ')) &&
+    fslow.fields.EMAIL === null, fslow.problems.join(' '));
+  check('…рабочая настройка не тронута', fs.readFileSync(path.join(tmp, 'bitrix.yml'), 'utf8') === before);
+  const quick = (k) => B.checkWebhookAccess(url(k), 1500);
+  const f500 = await quick('f500key');
+  check('user.fields вернул ошибку сервера — сохранить нельзя', !f500.canSave && /не завершена/.test(f500.problems.join(' ')), f500.problems.join(' '));
+  const flist = await quick('flist0key');
+  check('user.fields вернул не список полей — сохранить нельзя', !flist.canSave && /не вернул список полей/.test(flist.problems.join(' ')));
+  const sslow = await quick('sslow0key');
+  check('scope не ответил — сохранить нельзя', !sslow.canSave && /scope\) не завершена/.test(sslow.problems.join(' ')), sslow.problems.join(' '));
+  const scopenf = await quick('scopenf0key');
+  check('метода scope на портале нет — это не мешает, поля проверены', scopenf.canSave && scopenf.scopes === null && scopenf.fields.EMAIL === true);
+  check('ключ не попадает в тексты проблем', ![fslow, f500, flist, sslow].some((r) => /0key|f500key/.test(r.problems.join(' '))));
   const nouf = await spy('bitrixSetup:check', { portal: HOST, webhook: url('nouf0key') });
   check('нет UF_WEB_SITES — предупреждение, сохранить можно', nouf.canSave && nouf.fields.UF_WEB_SITES === false && /номер ПК/.test(nouf.warnings.join(' ')));
   check('после отказов действующая настройка не изменилась', fs.readFileSync(path.join(tmp, 'bitrix.yml'), 'utf8') === before);
