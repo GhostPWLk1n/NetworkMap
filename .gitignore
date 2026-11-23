@@ -1,4 +1,6 @@
 node_modules/
 dist/
 *.log
-/bitrix.yml
+# Настройка Битрикс24 с ключом доступа — на любой глубине (например, data/bitrix.yml
+# рядом с базой сервера). Образец без ключа — bitrix.example.yml, он в репозитории.
+bitrix.yml

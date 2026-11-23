@@ -67,6 +67,12 @@ contextBridge.exposeInMainWorld('api', {
     setFlag: (id, flag) => invoke('users:setFlag', { id, flag }),
     remove: (id) => invoke('users:remove', id)
   },
+  // Синхронизация карточек из Битрикс24. Запрос к порталу выполняет процесс, владеющий
+  // базой (в сетевом режиме — сервер), адрес вебхука сюда не попадает никогда.
+  bitrix: {
+    preview: (bitrixId, target = null) => invoke('bitrix:preview', { bitrixId, target }),
+    apply: (bitrixId, target, fingerprint) => invoke('bitrix:apply', { bitrixId, target, fingerprint })
+  },
   devices: {
     list: () => invoke('devices:list'),
     create: (payload) => invoke('devices:create', payload),

@@ -455,6 +455,9 @@ function buildUserCard(u) {
     e.preventDefault();
     showContextMenu(e.clientX, e.clientY, [
       { label: 'Редактировать', onClick: () => row.classList.add('expanded') },
+      u.bitrix_id
+        ? { label: '🔄 Обновить из Битрикс24', onClick: () => openBitrixModal(u.bitrix_id) }
+        : { label: '🔗 Найти в Битрикс24…', onClick: () => openBitrixModal() },
       ...flagMenuItems(u.flag, async (flag) => {
         const updated = await window.api.users.setFlag(u.id, flag);
         u.flag = updated.flag;
@@ -532,6 +535,8 @@ function buildUserCard(u) {
 
   form.appendChild(actions);
   body.appendChild(form);
+  const bitrixLine = buildUserBitrixLine(u);
+  if (bitrixLine) body.appendChild(bitrixLine);
 
   const devicesExtras = document.createElement('div');
   devicesExtras.className = 'device-card-extras';
@@ -614,6 +619,506 @@ document.getElementById('user-form').addEventListener('submit', async (e) => {
 usersSearchState = bindSearchBar('users', applyUsersFilter);
 document.getElementById('users-filter-department').addEventListener('input', applyUsersFilter);
 document.getElementById('users-filter-show-dismissed').addEventListener('change', applyUsersFilter);
+
+// ============================================================
+// Карточка из Битрикс24 (задача #3)
+// ============================================================
+//
+// Поиск по ID → предпросмотр → явное подтверждение. Сам запрос к порталу и сопоставление
+// делает процесс, владеющий базой (bitrix:preview / bitrix:apply в dbChannels), здесь —
+// только показ. Всё, что пришло из Битрикс24, выводится через textContent: строки с
+// портала не должны попадать в разметку как HTML.
+
+// Правило для кнопки «Сохранить»: она доступна только для предпросмотра, который
+//  1) пришёл ответом на ПОСЛЕДНИЙ запрос (более ранние ответы ничего не меняют),
+//  2) построен для той цели, что выбрана в окне прямо сейчас,
+//  3) и пока никакой запрос не выполняется.
+// Поэтому показываемый предпросмотр (preview) и тот, по которому можно сохранить
+// (savable), — разные вещи: при смене цели профиль остаётся на экране, а сохранять по
+// нему нельзя, пока не придёт сравнение именно с новой целью.
+const bitrixUi = {
+  bitrixId: null,   // ID, по которому показан текущий предпросмотр
+  preview: null,    // последний ответ bitrix:preview — то, что показано
+  savable: null,    // предпросмотр, по которому разрешено сохранить (см. правило выше)
+  choice: null,     // выбор оператора при первой синхронизации: { mode: 'create' } | { mode: 'link', userId }
+  requestSeq: 0,    // номер последнего запроса; ответы на более ранние отбрасываются
+  pendingSeq: null  // номер выполняющегося запроса, null — ничего не выполняется
+};
+
+/** ID из поля → число или null. ОДНА нормализация и для поиска, и для проверки перед
+ *  сохранением: «00106» — это тот же сотрудник 106, а не «другой ID». */
+function bitrixParseId(text) {
+  const digits = String(text == null ? '' : text).trim().replace(/^0+(?=\d)/, '');
+  if (!/^\d{1,10}$/.test(digits)) return null;
+  const n = Number(digits);
+  return n > 0 ? n : null;
+}
+
+/** Что выбрано в окне сейчас — по самим переключателям и списку, а не по сохранённому
+ *  состоянию. null — выбор не сделан или его нет (карточка уже связана). */
+function bitrixSelectedTarget() {
+  const checked = document.querySelector('#bitrix-target input[name="bitrix-target"]:checked');
+  if (!checked) return null;
+  if (checked.value === 'create') return { mode: 'create' };
+  const select = document.querySelector('#bitrix-target select');
+  return { mode: 'link', userId: select && select.value ? Number(select.value) : null };
+}
+
+/** Совпадает ли цель предпросмотра с тем, что выбрано сейчас (и в окне, и в состоянии). */
+function bitrixTargetIsCurrent(p) {
+  if (!p || !p.target) return false;
+  const hasChoiceUi = !!document.querySelector('#bitrix-target input[name="bitrix-target"]');
+  if (p.target.mode === 'linked') return !hasChoiceUi && !bitrixUi.choice;
+  const same = (t) => !!t && t.mode === p.target.mode &&
+    (p.target.mode !== 'link' || Number(t.userId) === p.target.userId);
+  return same(bitrixSelectedTarget()) && same(bitrixUi.choice);
+}
+
+/** Единственное место, где включается кнопка «Сохранить». */
+function bitrixUpdateApplyButton() {
+  const p = bitrixUi.savable;
+  bitrixEl('bitrix-apply-btn').disabled =
+    !(p && p.canApply && bitrixUi.pendingSeq === null && bitrixTargetIsCurrent(p));
+}
+
+/** На время записи выбор карточки замораживается: менять цель посреди сохранения
+ *  бессмысленно, а ответ записи не должен оказаться «устаревшим». */
+function bitrixLockTarget(locked) {
+  document.querySelectorAll('#bitrix-target input, #bitrix-target select').forEach((el) => {
+    if (locked) el.disabled = true;
+    else el.disabled = el.tagName === 'SELECT' ? !(bitrixUi.choice && bitrixUi.choice.mode === 'link') : false;
+  });
+}
+
+const BITRIX_FIELD_HINTS = {
+  keep: 'в Битрикс24 пусто — останется текущее',
+  same: 'без изменений',
+  empty: 'пусто и там, и там'
+};
+
+function bitrixEl(id) { return document.getElementById(id); }
+
+/** Сервер (или хост) старой версии не знает каналов bitrix:* и отвечает «Неизвестный
+ *  метод» — переводим это в понятное действие. */
+function bitrixErrorText(err) {
+  const msg = (err && err.message) || String(err);
+  if (/Неизвестный метод: bitrix:/.test(msg)) {
+    return 'Сервер не поддерживает синхронизацию с Битрикс24 — обновите сервер (или хост) до текущей версии приложения.';
+  }
+  return msg;
+}
+
+function bitrixSetStatus(text, kind = '') {
+  const el = bitrixEl('bitrix-status');
+  el.className = `bitrix-status${kind ? ` ${kind}` : ''}${text ? '' : ' hidden'}`;
+  el.textContent = text || '';
+}
+
+function bitrixSetBusy(busy, label) {
+  bitrixEl('bitrix-search-btn').disabled = busy;
+  bitrixEl('bitrix-id-input').disabled = busy;
+  if (busy && label) bitrixSetStatus(label);
+  bitrixUpdateApplyButton();
+}
+
+function openBitrixModal(prefillId = null) {
+  bitrixInvalidatePreview();
+  bitrixSetStatus('');
+  const input = bitrixEl('bitrix-id-input');
+  input.value = prefillId ? String(prefillId) : '';
+  bitrixEl('bitrix-modal').classList.remove('hidden');
+  input.focus();
+  if (prefillId) bitrixSearch();
+}
+
+function closeBitrixModal() {
+  bitrixUi.requestSeq++; // ответы, которые ещё в пути, больше никому не нужны
+  bitrixUi.pendingSeq = null;
+  bitrixUi.savable = null;
+  bitrixEl('bitrix-modal').classList.add('hidden');
+}
+
+/** Запрос предпросмотра. target — выбор оператора (или null, если связь уже есть или
+ *  выбор ещё не сделан). */
+async function bitrixRequestPreview(bitrixId, target, busyLabel) {
+  const seq = ++bitrixUi.requestSeq;
+  bitrixUi.pendingSeq = seq;
+  bitrixUi.savable = null; // пока идёт сравнение, сохранять нечего
+  bitrixSetBusy(true, busyLabel);
+  try {
+    handleApiErrorLocally('bitrix:preview'); // ошибку покажем в самом окне, без общего тоста
+    const preview = await window.api.bitrix.preview(bitrixId, target);
+    if (seq !== bitrixUi.requestSeq) return; // устаревший ответ ничего не меняет
+    bitrixUi.bitrixId = bitrixId;
+    bitrixUi.preview = preview;
+    bitrixSetStatus('');
+    renderBitrixPreview(preview);
+    bitrixUi.savable = preview;
+  } catch (err) {
+    if (seq !== bitrixUi.requestSeq) return;
+    bitrixUi.preview = null;
+    bitrixUi.savable = null;
+    bitrixEl('bitrix-result').classList.add('hidden');
+    bitrixSetStatus(bitrixErrorText(err), 'error');
+  } finally {
+    // Состояние окна меняет только ответ на последний запрос: ранний ответ, пришедший
+    // после того, как оператор уже выбрал другую цель, кнопку не включит
+    if (seq === bitrixUi.requestSeq) {
+      bitrixUi.pendingSeq = null;
+      bitrixSetBusy(false);
+    }
+  }
+}
+
+/** Аннулирует показанный предпросмотр: сохранить по нему больше нельзя, пока не будет
+ *  нового успешного поиска и выбора карточки. Вызывается при ЛЮБОЙ правке поля ID и при
+ *  отказе проверки ввода — иначе в окне мог остаться «живой» предпросмотр прошлого
+ *  сотрудника, и кнопка сохранила бы его данные при другом ID в поле. Ответы на запросы,
+ *  которые ещё в пути, тоже отбрасываются (requestSeq). */
+function bitrixInvalidatePreview() {
+  bitrixUi.requestSeq++;
+  bitrixUi.pendingSeq = null;
+  bitrixUi.bitrixId = null;
+  bitrixUi.preview = null;
+  bitrixUi.savable = null;
+  bitrixUi.choice = null;
+  bitrixEl('bitrix-result').classList.add('hidden');
+  bitrixSetBusy(false);
+}
+
+function bitrixSearch() {
+  const bitrixId = bitrixParseId(bitrixEl('bitrix-id-input').value);
+  bitrixInvalidatePreview(); // новый поиск — прошлый предпросмотр и выбор карточки больше не действуют
+  if (bitrixId === null) {
+    bitrixSetStatus('Введите ID сотрудника — целое положительное число (его видно в адресе профиля в Битрикс24).', 'error');
+    return;
+  }
+  bitrixRequestPreview(bitrixId, null, 'Запрашиваю профиль в Битрикс24…');
+}
+
+function bitrixChoose(choice) {
+  bitrixUi.choice = choice;
+  // Прежний предпросмотр построен для другой цели — сохранять по нему нельзя с этой же
+  // секунды, ещё до ответа на новый запрос
+  bitrixUi.savable = null;
+  bitrixUpdateApplyButton();
+  if (!bitrixUi.bitrixId) return;
+  if (choice && choice.mode === 'link' && !choice.userId) {
+    // Переключатель «связать» нажат, а карточка ещё не выбрана — сравнивать не с чем.
+    // Запрос для прежней цели, если он ещё в пути, больше не нужен.
+    bitrixUi.requestSeq++;
+    bitrixUi.pendingSeq = null;
+    bitrixSetBusy(false);
+    bitrixSetStatus('');
+    renderBitrixPreview(bitrixUi.preview);
+    bitrixUpdateApplyButton();
+    return;
+  }
+  bitrixRequestPreview(bitrixUi.bitrixId, choice, 'Сверяю с карточкой…');
+}
+
+function bitrixValue(text) {
+  const span = document.createElement('span');
+  if (text === null || text === undefined || text === '') {
+    span.className = 'bitrix-muted';
+    span.textContent = '—';
+  } else {
+    span.textContent = text;
+  }
+  return span;
+}
+
+function renderBitrixPreview(p) {
+  bitrixEl('bitrix-result').classList.remove('hidden');
+  renderBitrixProfile(p);
+  renderBitrixTarget(p);
+  renderBitrixChanges(p);
+}
+
+function renderBitrixProfile(p) {
+  const box = bitrixEl('bitrix-profile');
+  box.innerHTML = '';
+  const prof = p.profile;
+
+  const name = document.createElement('div');
+  name.className = 'bitrix-profile-name';
+  name.appendChild(bitrixValue(prof.fullName));
+  const idBadge = document.createElement('span');
+  idBadge.className = 'bitrix-badge';
+  idBadge.textContent = `ID ${prof.bitrixId}`;
+  name.appendChild(idBadge);
+  if (prof.active === false) {
+    const inactive = document.createElement('span');
+    inactive.className = 'bitrix-badge inactive';
+    inactive.textContent = 'неактивен в Битрикс24';
+    name.appendChild(inactive);
+  }
+  box.appendChild(name);
+
+  const dl = document.createElement('dl');
+  const row = (label, valueNode) => {
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.appendChild(valueNode);
+    dl.append(dt, dd);
+  };
+  row('Должность', bitrixValue(prof.position));
+  if (prof.department) {
+    row('Подразделение', bitrixValue(prof.department));
+  } else if (prof.departmentIds && prof.departmentIds.length) {
+    const s = document.createElement('span');
+    s.className = 'bitrix-muted';
+    s.textContent = `только ID: ${prof.departmentIds.join(', ')}`;
+    row('Подразделение', s);
+  } else {
+    row('Подразделение', bitrixValue(null));
+  }
+  row('Email', bitrixValue(prof.email));
+  const phone = bitrixValue(prof.phone);
+  if (prof.phone && prof.phoneSource === 'PERSONAL_MOBILE') phone.textContent += ' (мобильный — рабочий не заполнен)';
+  row('Телефон', phone);
+  row('Активность', bitrixValue(prof.active === false ? 'неактивен' : prof.active === true ? 'активен' : null));
+  box.appendChild(dl);
+
+  const note = (text) => {
+    const n = document.createElement('div');
+    n.className = 'bitrix-note';
+    n.textContent = text;
+    box.appendChild(n);
+  };
+  if (p.warnings.includes('inactive')) {
+    note('Сотрудник неактивен в Битрикс24 (уволен или отключён). Статус карточки в NetworkMap при сохранении не меняется — при необходимости отметьте увольнение вручную.');
+  }
+  if (p.warnings.includes('department_ids_only')) {
+    note(`Портал передал только ID подразделения (${prof.departmentIds.join(', ')}), без названия. В карточке останется подразделение, которое в ней уже записано.`);
+  }
+}
+
+function renderBitrixTarget(p) {
+  const box = bitrixEl('bitrix-target');
+  box.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'bitrix-target-title';
+
+  if (p.linkedUser) {
+    title.textContent = 'Карточка в NetworkMap';
+    const text = document.createElement('div');
+    text.textContent = `Уже связан с карточкой «${p.linkedUser.full_name}» — обновится она.` +
+      (p.linkedUser.status === 'dismissed' ? ' Карточка отмечена как уволенный.' : '');
+    box.append(title, text);
+    return;
+  }
+
+  title.textContent = 'Сотрудник ещё не связан с карточкой NetworkMap — выберите:';
+  box.appendChild(title);
+  const choice = bitrixUi.choice;
+
+  const createLabel = document.createElement('label');
+  const createRadio = document.createElement('input');
+  createRadio.type = 'radio';
+  createRadio.name = 'bitrix-target';
+  createRadio.value = 'create';
+  createRadio.checked = !!choice && choice.mode === 'create';
+  createRadio.addEventListener('change', () => bitrixChoose({ mode: 'create' }));
+  createLabel.append(createRadio, document.createTextNode('Создать новую карточку'));
+  box.appendChild(createLabel);
+
+  const linkLabel = document.createElement('label');
+  const linkRadio = document.createElement('input');
+  linkRadio.type = 'radio';
+  linkRadio.name = 'bitrix-target';
+  linkRadio.value = 'link';
+  linkRadio.checked = !!choice && choice.mode === 'link';
+  linkLabel.append(linkRadio, document.createTextNode('Связать с существующей карточкой'));
+  box.appendChild(linkLabel);
+
+  const select = document.createElement('select');
+  select.className = 'bitrix-link-select';
+  select.disabled = !(choice && choice.mode === 'link');
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = p.candidates.length ? '— выберите карточку —' : 'нет карточек без связи';
+  select.appendChild(placeholder);
+  const MATCH_LABELS = { email: 'email', name: 'ФИО' };
+  p.candidates.forEach((c) => {
+    const opt = document.createElement('option');
+    opt.value = String(c.id);
+    const parts = [c.full_name];
+    if (c.department) parts.push(c.department);
+    let text = parts.join(' · ');
+    if (c.status === 'dismissed') text += ' (уволен)';
+    if (c.match && c.match.length) text += ` — совпадает ${c.match.map((m) => MATCH_LABELS[m] || m).join(' и ')}`;
+    opt.textContent = text;
+    select.appendChild(opt);
+  });
+  if (choice && choice.mode === 'link' && choice.userId) select.value = String(choice.userId);
+  linkRadio.addEventListener('change', () => {
+    select.disabled = false;
+    bitrixChoose({ mode: 'link', userId: select.value ? Number(select.value) : null });
+    select.focus();
+  });
+  select.addEventListener('change', () => {
+    bitrixChoose({ mode: 'link', userId: select.value ? Number(select.value) : null });
+  });
+  box.appendChild(select);
+}
+
+function renderBitrixChanges(p) {
+  const box = bitrixEl('bitrix-changes');
+  box.innerHTML = '';
+  // Выбор ещё не сделан (или «связать» без выбранной карточки) — сравнивать не с чем
+  const waitingForChoice = !p.target || (bitrixUi.choice && bitrixUi.choice.mode === 'link' && !bitrixUi.choice.userId && !p.linkedUser);
+  if (waitingForChoice) {
+    if (p.blockReason && p.target === null && bitrixUi.choice && bitrixUi.choice.mode === 'link' && bitrixUi.choice.userId) {
+      // Выбранную карточку взять нельзя (удалена или уже связана) — причина от сервера
+      const n = document.createElement('div');
+      n.className = 'bitrix-note';
+      n.textContent = p.blockReason;
+      box.appendChild(n);
+    }
+    return;
+  }
+
+  const table = document.createElement('table');
+  table.className = 'bitrix-changes-table';
+  const thead = document.createElement('thead');
+  const isCreate = p.target.mode === 'create';
+  thead.innerHTML = `<tr><th>Поле</th><th>${isCreate ? 'Сейчас' : 'Сейчас в NetworkMap'}</th><th>Станет</th></tr>`;
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+
+  const addRow = (label, fromNode, toNode, cls, hintText) => {
+    const tr = document.createElement('tr');
+    if (cls) tr.className = cls;
+    const tdLabel = document.createElement('td');
+    tdLabel.textContent = label;
+    const tdFrom = document.createElement('td');
+    tdFrom.appendChild(fromNode);
+    const tdTo = document.createElement('td');
+    tdTo.className = 'to';
+    tdTo.appendChild(toNode);
+    if (hintText) {
+      const hint = document.createElement('span');
+      hint.className = 'hint';
+      hint.textContent = hintText;
+      tdTo.appendChild(hint);
+    }
+    tr.append(tdLabel, tdFrom, tdTo);
+    tbody.appendChild(tr);
+  };
+
+  p.changes.forEach((c) => {
+    const changing = c.action === 'set' || c.action === 'change';
+    let hint = changing ? null : BITRIX_FIELD_HINTS[c.action];
+    if (c.field === 'phone' && changing && p.profile.phoneSource === 'PERSONAL_MOBILE') hint = 'мобильный — рабочий не заполнен';
+    if (c.field === 'department' && c.action === 'keep' && p.warnings.includes('department_ids_only')) hint = 'в Битрикс24 только ID подразделения — останется текущее';
+    addRow(c.label, bitrixValue(isCreate ? null : c.from), bitrixValue(c.to), changing ? 'is-change' : 'is-quiet', hint);
+  });
+  if (p.target.mode !== 'linked') {
+    addRow('Связь с Битрикс24', bitrixValue(null), bitrixValue(`ID ${p.bitrixId}`), 'is-change',
+      isCreate ? 'новая карточка' : 'карточка запомнит этого сотрудника');
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+
+  if (!p.canApply && p.blockReason) {
+    const n = document.createElement('div');
+    n.className = 'bitrix-note';
+    n.textContent = p.blockReason;
+    box.appendChild(n);
+  }
+}
+
+async function bitrixApply() {
+  const p = bitrixUi.savable;
+  if (!p || !p.canApply || bitrixUi.pendingSeq !== null) return;
+  // Последние проверки перед записью. Кнопка и так выключена в этих случаях, но
+  // расхождение не должно дойти до записи ни при каком порядке событий.
+  // 1) Сотрудник — тот, чей ID сейчас в поле (та же нормализация, что при поиске).
+  if (bitrixParseId(bitrixEl('bitrix-id-input').value) !== bitrixUi.bitrixId) {
+    bitrixInvalidatePreview();
+    bitrixSetStatus('ID в поле изменился — нажмите «Найти», чтобы проверить этого сотрудника.', 'error');
+    return;
+  }
+  // 2) Карточка — та, что выбрана в окне сейчас.
+  if (!bitrixTargetIsCurrent(p)) {
+    bitrixUi.savable = null;
+    bitrixUpdateApplyButton();
+    bitrixSetStatus('Выбранная карточка не совпадает с показанным сравнением — выберите её ещё раз.', 'error');
+    return;
+  }
+  const seq = ++bitrixUi.requestSeq;
+  bitrixUi.pendingSeq = seq;
+  bitrixUi.savable = null;
+  bitrixLockTarget(true);
+  bitrixSetBusy(true, 'Сохраняю…');
+  try {
+    handleApiErrorLocally('bitrix:apply');
+    const res = await window.api.bitrix.apply(bitrixUi.bitrixId, p.target, p.fingerprint);
+    // Запись уже состоялась — список обновляем в любом случае, даже если окно успели
+    // закрыть, пока шло сохранение
+    await renderUsers();
+    fillUserDragList();
+    syncPlanOwnerName(res.user.id, res.user.full_name);
+    if (seq !== bitrixUi.requestSeq) return;
+    bitrixUi.preview = null;
+    bitrixUi.savable = null;
+    bitrixEl('bitrix-target').innerHTML = '';
+    bitrixEl('bitrix-changes').innerHTML = '';
+    const what = res.created
+      ? 'создана'
+      : (res.newlyLinked ? 'связана с Битрикс24' : 'обновлена') +
+        (res.changedFields.length && res.newlyLinked ? ' и обновлена' : '');
+    bitrixSetStatus(`Карточка «${res.user.full_name}» ${what}.`, 'success');
+  } catch (err) {
+    if (seq !== bitrixUi.requestSeq) return;
+    // После отказа повторять то же сохранение бессмысленно (отпечаток тот же) — нужен
+    // свежий предпросмотр, чтобы оператор снова увидел, что именно сохраняет
+    bitrixUi.preview = null;
+    bitrixUi.savable = null;
+    bitrixSetStatus(bitrixErrorText(err), 'error');
+  } finally {
+    if (seq === bitrixUi.requestSeq) {
+      bitrixUi.pendingSeq = null;
+      bitrixLockTarget(false);
+      bitrixSetBusy(false);
+    }
+  }
+}
+
+bitrixEl('bitrix-sync-btn').addEventListener('click', () => openBitrixModal());
+bitrixEl('bitrix-search-form').addEventListener('submit', (e) => { e.preventDefault(); bitrixSearch(); });
+bitrixEl('bitrix-id-input').addEventListener('input', () => {
+  // Предпросмотр относится к конкретному ID — после любой правки поля он недействителен.
+  // Подсказку «нажмите Найти» показываем, только если было что аннулировать.
+  const hadPreview = !!(bitrixUi.preview || bitrixUi.bitrixId);
+  bitrixInvalidatePreview();
+  bitrixSetStatus(hadPreview ? 'ID изменён — нажмите «Найти».' : '');
+});
+bitrixEl('bitrix-apply-btn').addEventListener('click', bitrixApply);
+bitrixEl('bitrix-cancel-btn').addEventListener('click', closeBitrixModal);
+bitrixEl('bitrix-modal').addEventListener('keydown', (e) => { if (e.key === 'Escape') closeBitrixModal(); });
+
+/** Строка «связан с Битрикс24» в развёрнутой карточке пользователя. */
+function buildUserBitrixLine(u) {
+  if (!u.bitrix_id) return null;
+  const line = document.createElement('div');
+  line.className = 'user-bitrix-link';
+  let synced = '';
+  if (u.bitrix_synced_at) {
+    const d = new Date(`${String(u.bitrix_synced_at).replace(' ', 'T')}Z`); // SQLite datetime('now') — UTC
+    synced = ` · сверено ${Number.isNaN(d.getTime()) ? u.bitrix_synced_at : d.toLocaleString('ru-RU')}`;
+  }
+  const text = document.createElement('span');
+  text.textContent = `Битрикс24: ID ${u.bitrix_id}${synced} `;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = '🔄 Обновить из Битрикс24';
+  btn.addEventListener('click', () => openBitrixModal(u.bitrix_id));
+  line.append(text, btn);
+  return line;
+}
 
 // ============================================================
 // Лист «Устройства»

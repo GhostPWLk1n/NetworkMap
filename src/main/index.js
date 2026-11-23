@@ -171,10 +171,13 @@ function registerIpcHandlers() {
 
   if (mode === 'client') {
     const remoteHost = getRemoteHost();
-    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn }]) => {
+    Object.entries(RPC_HANDLERS).forEach(([channel, { write, fn, noCache }]) => {
       ipcMain.handle(channel, async (_event, payload) => {
         const clientInfo = { clientId: clientInstanceId, hostname: os.hostname() };
-        if (write) {
+        if (write || noCache) {
+          // noCache — данные, которые обязаны быть свежими (предпросмотр из Битрикс24):
+          // подставить при обрыве связи старый ответ значило бы показать оператору то,
+          // чего уже нет, а сохранять их на диск клиента незачем.
           // Решение "можно/нельзя" теперь принимает ИСКЛЮЧИТЕЛЬНО хост (тумблер +
           // блокировки, см. authorizeWrite) — раньше клиент отказывал сам себе по
           // жёсткому правилу "запись = нет", без всякой возможности это разрешить.
