@@ -20,8 +20,16 @@ CREATE TABLE users (
     status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','dismissed')),
     flag        TEXT CHECK (flag IN ('problem','attention','error')), -- ручная пометка, NULL = нет
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Связь с сотрудником Битрикс24 (см. src/main/bitrix.js). NULL — карточка ведётся
+    -- только локально. Уникальность — индексом ниже, а не проверкой в коде: только так
+    -- два одновременных сохранения не создадут две карточки одного сотрудника.
+    bitrix_id        INTEGER CHECK (bitrix_id IS NULL OR bitrix_id > 0),
+    bitrix_synced_at TEXT
 );
+-- NULL в уникальном индексе SQLite не конфликтуют друг с другом, поэтому несвязанных
+-- карточек может быть сколько угодно, а связанная с одним ID — только одна.
+CREATE UNIQUE INDEX idx_users_bitrix_id ON users(bitrix_id);
 
 -- ------------------------------------------------------------
 -- Устройства: компьютеры, ноутбуки, сервера, роутеры, свитчи, принтеры и т.д.

@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 const dbLock = require('./dbLock');
 
@@ -27,6 +28,12 @@ function userDataPath() {
   throw new Error('Папка данных не задана: вызовите setUserDataPath() до работы с БД (вне Electron это обязательно).');
 }
 
+/** То же, но без исключения — для мест, где папка данных лишь один из вариантов поиска
+ *  (например, где искать bitrix.yml). */
+function getUserDataDir() {
+  try { return userDataPath(); } catch { return null; }
+}
+
 let db;
 let currentDbPath = null;
 let lastConnectWarning = null; // строка предупреждения, если пришлось откатиться на локальную БД
@@ -34,7 +41,7 @@ let lastConnectWarning = null; // строка предупреждения, е�
 // { readonly, heldBy, reason, schemaMismatch?, openError? }
 let readonlyState = { readonly: false, heldBy: null, reason: null };
 
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 20;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
 const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
@@ -494,6 +501,7 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 17) migrateToV17();
   if (db.pragma('user_version', { simple: true }) < 18) migrateToV18();
   if (db.pragma('user_version', { simple: true }) < 19) migrateToV19();
+  if (db.pragma('user_version', { simple: true }) < 20) migrateToV20();
 }
 
 /**
@@ -1191,6 +1199,31 @@ function migrateToV19() {
   tx();
 }
 
+/**
+ * v19 -> v20: связь карточки пользователя с сотрудником Битрикс24 (задача #3).
+ *
+ * Только новые столбцы со значением NULL — существующие карточки остаются несвязанными
+ * и ведутся локально, как раньше. Уникальность внешнего ID обеспечивает индекс, а не
+ * проверка в коде: проверка «а нет ли уже такой карточки» с последующей вставкой — это
+ * два шага, между которыми успеет вклиниться второе сохранение.
+ */
+function migrateToV20() {
+  console.log('[db] миграция схемы v19 -> v20 (связь пользователей с Битрикс24)');
+  const tx = db.transaction(() => {
+    const columns = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+    // ADD COLUMN на существующем столбце — жёсткая ошибка, которая оборвала бы миграцию
+    if (!columns.includes('bitrix_id')) {
+      db.exec('ALTER TABLE users ADD COLUMN bitrix_id INTEGER CHECK (bitrix_id IS NULL OR bitrix_id > 0);');
+    }
+    if (!columns.includes('bitrix_synced_at')) {
+      db.exec('ALTER TABLE users ADD COLUMN bitrix_synced_at TEXT;');
+    }
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_bitrix_id ON users(bitrix_id);');
+    db.pragma('user_version = 20');
+  });
+  tx();
+}
+
 function getDb() {
   if (!db) throw new Error('DB ещё не инициализирована — вызови initDatabase() при старте приложения');
   return db;
@@ -1246,6 +1279,247 @@ const usersRepo = {
     auditLogRepo.log('user', id, 'update',
       flag ? `Пользователю «${user.full_name}» поставлена пометка «${FLAG_LABELS_RU[flag] || flag}»` : `С пользователя «${user.full_name}» снята пометка`);
     return user;
+  }
+};
+
+// ------------------------------------------------------------
+// Синхронизация карточек пользователей из Битрикс24 (задача #3)
+// ------------------------------------------------------------
+//
+// Профиль приходит из src/main/bitrix.js уже в терминах NetworkMap. Здесь — только
+// сопоставление с карточкой и запись. Правила:
+//   - пишем только в NetworkMap и только после подтверждения оператора;
+//   - если карточка уже связана с этим ID — обновляется она же; при первой синхронизации
+//     оператор явно выбирает: создать новую или связать с существующей;
+//   - пустое поле в Битрикс24 не стирает заполненное локальное значение;
+//   - заметки, статус, пометка, устройства и их история не трогаются вовсе;
+//   - статус «уволен» по неактивному профилю НЕ ставится — только предупреждение.
+//
+// preview и apply строят один и тот же план (buildBitrixPlan). apply делает это
+// повторно внутри транзакции и сверяет отпечаток с тем, что видел оператор: если с
+// момента предпросмотра изменились данные в Битрикс24, локальная карточка или связь,
+// запись отклоняется с просьбой проверить предпросмотр заново. Так оператор сохраняет
+// ровно то, что ему показали, а не то, что успело прийти позже.
+
+/** Поля карточки, которые заполняются из Битрикс24, — в порядке показа. */
+const BITRIX_SYNC_FIELDS = [
+  { field: 'full_name', label: 'ФИО', profileKey: 'fullName' },
+  { field: 'position', label: 'Должность', profileKey: 'position' },
+  { field: 'department', label: 'Подразделение', profileKey: 'department' },
+  { field: 'email', label: 'Email', profileKey: 'email' },
+  { field: 'phone', label: 'Телефон', profileKey: 'phone' }
+];
+
+function localText(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s || null;
+}
+
+/** action: 'set' — поле было пустым и заполнится; 'change' — значение заменится;
+ *  'same' — уже совпадает; 'keep' — в Битрикс24 пусто, локальное значение остаётся;
+ *  'empty' — пусто и там, и там. */
+function diffBitrixFields(localUser, profile) {
+  return BITRIX_SYNC_FIELDS.map(({ field, label, profileKey }) => {
+    const from = localUser ? localText(localUser[field]) : null;
+    const incoming = localText(profile[profileKey]);
+    let action;
+    if (incoming === null) action = from === null ? 'empty' : 'keep';
+    else if (incoming === from) action = 'same';
+    else action = from === null ? 'set' : 'change';
+    const to = (action === 'set' || action === 'change') ? incoming : from;
+    return { field, label, from, to, action };
+  });
+}
+
+function bitrixFingerprint(bitrixId, target, changes) {
+  const canonical = JSON.stringify({
+    v: 1,
+    bitrixId,
+    target: { mode: target.mode, userId: target.userId || null },
+    changes: changes.map((c) => [c.field, c.from, c.to, c.action])
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+function publicUserRow(u) {
+  return u ? {
+    id: u.id, full_name: u.full_name, department: u.department, position: u.position,
+    email: u.email, phone: u.phone, status: u.status, bitrix_id: u.bitrix_id ?? null
+  } : null;
+}
+
+/**
+ * Общее ядро preview/apply. requestedTarget — выбор оператора при первой синхронизации:
+ * { mode: 'create' } или { mode: 'link', userId }. Если связь уже есть, выбор не нужен и
+ * игнорируется — цель всегда связанная карточка.
+ */
+function buildBitrixPlan(profile, requestedTarget) {
+  const db = getDb();
+  const bitrixId = profile.bitrixId;
+  const linked = db.prepare('SELECT * FROM users WHERE bitrix_id = ?').get(bitrixId) || null;
+
+  const warnings = [];
+  if (profile.active === false) warnings.push('inactive');
+  if (!profile.department && profile.departmentIds && profile.departmentIds.length) warnings.push('department_ids_only');
+
+  const plan = {
+    bitrixId,
+    linkedUser: publicUserRow(linked),
+    target: null,
+    needsTarget: false,
+    candidates: [],
+    changes: [],
+    hasChanges: false,
+    warnings,
+    canApply: false,
+    blockReason: null,
+    fingerprint: null,
+    targetUser: null
+  };
+
+  let targetUser = null;
+  if (linked) {
+    plan.target = { mode: 'linked', userId: linked.id };
+    targetUser = linked;
+  } else {
+    // Кандидаты для ручной привязки: все ещё не связанные карточки. Совпадения по email и
+    // ФИО — первыми и с подписью, но НЕ выбираются автоматически: решает оператор.
+    const email = localText(profile.email);
+    const name = localText(profile.fullName);
+    const unlinked = db.prepare('SELECT * FROM users WHERE bitrix_id IS NULL ORDER BY full_name').all();
+    plan.candidates = unlinked.map((u) => {
+      const match = [];
+      if (email && localText(u.email) && localText(u.email).toLowerCase() === email.toLowerCase()) match.push('email');
+      if (name && localText(u.full_name) && localText(u.full_name).toLowerCase() === name.toLowerCase()) match.push('name');
+      return { ...publicUserRow(u), match };
+    }).sort((a, b) => (b.match.length - a.match.length) || 0);
+
+    const mode = requestedTarget && requestedTarget.mode;
+    if (mode === 'create') {
+      plan.target = { mode: 'create' };
+    } else if (mode === 'link') {
+      const userId = Number(requestedTarget.userId);
+      targetUser = Number.isInteger(userId) ? db.prepare('SELECT * FROM users WHERE id = ?').get(userId) : null;
+      if (!targetUser) {
+        plan.needsTarget = true;
+        plan.blockReason = 'Выбранная карточка не найдена — возможно, её уже удалили. Выберите другую.';
+        return plan;
+      }
+      if (targetUser.bitrix_id !== null && targetUser.bitrix_id !== undefined) {
+        plan.needsTarget = true;
+        plan.blockReason = `Карточка «${targetUser.full_name}» уже связана с другим сотрудником Битрикс24 (ID ${targetUser.bitrix_id}).`;
+        return plan;
+      }
+      plan.target = { mode: 'link', userId: targetUser.id };
+    } else {
+      plan.needsTarget = true;
+      plan.blockReason = 'Сотрудник ещё не связан с карточкой NetworkMap — выберите: создать новую карточку или связать с существующей.';
+      return plan;
+    }
+  }
+
+  plan.targetUser = publicUserRow(targetUser);
+  plan.changes = diffBitrixFields(targetUser, profile);
+  plan.hasChanges = plan.changes.some((c) => c.action === 'set' || c.action === 'change');
+
+  if (plan.target.mode === 'create' && !localText(profile.fullName)) {
+    plan.blockReason = 'У сотрудника в Битрикс24 не заполнено ФИО — новую карточку создать нельзя. Свяжите его с существующей.';
+  } else if (plan.target.mode === 'linked' && !plan.hasChanges) {
+    plan.blockReason = 'Данные в карточке уже совпадают с Битрикс24 — сохранять нечего.';
+  } else {
+    plan.canApply = true;
+  }
+  plan.fingerprint = bitrixFingerprint(bitrixId, plan.target, plan.changes);
+  return plan;
+}
+
+function staleBitrixPreview() {
+  return new Error('Данные изменились после предпросмотра (в Битрикс24, в карточке или в связи с ней). ' +
+    'Нажмите «Найти» ещё раз и проверьте изменения перед сохранением.');
+}
+
+const bitrixSyncRepo = {
+  FIELDS: BITRIX_SYNC_FIELDS,
+
+  /** Предпросмотр: ничего не пишет. Возвращает план и отпечаток для apply. */
+  preview(profile, requestedTarget = null) {
+    const plan = buildBitrixPlan(profile, requestedTarget);
+    return { ...plan, profile };
+  },
+
+  /**
+   * Сохранение по подтверждённому предпросмотру. requestedTarget и fingerprint — ровно то,
+   * что вернул preview. Транзакция IMMEDIATE: блокировку на запись берём сразу, до чтения,
+   * чтобы между сверкой и записью никто не вклинился. Уникальный индекс по bitrix_id —
+   * последний рубеж на случай, если вклиниться всё же попробует другой процесс.
+   */
+  apply(profile, requestedTarget, fingerprint) {
+    const db = getDb();
+    const run = db.transaction(() => {
+      const plan = buildBitrixPlan(profile, requestedTarget);
+      if (plan.needsTarget) throw new Error(plan.blockReason);
+      const requestedMode = requestedTarget && requestedTarget.mode;
+      // Связь появилась или пропала после предпросмотра — оператор видел другой сценарий
+      if (plan.target.mode === 'linked' ? requestedMode !== 'linked' : requestedMode === 'linked') throw staleBitrixPreview();
+      if (plan.target.mode === 'linked' && Number(requestedTarget.userId) !== plan.target.userId) throw staleBitrixPreview();
+      if (!fingerprint || plan.fingerprint !== fingerprint) throw staleBitrixPreview();
+      if (!plan.canApply) throw new Error(plan.blockReason);
+
+      const changed = plan.changes.filter((c) => c.action === 'set' || c.action === 'change');
+      const changedLabels = changed.map((c) => c.label.toLowerCase());
+      let userId;
+
+      if (plan.target.mode === 'create') {
+        const values = {};
+        plan.changes.forEach((c) => { values[c.field] = c.to; });
+        const info = db.prepare(`
+          INSERT INTO users (full_name, department, position, email, phone, bitrix_id, bitrix_synced_at)
+          VALUES (@full_name, @department, @position, @email, @phone, @bitrix_id, datetime('now'))
+        `).run({ ...values, bitrix_id: plan.bitrixId });
+        userId = Number(info.lastInsertRowid);
+        auditLogRepo.log('user', userId, 'create',
+          `Пользователь «${values.full_name}» создан по данным Битрикс24 (ID ${plan.bitrixId})`);
+      } else {
+        userId = plan.target.userId;
+        const sets = changed.map((c) => `${c.field} = @${c.field}`);
+        const params = { id: userId, bitrix_id: plan.bitrixId };
+        changed.forEach((c) => { params[c.field] = c.to; });
+        // Имена столбцов — только из BITRIX_SYNC_FIELDS, не из запроса: подстановка безопасна
+        const info = db.prepare(`
+          UPDATE users SET ${sets.length ? `${sets.join(', ')}, ` : ''}
+                 bitrix_id = @bitrix_id, bitrix_synced_at = datetime('now'), updated_at = datetime('now')
+          WHERE id = @id AND (bitrix_id IS NULL OR bitrix_id = @bitrix_id)
+        `).run(params);
+        if (info.changes !== 1) throw staleBitrixPreview();
+        const name = db.prepare('SELECT full_name FROM users WHERE id = ?').get(userId).full_name;
+        if (plan.target.mode === 'link') {
+          auditLogRepo.log('user', userId, 'update',
+            `Пользователь «${name}» связан с сотрудником Битрикс24 (ID ${plan.bitrixId})` +
+            (changedLabels.length ? `; обновлено: ${changedLabels.join(', ')}` : ''));
+        } else {
+          auditLogRepo.log('user', userId, 'update',
+            `Пользователь «${name}» обновлён по данным Битрикс24 (ID ${plan.bitrixId}): ${changedLabels.join(', ')}`);
+        }
+      }
+
+      return {
+        user: db.prepare('SELECT * FROM users WHERE id = ?').get(userId),
+        created: plan.target.mode === 'create',
+        newlyLinked: plan.target.mode !== 'linked', // связь появилась этим сохранением
+        changedFields: changed.map((c) => c.field)
+      };
+    });
+
+    try {
+      return run.immediate();
+    } catch (err) {
+      if (err && err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        throw new Error(`Сотрудник Битрикс24 с ID ${profile.bitrixId} уже связан с другой карточкой — ` +
+          'вероятно, её только что сохранили с другого рабочего места. Нажмите «Найти» ещё раз.');
+      }
+      throw err;
+    }
   }
 };
 
@@ -2642,8 +2916,8 @@ const networkRepo = {
 };
 
 module.exports = {
-  setUserDataPath,
-  initDatabase, getDb, getDbReadonly, markReadonly, releaseDbLock, dbLock, usersRepo, devicesRepo, pingRepo,
+  setUserDataPath, getUserDataDir,
+  initDatabase, getDb, getDbReadonly, markReadonly, releaseDbLock, dbLock, usersRepo, bitrixSyncRepo, devicesRepo, pingRepo,
   floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
   softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,

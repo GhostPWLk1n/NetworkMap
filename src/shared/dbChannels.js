@@ -16,12 +16,23 @@
 // lockEntity   — какой объект операция затрагивает, чтобы сверить с блокировкой
 //                «взялся — ходи»; без него операция блокировками не защищена.
 
+// noCache: true    — клиент не сохраняет ответ в локальный кэш и не подставляет старый
+//                    ответ при обрыве связи (см. main/index.js). Нужно для данных, которые
+//                    обязаны быть свежими: например, предпросмотра из Битрикс24.
+
 const {
-  usersRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
+  usersRepo, bitrixSyncRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
-  getDbReadonly
+  getDbReadonly, getCurrentDbPath, getUserDataDir
 } = require('../main/db');
 const { pingHost } = require('../main/ping');
+const { lookupBitrixUser } = require('../main/bitrix');
+
+/** Где искать bitrix.yml — у процесса, который владеет базой (см. bitrix.js). Эти
+ *  каналы выполняются только там: клиент шлёт их по RPC на сервер или хост. */
+function bitrixContext() {
+  return { dbPath: getCurrentDbPath(), dataDir: getUserDataDir() };
+}
 
 const DB_CHANNELS = {
   'users:list': { write: false, fn: () => usersRepo.list() },
@@ -30,6 +41,20 @@ const DB_CHANNELS = {
   'users:setStatus': { write: true, fn: ({ id, status }) => usersRepo.setStatus(id, status) },
   'users:setFlag': { write: true, fn: ({ id, flag }) => usersRepo.setFlag(id, flag) },
   'users:remove': { write: true, fn: (id) => usersRepo.remove(id) },
+
+  // Синхронизация из Битрикс24 (задача #3). Профиль запрашивается заново и при
+  // предпросмотре, и при сохранении: apply сверяет отпечаток с тем, что видел оператор.
+  'bitrix:preview': {
+    write: false,
+    noCache: true,
+    fn: async ({ bitrixId, target = null } = {}) =>
+      bitrixSyncRepo.preview(await lookupBitrixUser(bitrixId, bitrixContext()), target)
+  },
+  'bitrix:apply': {
+    write: true,
+    fn: async ({ bitrixId, target, fingerprint } = {}) =>
+      bitrixSyncRepo.apply(await lookupBitrixUser(bitrixId, bitrixContext()), target, fingerprint)
+  },
 
   'devices:list': { write: false, fn: () => devicesRepo.list() },
   'devices:create': { write: true, fn: (payload) => devicesRepo.create(payload) },

@@ -33,6 +33,10 @@
 #
 #   docker compose cp networkmap-server:/data/backups .\backups
 #
+# Положить в том настройку Битрикс24 (сервер перечитывает её сам, перезапуск не нужен):
+#
+#   docker compose cp bitrix.yml networkmap-server:/data/bitrix.yml
+#
 # Посмотреть, что в томе, и сколько он занимает:
 #
 #   docker compose exec networkmap-server ls -la /data /data/backups

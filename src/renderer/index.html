@@ -132,6 +132,7 @@
     <div class="tab-sticky-header">
       <div id="import-bar">
         <button id="import-excel-btn" type="button">📥 Импорт из Excel</button>
+        <button id="bitrix-sync-btn" type="button" title="Найти сотрудника в Битрикс24 по ID и создать или обновить его карточку">🔗 Из Битрикс24</button>
         <span id="import-status"></span>
       </div>
       <div id="import-report" class="hidden"></div>
@@ -416,6 +417,31 @@
       <div class="modal-title" id="alert-modal-title"></div>
       <div class="modal-actions">
         <button id="alert-modal-ok" type="button">Ок</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Синхронизация карточки пользователя из Битрикс24 (задача #3): поиск по ID →
+       предпросмотр изменений → явное подтверждение. Пишет только в NetworkMap. -->
+  <div id="bitrix-modal" class="modal-overlay hidden">
+    <div class="modal-box bitrix-box">
+      <div class="modal-title">Карточка из Битрикс24</div>
+      <form id="bitrix-search-form" class="bitrix-search">
+        <label for="bitrix-id-input">ID сотрудника в Битрикс24</label>
+        <div class="bitrix-search-row">
+          <input id="bitrix-id-input" inputmode="numeric" autocomplete="off" placeholder="например, 128" />
+          <button id="bitrix-search-btn" type="submit">Найти</button>
+        </div>
+      </form>
+      <div id="bitrix-status" class="bitrix-status hidden" role="status"></div>
+      <div id="bitrix-result" class="hidden">
+        <div id="bitrix-profile" class="bitrix-profile"></div>
+        <div id="bitrix-target" class="bitrix-target"></div>
+        <div id="bitrix-changes"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="bitrix-cancel-btn" type="button">Закрыть</button>
+        <button id="bitrix-apply-btn" type="button" class="primary" disabled>Сохранить в NetworkMap</button>
       </div>
     </div>
   </div>
