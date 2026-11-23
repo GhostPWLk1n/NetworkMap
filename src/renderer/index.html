@@ -15,6 +15,7 @@
       <button class="tab-btn" data-tab="devices">Устройства</button>
       <button class="tab-btn" data-tab="warehouse">Склад</button>
       <button class="tab-btn" data-tab="software">ПО</button>
+      <button class="tab-btn" data-tab="invoices">Счета</button>
       <button class="tab-btn" data-tab="network">Сеть</button>
       <button class="tab-btn" data-tab="audit">Журнал</button>
     </nav>
@@ -339,6 +340,27 @@
     </div>
   </div>
 
+  <!-- ЛИСТ: Счета поставщиков (задача #8) — реестр счетов, распознанных из PDF.
+       Сохранение счёта не создаёт приход на склад и не меняет остатки. -->
+  <div id="tab-invoices" class="tab-content">
+    <div class="tab-sticky-header">
+      <div class="invoices-toolbar">
+        <div class="search-bar invoices-search">
+          <input id="invoices-search-input" placeholder="Поиск: номер, поставщик, ИНН, файл" autocomplete="off" />
+          <button class="search-toggle" id="invoices-search-clear" type="button" title="Очистить">×</button>
+        </div>
+        <button id="invoices-upload-btn" type="button" class="primary">📄 Загрузить PDF</button>
+      </div>
+      <p class="search-advanced-note">
+        Счёт распознаётся из текстового слоя PDF. Перед сохранением проверьте реквизиты, позиции
+        и итоги. Оригинал хранится в базе вместе с карточкой. Склад при этом не меняется.
+      </p>
+    </div>
+    <div class="tab-scroll-body">
+      <div id="invoices-list" class="card-list"></div>
+    </div>
+  </div>
+
   <!-- ЛИСТ 6: Сеть -->
   <div id="tab-network" class="tab-content">
     <div class="tab-sticky-header">
@@ -442,6 +464,60 @@
       <div class="modal-actions">
         <button id="bitrix-cancel-btn" type="button">Закрыть</button>
         <button id="bitrix-apply-btn" type="button" class="primary" disabled>Сохранить в NetworkMap</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Карточка счёта поставщика (задача #8): проверка распознанного перед записью,
+       просмотр и правка сохранённого. -->
+  <div id="invoice-modal" class="modal-overlay hidden">
+    <div class="modal-box invoice-box" role="dialog" aria-labelledby="invoice-modal-title">
+      <div class="invoice-head">
+        <div class="modal-title" id="invoice-modal-title">Счёт поставщика</div>
+        <div id="invoice-file" class="invoice-file"></div>
+      </div>
+      <div id="invoice-status" class="invoice-status hidden" role="status"></div>
+      <div id="invoice-duplicates" class="invoice-duplicates hidden"></div>
+      <form id="invoice-form" autocomplete="off">
+        <fieldset class="invoice-header">
+          <label>Номер счёта<input name="number" data-field="number" /></label>
+          <label>Дата<input name="invoice_date" data-field="invoice_date" type="date" /></label>
+          <label>Валюта<input name="currency" data-field="currency" placeholder="RUB" /></label>
+          <label class="wide">Поставщик<input name="supplier_name" data-field="supplier_name" /></label>
+          <label>ИНН поставщика<input name="supplier_inn" data-field="supplier_inn" inputmode="numeric" /></label>
+          <label>КПП поставщика<input name="supplier_kpp" data-field="supplier_kpp" /></label>
+          <label class="wide">Покупатель / плательщик<input name="buyer_name" data-field="buyer_name" /></label>
+          <label>ИНН покупателя<input name="buyer_inn" data-field="buyer_inn" inputmode="numeric" /></label>
+          <label>КПП покупателя<input name="buyer_kpp" data-field="buyer_kpp" /></label>
+        </fieldset>
+        <div class="invoice-items-wrap">
+          <table class="invoice-items">
+            <thead>
+              <tr>
+                <th class="c-pos">№</th><th class="c-code">Код / артикул</th><th class="c-name">Наименование</th>
+                <th class="c-unit">Ед.</th><th class="c-num">Кол-во</th><th class="c-num">Цена</th>
+                <th class="c-num">Сумма</th><th class="c-rate">Ставка НДС</th><th class="c-num">НДС</th><th class="c-del"></th>
+              </tr>
+            </thead>
+            <tbody id="invoice-items-body"></tbody>
+          </table>
+          <button id="invoice-add-item" type="button" class="invoice-add-item">+ Добавить строку</button>
+        </div>
+        <fieldset class="invoice-totals">
+          <label>Итого<input name="total_amount" data-field="total_amount" data-num="1" inputmode="decimal" /></label>
+          <label>В т. ч. НДС / сумма НДС<input name="vat_amount" data-field="vat_amount" data-num="1" inputmode="decimal" /></label>
+          <label>К оплате<input name="amount_due" data-field="amount_due" data-num="1" inputmode="decimal" /></label>
+          <label class="wide">Отметка об НДС<input name="vat_note" data-field="vat_note" placeholder="например, «Без налога (НДС)»" /></label>
+          <label class="full">Примечание<textarea name="notes" data-field="notes" rows="2"></textarea></label>
+        </fieldset>
+        <div id="invoice-warnings" class="invoice-warnings hidden"></div>
+      </form>
+      <div class="modal-actions">
+        <button id="invoice-delete-btn" type="button" class="danger-btn hidden">Удалить</button>
+        <span class="spacer"></span>
+        <button id="invoice-cancel-btn" type="button">Закрыть</button>
+        <button id="invoice-edit-btn" type="button" class="hidden">Редактировать</button>
+        <button id="invoice-save-btn" type="button" class="primary hidden">Сохранить</button>
       </div>
     </div>
   </div>
@@ -574,6 +650,8 @@
   </div>
 
   <script src="../../node_modules/konva/konva.min.js"></script>
+  <script src="../shared/invoiceMath.js"></script>
   <script src="index.js"></script>
+  <script src="invoices.js"></script>
 </body>
 </html>

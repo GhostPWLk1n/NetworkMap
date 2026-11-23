@@ -41,7 +41,7 @@ let lastConnectWarning = null; // строка предупреждения, е�
 // { readonly, heldBy, reason, schemaMismatch?, openError? }
 let readonlyState = { readonly: false, heldBy: null, reason: null };
 
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 21;
 const FLAG_VALUES = ['problem', 'attention', 'error']; // null = нет пометки, отдельно не входит в список
 const FLAG_LABELS_RU = { problem: 'Проблема', attention: 'Внимание', error: 'Ошибка' }; // для текста в журнале изменений
 const DEVICE_STATUS_LABELS_RU = { active: 'Активен', repair: 'Ремонт', storage: 'На складе', decommissioned: 'Списан' };
@@ -502,6 +502,7 @@ function runMigrations() {
   if (db.pragma('user_version', { simple: true }) < 18) migrateToV18();
   if (db.pragma('user_version', { simple: true }) < 19) migrateToV19();
   if (db.pragma('user_version', { simple: true }) < 20) migrateToV20();
+  if (db.pragma('user_version', { simple: true }) < 21) migrateToV21();
 }
 
 /**
@@ -1220,6 +1221,69 @@ function migrateToV20() {
     }
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_bitrix_id ON users(bitrix_id);');
     db.pragma('user_version = 20');
+  });
+  tx();
+}
+
+/**
+ * v20 -> v21: счета поставщиков (задача #8) — оригиналы документов, карточки счетов и
+ * позиции. Только новые таблицы, существующие данные не трогаются. IF NOT EXISTS —
+ * чтобы прерванную на середине миграцию можно было безопасно повторить.
+ */
+function migrateToV21() {
+  console.log('[db] миграция схемы v20 -> v21 (счета поставщиков из PDF)');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS document_files (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          sha256       TEXT NOT NULL UNIQUE CHECK (length(sha256) = 64),
+          file_name    TEXT NOT NULL,
+          mime_type    TEXT NOT NULL DEFAULT 'application/pdf',
+          size_bytes   INTEGER NOT NULL CHECK (size_bytes > 0),
+          page_count   INTEGER,
+          content      BLOB NOT NULL,
+          created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS invoices (
+          id             INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_id        INTEGER NOT NULL UNIQUE REFERENCES document_files(id),
+          number         TEXT NOT NULL,
+          invoice_date   TEXT NOT NULL,
+          supplier_name  TEXT NOT NULL,
+          supplier_inn   TEXT,
+          supplier_kpp   TEXT,
+          buyer_name     TEXT,
+          buyer_inn      TEXT,
+          buyer_kpp      TEXT,
+          currency       TEXT,
+          total_amount   TEXT,
+          vat_amount     TEXT,
+          amount_due     TEXT,
+          vat_note       TEXT,
+          notes          TEXT,
+          recognition    TEXT,
+          revision       INTEGER NOT NULL DEFAULT 1,
+          created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_invoices_requisites ON invoices(supplier_inn, number, invoice_date);
+      CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(invoice_date);
+      CREATE TABLE IF NOT EXISTS invoice_items (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          invoice_id   INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+          position     INTEGER NOT NULL CHECK (position > 0),
+          name         TEXT NOT NULL,
+          code         TEXT,
+          unit         TEXT,
+          quantity     TEXT,
+          price        TEXT,
+          amount       TEXT,
+          vat_rate     TEXT,
+          vat_amount   TEXT,
+          UNIQUE (invoice_id, position)
+      );
+    `);
+    db.pragma('user_version = 21');
   });
   tx();
 }
@@ -2833,6 +2897,9 @@ const auditLogRepo = {
   }
 };
 
+// Реестр счетов поставщиков (задача #8) — в отдельном модуле, чтобы не раздувать этот файл
+const invoicesRepo = require('./invoices').createInvoicesRepo({ getDb, auditLogRepo });
+
 const networkRepo = {
   /** Кандидаты в корень дерева — роутеры и свитчи */
   listRoots() {
@@ -2928,7 +2995,7 @@ module.exports = {
   initDatabase, getDb, getDbReadonly, markReadonly, releaseDbLock, dbLock, usersRepo, bitrixSyncRepo, devicesRepo, pingRepo,
   floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
   ownershipRepo, componentsRepo, peripheralsRepo,
-  softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
+  softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo, invoicesRepo,
   getDefaultDbPath, getCurrentDbPath, getLastConnectWarning, setConfiguredDbPath, getConfiguredDbPath,
   getAppMode, getHostPort, getRemoteHost, setHostMode, setClientMode, getDiscoveryPath,
   getServerToken, getSourceKind,

@@ -16,13 +16,15 @@
 // lockEntity   — какой объект операция затрагивает, чтобы сверить с блокировкой
 //                «взялся — ходи»; без него операция блокировками не защищена.
 
+// timeoutMs        — сколько клиент ждёт ответа по сети (по умолчанию 10 с); больше —
+//                    для каналов, которые везут файлы.
 // noCache: true    — клиент не сохраняет ответ в локальный кэш и не подставляет старый
 //                    ответ при обрыве связи (см. main/index.js). Нужно для данных, которые
 //                    обязаны быть свежими: например, предпросмотра из Битрикс24.
 
 const {
   usersRepo, bitrixSyncRepo, devicesRepo, pingRepo, floorPlansRepo, planItemsRepo, cablesRepo, cableConnectionsRepo,
-  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo,
+  ownershipRepo, componentsRepo, peripheralsRepo, softwareRepo, warehouseRepo, zonesRepo, networkRepo, auditLogRepo, invoicesRepo,
   getDbReadonly, getCurrentDbPath, getUserDataDir
 } = require('../main/db');
 const { pingHost } = require('../main/ping');
@@ -55,6 +57,19 @@ const DB_CHANNELS = {
     fn: async ({ bitrixId, target, fingerprint } = {}) =>
       bitrixSyncRepo.apply(await lookupBitrixUser(bitrixId, bitrixContext()), target, fingerprint)
   },
+
+  // Счета поставщиков (задача #8). PDF разбирает приложение оператора (main/index.js,
+  // каналы invoices:pickPdf и т. п.), сюда приходят проверенные оператором данные и сам
+  // файл. Карточка, позиции и оригинал пишутся одной транзакцией. Счёт и файл не
+  // кэшируются на клиенте: оригинал может весить мегабайты, а дубли проверяются по
+  // свежим данным.
+  'invoices:list': { write: false, fn: () => invoicesRepo.list() },
+  'invoices:get': { write: false, noCache: true, fn: (id) => invoicesRepo.get(id) },
+  'invoices:getFile': { write: false, noCache: true, timeoutMs: 60000, fn: (id) => invoicesRepo.getFile(id) },
+  'invoices:findDuplicates': { write: false, noCache: true, fn: (query) => invoicesRepo.findDuplicates(query) },
+  'invoices:create': { write: true, timeoutMs: 60000, fn: (payload) => invoicesRepo.create(payload) },
+  'invoices:update': { write: true, fn: ({ id, ...payload }) => invoicesRepo.update(id, payload) },
+  'invoices:remove': { write: true, fn: (id) => invoicesRepo.remove(id) },
 
   'devices:list': { write: false, fn: () => devicesRepo.list() },
   'devices:create': { write: true, fn: (payload) => devicesRepo.create(payload) },

@@ -73,6 +73,20 @@ contextBridge.exposeInMainWorld('api', {
     preview: (bitrixId, target = null) => invoke('bitrix:preview', { bitrixId, target }),
     apply: (bitrixId, target, fingerprint) => invoke('bitrix:apply', { bitrixId, target, fingerprint })
   },
+  // Счета поставщиков (задача #8). pickPdf/openFile/saveFileAs — локально (диалоги,
+  // разбор PDF); остальное — процесс, владеющий базой (в сетевом режиме — сервер).
+  invoices: {
+    pickPdf: () => invoke('invoices:pickPdf'),
+    list: () => invoke('invoices:list'),
+    get: (id) => invoke('invoices:get', id),
+    getFile: (id) => invoke('invoices:getFile', id),
+    findDuplicates: (query) => invoke('invoices:findDuplicates', query),
+    create: (payload) => invoke('invoices:create', payload),
+    update: (id, payload) => invoke('invoices:update', { id, ...payload }),
+    remove: (id) => invoke('invoices:remove', id),
+    openFile: (file) => invoke('invoices:openFile', file),
+    saveFileAs: (file) => invoke('invoices:saveFileAs', file)
+  },
   devices: {
     list: () => invoke('devices:list'),
     create: (payload) => invoke('devices:create', payload),

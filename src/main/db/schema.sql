@@ -397,13 +397,78 @@ CREATE TABLE audit_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
     entity_type  TEXT NOT NULL,   -- 'user' | 'device' | 'plan_item' | 'cable' | 'zone' | 'warehouse_item' |
-                                   -- 'software' | 'component' | 'peripheral' | 'floor_plan' | 'ownership'
+                                   -- 'software' | 'component' | 'peripheral' | 'floor_plan' | 'ownership' | 'invoice'
     entity_id    INTEGER,         -- id сущности на момент действия (может уже не существовать)
     action       TEXT NOT NULL,   -- 'create' | 'update' | 'delete' | 'status_change' | другое короткое слово
     summary      TEXT NOT NULL    -- человекочитаемое описание, готовое для показа в списке
 );
 CREATE INDEX idx_audit_log_created ON audit_log(created_at);
 CREATE INDEX idx_audit_log_entity ON audit_log(entity_type, entity_id);
+
+-- ============================================================
+-- Документы поставщиков (задача #8: счета; та же таблица файлов пригодится для
+-- коммерческих предложений, #5)
+-- ============================================================
+
+-- Оригиналы загруженных документов. Файл хранится прямо в базе (BLOB), а не рядом с
+-- ней: карточка и оригинал пишутся одной транзакцией (не бывает карточки без файла и
+-- «осиротевших» файлов), резервная копия базы (db.backup на сервере) уносит оригиналы
+-- вместе с данными, а клиент получает файл по тому же RPC, что и всё остальное.
+-- sha256 уникален — один и тот же PDF второй раз не сохраняется.
+CREATE TABLE document_files (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256       TEXT NOT NULL UNIQUE CHECK (length(sha256) = 64),
+    file_name    TEXT NOT NULL,
+    mime_type    TEXT NOT NULL DEFAULT 'application/pdf',
+    size_bytes   INTEGER NOT NULL CHECK (size_bytes > 0),
+    page_count   INTEGER,
+    content      BLOB NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Счета поставщиков. Суммы — канонические десятичные строки ("1234.50"), как в
+-- документе, без округления через float (см. src/shared/invoiceMath.js).
+-- Сохранение счёта НЕ создаёт приход на склад и не меняет остатки.
+CREATE TABLE invoices (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id        INTEGER NOT NULL UNIQUE REFERENCES document_files(id),
+    number         TEXT NOT NULL,
+    invoice_date   TEXT NOT NULL,          -- YYYY-MM-DD
+    supplier_name  TEXT NOT NULL,
+    supplier_inn   TEXT,
+    supplier_kpp   TEXT,
+    buyer_name     TEXT,
+    buyer_inn      TEXT,
+    buyer_kpp      TEXT,
+    currency       TEXT,                   -- RUB / USD / EUR …; NULL — в документе не указана
+    total_amount   TEXT,
+    vat_amount     TEXT,
+    amount_due     TEXT,
+    vat_note       TEXT,                   -- «Без налога (НДС)» и т. п., как в документе
+    notes          TEXT,
+    recognition    TEXT,                   -- JSON: что распознано автоматически (для истории)
+    revision       INTEGER NOT NULL DEFAULT 1,   -- растёт при каждой правке: защита от затирания чужих правок
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_invoices_requisites ON invoices(supplier_inn, number, invoice_date);
+CREATE INDEX idx_invoices_date ON invoices(invoice_date);
+
+-- Позиции счёта в порядке документа. Наименование — как в счёте, без «нормализации».
+CREATE TABLE invoice_items (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id   INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    position     INTEGER NOT NULL CHECK (position > 0),
+    name         TEXT NOT NULL,
+    code         TEXT,                     -- код / артикул
+    unit         TEXT,
+    quantity     TEXT,
+    price        TEXT,
+    amount       TEXT,
+    vat_rate     TEXT,                     -- как в документе: «20%», «Без НДС»
+    vat_amount   TEXT,
+    UNIQUE (invoice_id, position)
+);
 
 -- ============================================================
 -- Полнотекстовый поиск (FTS5) по устройствам и пользователям
