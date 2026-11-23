@@ -559,6 +559,123 @@ def make_1c_centered(expected):
         vat_note='НДС не облагается', count=len(rows), pages=2)
 
 
+def _tounicode_map(stream_bytes):
+    """ToUnicode CMap → {код: строка}. Нужны bfchar и bfrange — так пишет reportlab."""
+    import re as _re
+    text = stream_bytes.decode('latin1')
+    out = {}
+    for block in _re.findall(r'beginbfchar(.*?)endbfchar', text, _re.S):
+        for src, dst in _re.findall(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', block):
+            out[int(src, 16)] = bytes.fromhex(dst).decode('utf-16-be')
+    for block in _re.findall(r'beginbfrange(.*?)endbfrange', text, _re.S):
+        for a, b, dst in _re.findall(r'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>', block):
+            start = int(dst, 16)
+            for k, code in enumerate(range(int(a, 16), int(b, 16) + 1)):
+                out[code] = chr(start + k)
+    return out
+
+
+def make_cid_variant(expected, src, dst, strip_only=False):
+    """Тот же счёт, но шрифты — как у части генераторов PDF:
+    strip_only=False — составной шрифт Type0 / Identity-H со встроенным TrueType и БЕЗ
+      ToUnicode (коды — номера глифов). pdf.js сам такой текст не читает, приложение
+      восстанавливает буквы по таблице cmap встроенного шрифта;
+    strip_only=True — у простых шрифтов просто убрана ToUnicode: восстановить буквы
+      неоткуда, текст нечитаем, форма должна предложить ручное заполнение."""
+    import pikepdf
+    from fontTools import subset as ft_subset
+    from fontTools.ttLib import TTFont as FTFont
+    pdf = pikepdf.open(os.path.join(HERE, src))
+    fonts_by_base = {'DejaVuSans': os.path.join(FONT_DIR, 'DejaVuSans.ttf'), 'DejaVuSans-Bold': os.path.join(FONT_DIR, 'DejaVuSans-Bold.ttf')}
+    code_maps = {}   # objgen шрифта -> (база, {код: символ})
+    used = {b: set() for b in fonts_by_base}
+    for page in pdf.pages:
+        for name, f in page.Resources.get('/Font', {}).items():
+            if '/ToUnicode' not in f:
+                continue
+            base = str(f.BaseFont).split('+')[-1]
+            code_maps[f.objgen] = (base, _tounicode_map(f.ToUnicode.read_bytes()))
+    if strip_only:
+        for page in pdf.pages:
+            for name, f in page.Resources.get('/Font', {}).items():
+                if '/ToUnicode' in f:
+                    del f['/ToUnicode']
+        pdf.save(os.path.join(HERE, dst), deterministic_id=True)
+        expected[dst] = {'pages': len(pdf.pages), 'unreadable': True}
+        return
+    # Шрифты страниц — до любых замен (словарь ресурсов бывает общим для страниц)
+    page_fonts = [{str(k): code_maps.get(f.objgen) for k, f in page.Resources.get('/Font', {}).items()} for page in pdf.pages]
+    # Какие символы встречаются — для подмножества шрифта
+    for pi, page in enumerate(pdf.pages):
+        cur = None
+        for operands, op in pikepdf.parse_content_stream(page):
+            if str(op) == 'Tf':
+                cur = page_fonts[pi].get(str(operands[0]))
+            elif str(op) in ('Tj', "'", '"', 'TJ') and cur:
+                strs = operands[0] if str(op) == 'TJ' else [operands[-1]]
+                for s_ in strs:
+                    if isinstance(s_, pikepdf.String):
+                        used[cur[0]].update(cur[1].get(b, '') for b in bytes(s_))
+    new_fonts = {}
+    for base, path in fonts_by_base.items():
+        full = FTFont(path, recalcTimestamp=False)
+        cmap = full.getBestCmap()
+        order = full.getGlyphOrder()
+        gid_of = {ch: order.index(cmap[ord(ch)]) for ch in used[base] if ch and ord(ch) in cmap}
+        opts = ft_subset.Options()
+        opts.retain_gids = True          # номера глифов как в полном шрифте — их и пишем в текст
+        opts.name_IDs = []
+        opts.drop_tables += ['DSIG']
+        sub = ft_subset.Subsetter(opts)
+        sub.populate(unicodes=[ord(c) for c in gid_of])
+        tt = FTFont(path, recalcTimestamp=False)
+        sub.subset(tt)
+        bio = io.BytesIO()
+        tt.save(bio)
+        data = bio.getvalue()
+        upm = full['head'].unitsPerEm
+        widths = []
+        for ch, g in sorted(gid_of.items(), key=lambda kv: kv[1]):
+            widths += [g, [round(full['hmtx'][order[g]][0] * 1000 / upm)]]
+        ff = pdf.make_stream(data)
+        ff.Length1 = len(data)
+        descriptor = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.FontDescriptor, FontName=pikepdf.Name('/BCDEFG+' + base), Flags=32,
+            FontBBox=[-1021, -463, 1793, 1232], ItalicAngle=0, Ascent=928, Descent=-236, CapHeight=729,
+            StemV=80, FontFile2=ff))
+        cid = pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.CIDFontType2, BaseFont=pikepdf.Name('/BCDEFG+' + base),
+            CIDSystemInfo=pikepdf.Dictionary(Registry=pikepdf.String('Adobe'), Ordering=pikepdf.String('Identity'), Supplement=0),
+            FontDescriptor=descriptor, DW=600, W=widths, CIDToGIDMap=pikepdf.Name.Identity))
+        new_fonts[base] = (pdf.make_indirect(pikepdf.Dictionary(
+            Type=pikepdf.Name.Font, Subtype=pikepdf.Name.Type0, BaseFont=pikepdf.Name('/BCDEFG+' + base),
+            Encoding=pikepdf.Name('/Identity-H'), DescendantFonts=[cid])), gid_of)
+    for pi, page in enumerate(pdf.pages):
+        cur = None
+        ops = []
+        for operands, op in pikepdf.parse_content_stream(page):
+            if str(op) == 'Tf':
+                cur = page_fonts[pi].get(str(operands[0]))
+            elif str(op) in ('Tj', "'", '"', 'TJ') and cur:
+                gid_of = new_fonts[cur[0]][1]
+                def conv(s_):
+                    return pikepdf.String(b''.join(gid_of[cur[1][b]].to_bytes(2, 'big') for b in bytes(s_)))
+                if str(op) == 'TJ':
+                    operands = [pikepdf.Array([conv(x) if isinstance(x, pikepdf.String) else x for x in operands[0]])]
+                else:
+                    operands = list(operands[:-1]) + [conv(operands[-1])]
+            ops.append((operands, op))
+        page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(ops))
+        fonts = page.Resources.Font
+        for name in list(fonts.keys()):
+            entry = page_fonts[pi].get(str(name))
+            if entry:
+                fonts[name] = new_fonts[entry[0]][0]
+    pdf.remove_unreferenced_resources()
+    pdf.save(os.path.join(HERE, dst), deterministic_id=True, compress_streams=True)
+    expected[dst] = dict(expected[src])
+
+
 if __name__ == '__main__':
     expected = {}
     make_3pages(expected)
@@ -568,6 +685,8 @@ if __name__ == '__main__':
     make_scan(expected)
     make_1c_centered(expected)
     make_3pages(expected, 'invoice-wordwise.pdf', wordwise=True)
+    make_cid_variant(expected, 'invoice-3pages.pdf', 'invoice-cid-no-tounicode.pdf')
+    make_cid_variant(expected, 'invoice-3pages.pdf', 'invoice-unreadable.pdf', strip_only=True)
     with open(os.path.join(HERE, 'expected.json'), 'w', encoding='utf-8') as f:
         json.dump(expected, f, ensure_ascii=False, indent=2)
         f.write('\n')

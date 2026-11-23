@@ -619,5 +619,77 @@
     "items_declared": 6,
     "expected_warnings": [],
     "pages": 3
+  },
+  "invoice-cid-no-tounicode.pdf": {
+    "number": "ВТ-2026/1187",
+    "invoice_date": "2026-11-12",
+    "supplier_name": "ООО «Вымышленная Техника»",
+    "supplier_inn": "7701001238",
+    "supplier_kpp": "770101001",
+    "buyer_name": "ООО «Тестовый Заказчик»",
+    "buyer_inn": "5003004563",
+    "buyer_kpp": "500301001",
+    "currency": "RUB",
+    "total_amount": "410075.00",
+    "vat_amount": "68345.83",
+    "amount_due": "410075.00",
+    "vat_note": null,
+    "items": [
+      {
+        "code": "NB-1450",
+        "name": "Ноутбук Вымышленный Pro 14, 16 ГБ ОЗУ, SSD 512 ГБ",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "84500.00",
+        "amount": "253500.00"
+      },
+      {
+        "code": "MN-2701",
+        "name": "Монитор 27\" Условный IPS 2560x1440",
+        "quantity": "3",
+        "unit": "шт",
+        "price": "23990.00",
+        "amount": "71970.00"
+      },
+      {
+        "code": "SW-OS-11",
+        "name": "Лицензия операционной системы, бессрочная, электронная поставка",
+        "quantity": "3",
+        "unit": "лиц",
+        "price": "17800.00",
+        "amount": "53400.00"
+      },
+      {
+        "code": "SW-AV-1Y",
+        "name": "Антивирус Пример на 1 год, продление",
+        "quantity": "10",
+        "unit": "лиц",
+        "price": "1450.50",
+        "amount": "14505.00"
+      },
+      {
+        "code": "SRV-SET",
+        "name": "Настройка рабочих мест и перенос данных",
+        "quantity": "6",
+        "unit": "ч",
+        "price": "2200.00",
+        "amount": "13200.00"
+      },
+      {
+        "code": null,
+        "name": "Доставка до склада покупателя",
+        "quantity": "1",
+        "unit": "усл",
+        "price": "3500.00",
+        "amount": "3500.00"
+      }
+    ],
+    "items_declared": 6,
+    "expected_warnings": [],
+    "pages": 3
+  },
+  "invoice-unreadable.pdf": {
+    "pages": 3,
+    "unreadable": true
   }
 }
