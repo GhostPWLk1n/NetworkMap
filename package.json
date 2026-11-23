@@ -12,6 +12,7 @@
     "start": "electron .",
     "test:invoices": "node tests/invoice-parser.test.js && node tests/invoices-db.test.js",
     "test:invoices-electron": "electron tests/electron/invoice-smoke.js",
+    "test:bitrix": "node tests/bitrix.test.js",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:win:portable": "electron-builder --win portable",

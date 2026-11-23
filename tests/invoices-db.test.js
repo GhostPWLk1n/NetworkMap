@@ -64,7 +64,7 @@ const ITEMS = [
   const db = dbm.getDb();
 
   console.log('=== Новая база');
-  check('версия схемы 21', db.pragma('user_version', { simple: true }) === 21);
+  check('версия схемы не ниже 21 (счета)', db.pragma('user_version', { simple: true }) >= 21);
   ['document_files', 'invoices', 'invoice_items'].forEach((t) =>
     check(`таблица ${t}`, !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(t)));
   check('каналы: чтение без записи, создание/правка/удаление — запись',
@@ -206,7 +206,7 @@ const ITEMS = [
   d.close();
   dbm.initDatabase(oldFile);
   d = dbm.getDb();
-  check('версия поднялась до 21', d.pragma('user_version', { simple: true }) === 21);
+  check('версия поднялась до текущей (не ниже 21)', d.pragma('user_version', { simple: true }) >= 21);
   check('прежние данные на месте', dbm.usersRepo.list().length === 1 && dbm.devicesRepo.list().some((x) => x.hostname === 'PC-TEST-01'));
   const mig = await call('invoices:create', { invoice: HEADER, items: ITEMS, file: fileOf('invoice-3pages.pdf') });
   check('в обновлённой базе счета работают', mig.status === 'created');

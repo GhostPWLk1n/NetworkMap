@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld('api', {
   // Синхронизация карточек из Битрикс24. Запрос к порталу выполняет процесс, владеющий
   // базой (в сетевом режиме — сервер), адрес вебхука сюда не попадает никогда.
   bitrix: {
+    search: (query, start = 0) => invoke('bitrix:search', { query, start }),
     preview: (bitrixId, target = null) => invoke('bitrix:preview', { bitrixId, target }),
     apply: (bitrixId, target, fingerprint) => invoke('bitrix:apply', { bitrixId, target, fingerprint })
   },

@@ -417,7 +417,7 @@ function applyUsersFilter() {
   const query = (state.query || '').trim();
 
   const filtered = usersCache.filter((u) => {
-    const haystack = [u.full_name, u.department, u.position, u.email, u.phone, u.notes].filter(Boolean).join(' ');
+    const haystack = [u.full_name, u.department, u.position, u.email, u.phone, u.notes, u.bitrix_pc_number].filter(Boolean).join(' ');
     const matchesText = !query || matchesQuery(haystack, query, state);
     const matchesDept = !deptFilter || (u.department || '').toLowerCase().includes(deptFilter);
     const isHiddenByDefault = u.status === 'dismissed' && !showDismissed;
@@ -646,7 +646,7 @@ document.getElementById('users-filter-show-dismissed').addEventListener('change'
 // Карточка из Битрикс24 (задача #3)
 // ============================================================
 //
-// Поиск по ID → предпросмотр → явное подтверждение. Сам запрос к порталу и сопоставление
+// Поиск по ID или по имени (#10) → выбор сотрудника → предпросмотр → явное подтверждение. Сам запрос к порталу и сопоставление
 // делает процесс, владеющий базой (bitrix:preview / bitrix:apply в dbChannels), здесь —
 // только показ. Всё, что пришло из Битрикс24, выводится через textContent: строки с
 // портала не должны попадать в разметку как HTML.
@@ -664,8 +664,19 @@ const bitrixUi = {
   savable: null,    // предпросмотр, по которому разрешено сохранить (см. правило выше)
   choice: null,     // выбор оператора при первой синхронизации: { mode: 'create' } | { mode: 'link', userId }
   requestSeq: 0,    // номер последнего запроса; ответы на более ранние отбрасываются
-  pendingSeq: null  // номер выполняющегося запроса, null — ничего не выполняется
+  pendingSeq: null, // номер выполняющегося запроса, null — ничего не выполняется
+  query: null,      // текст поля на момент поиска — сохранение сверяет его с полем
+  results: null,    // ответ поиска по имени: { query, items, next, total }
+  // Привязка из карточки пользователя (#10): { userId, fullName } — сохранить связь можно
+  // только с этой карточкой, создать новую или забрать чужую связь нельзя
+  fixedTarget: null
 };
+
+/** Цель запроса предпросмотра при привязке из карточки, иначе null (выбор в окне). */
+function bitrixFixedRequest() {
+  const f = bitrixUi.fixedTarget;
+  return f ? { mode: 'link', userId: f.userId, strict: true } : null;
+}
 
 /** ID из поля → число или null. ОДНА нормализация и для поиска, и для проверки перед
  *  сохранением: «00106» — это тот же сотрудник 106, а не «другой ID». */
@@ -689,6 +700,9 @@ function bitrixSelectedTarget() {
 /** Совпадает ли цель предпросмотра с тем, что выбрано сейчас (и в окне, и в состоянии). */
 function bitrixTargetIsCurrent(p) {
   if (!p || !p.target) return false;
+  if (bitrixUi.fixedTarget) {
+    return (p.target.mode === 'link' || p.target.mode === 'linked') && p.target.userId === bitrixUi.fixedTarget.userId;
+  }
   const hasChoiceUi = !!document.querySelector('#bitrix-target input[name="bitrix-target"]');
   if (p.target.mode === 'linked') return !hasChoiceUi && !bitrixUi.choice;
   const same = (t) => !!t && t.mode === p.target.mode &&
@@ -743,8 +757,15 @@ function bitrixSetBusy(busy, label) {
   bitrixUpdateApplyButton();
 }
 
-function openBitrixModal(prefillId = null) {
+function openBitrixModal(prefillId = null, fixedTarget = null) {
+  bitrixUi.fixedTarget = fixedTarget;
+  const fixedBox = bitrixEl('bitrix-fixed-target');
+  fixedBox.textContent = fixedTarget
+    ? `Связь будет сохранена с карточкой NetworkMap «${fixedTarget.fullName}». Найдите сотрудника по ID или имени.`
+    : '';
+  fixedBox.classList.toggle('hidden', !fixedTarget);
   bitrixInvalidatePreview();
+  bitrixClearResults();
   bitrixSetStatus('');
   const input = bitrixEl('bitrix-id-input');
   input.value = prefillId ? String(prefillId) : '';
@@ -774,6 +795,7 @@ async function bitrixRequestPreview(bitrixId, target, busyLabel) {
     bitrixUi.bitrixId = bitrixId;
     bitrixUi.preview = preview;
     bitrixSetStatus('');
+    bitrixMarkSelectedResult(bitrixId);
     renderBitrixPreview(preview);
     bitrixUi.savable = preview;
   } catch (err) {
@@ -808,14 +830,137 @@ function bitrixInvalidatePreview() {
   bitrixSetBusy(false);
 }
 
+function bitrixClearResults() {
+  bitrixUi.results = null;
+  const box = bitrixEl('bitrix-results');
+  box.innerHTML = '';
+  box.classList.add('hidden');
+}
+
 function bitrixSearch() {
-  const bitrixId = bitrixParseId(bitrixEl('bitrix-id-input').value);
+  const text = bitrixEl('bitrix-id-input').value.trim();
   bitrixInvalidatePreview(); // новый поиск — прошлый предпросмотр и выбор карточки больше не действуют
-  if (bitrixId === null) {
-    bitrixSetStatus('Введите ID сотрудника — целое положительное число (его видно в адресе профиля в Битрикс24).', 'error');
+  bitrixClearResults();
+  bitrixUi.query = text;
+  if (!text) {
+    bitrixSetStatus('Введите ID сотрудника (его видно в адресе профиля в Битрикс24), фамилию, имя или ФИО.', 'error');
     return;
   }
-  bitrixRequestPreview(bitrixId, null, 'Запрашиваю профиль в Битрикс24…');
+  if (/^\d+$/.test(text)) {
+    // Только цифры — это ID, как и раньше («00106» — тот же сотрудник 106)
+    const bitrixId = bitrixParseId(text);
+    if (bitrixId === null) {
+      bitrixSetStatus('ID сотрудника — целое положительное число.', 'error');
+      return;
+    }
+    bitrixRequestPreview(bitrixId, bitrixFixedRequest(), 'Запрашиваю профиль в Битрикс24…');
+    return;
+  }
+  if (text.length < 2) {
+    bitrixSetStatus('Для поиска по имени введите хотя бы 2 буквы.', 'error');
+    return;
+  }
+  bitrixRequestSearch(text, 0);
+}
+
+/** Поиск по имени. start > 0 — следующая страница того же запроса (дописывается в список). */
+async function bitrixRequestSearch(query, start) {
+  const seq = ++bitrixUi.requestSeq;
+  bitrixUi.pendingSeq = seq;
+  bitrixUi.savable = null;
+  bitrixSetBusy(true, start ? 'Загружаю ещё…' : 'Ищу в Битрикс24…');
+  try {
+    handleApiErrorLocally('bitrix:search');
+    const res = await window.api.bitrix.search(query, start);
+    if (seq !== bitrixUi.requestSeq) return; // устаревший ответ ничего не меняет
+    const prev = start && bitrixUi.results && bitrixUi.results.query === res.query ? bitrixUi.results.items : [];
+    const seen = new Set(prev.map((it) => it.bitrixId));
+    bitrixUi.results = { ...res, items: [...prev, ...res.items.filter((it) => !seen.has(it.bitrixId))] };
+    renderBitrixResults();
+    if (bitrixUi.results.items.length === 0) {
+      bitrixSetStatus(`По запросу «${res.query}» в Битрикс24 никого не нашлось. Проверьте написание или ищите по ID.`, 'error');
+    } else {
+      bitrixSetStatus(bitrixUi.results.items.length === 1 ? 'Найден один сотрудник — выберите его, чтобы посмотреть изменения.' : 'Выберите сотрудника.');
+    }
+  } catch (err) {
+    if (seq !== bitrixUi.requestSeq) return;
+    if (!start) bitrixClearResults();
+    bitrixSetStatus(bitrixErrorText(err), 'error');
+  } finally {
+    if (seq === bitrixUi.requestSeq) {
+      bitrixUi.pendingSeq = null;
+      bitrixSetBusy(false);
+    }
+  }
+}
+
+function renderBitrixResults() {
+  const box = bitrixEl('bitrix-results');
+  box.innerHTML = '';
+  const r = bitrixUi.results;
+  if (!r || r.items.length === 0) { box.classList.add('hidden'); return; }
+  const head = document.createElement('div');
+  head.className = 'bitrix-results-head';
+  head.textContent = r.total !== null && r.total !== undefined
+    ? `Найдено: ${r.total}${r.total > r.items.length ? `, показано ${r.items.length}` : ''}`
+    : `Найдено: ${r.items.length}`;
+  box.appendChild(head);
+  r.items.forEach((it) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'bitrix-result';
+    btn.dataset.bitrixId = String(it.bitrixId);
+    const name = document.createElement('span');
+    name.className = 'bitrix-result-name';
+    name.textContent = it.fullName || '(ФИО не заполнено)';
+    const id = document.createElement('span');
+    id.className = 'bitrix-badge';
+    id.textContent = `ID ${it.bitrixId}`;
+    btn.append(name, id);
+    if (it.active === false) {
+      const b = document.createElement('span');
+      b.className = 'bitrix-badge inactive';
+      b.textContent = 'неактивен';
+      btn.appendChild(b);
+    }
+    if (it.linkedUser) {
+      const b = document.createElement('span');
+      b.className = 'bitrix-badge';
+      b.textContent = `связан с «${it.linkedUser.full_name}»`;
+      btn.appendChild(b);
+    }
+    const meta = document.createElement('span');
+    meta.className = 'bitrix-result-meta';
+    const dept = it.department || (it.departmentIds && it.departmentIds.length ? `подразделение ID ${it.departmentIds.join(', ')}` : null);
+    meta.textContent = [it.position, dept].filter(Boolean).join(' · ') || 'должность и подразделение не указаны';
+    btn.appendChild(meta);
+    btn.addEventListener('click', () => bitrixPick(it.bitrixId));
+    box.appendChild(btn);
+  });
+  if (r.next !== null && r.next !== undefined) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'bitrix-results-more';
+    more.textContent = 'Показать ещё';
+    more.addEventListener('click', () => bitrixRequestSearch(r.query, r.next));
+    box.appendChild(more);
+  }
+  box.classList.remove('hidden');
+  bitrixMarkSelectedResult(bitrixUi.bitrixId);
+}
+
+function bitrixMarkSelectedResult(bitrixId) {
+  document.querySelectorAll('#bitrix-results .bitrix-result').forEach((b) => {
+    b.classList.toggle('selected', Number(b.dataset.bitrixId) === bitrixId);
+  });
+}
+
+/** Выбор сотрудника из найденных: прежний предпросмотр и выбор карточки сбрасываются,
+ *  затем — обычный предпросмотр по точному ID. */
+function bitrixPick(bitrixId) {
+  bitrixInvalidatePreview();
+  bitrixMarkSelectedResult(bitrixId);
+  bitrixRequestPreview(bitrixId, bitrixFixedRequest(), 'Запрашиваю профиль в Битрикс24…');
 }
 
 function bitrixChoose(choice) {
@@ -901,6 +1046,12 @@ function renderBitrixProfile(p) {
   if (prof.phone && prof.phoneSource === 'PERSONAL_MOBILE') phone.textContent += ' (мобильный — рабочий не заполнен)';
   row('Телефон', phone);
   row('Активность', bitrixValue(prof.active === false ? 'неактивен' : prof.active === true ? 'активен' : null));
+  const pc = bitrixValue(prof.pcNumber);
+  if (!prof.pcNumber && prof.pcSourceText) {
+    pc.className = 'bitrix-muted';
+    pc.textContent = `не определён — в поле «Другие сайты»: «${prof.pcSourceText}»`;
+  }
+  row('Номер ПК', pc);
   box.appendChild(dl);
 
   const note = (text) => {
@@ -915,6 +1066,12 @@ function renderBitrixProfile(p) {
   if (p.warnings.includes('department_ids_only')) {
     note(`Портал передал только ID подразделения (${prof.departmentIds.join(', ')}), без названия. В карточке останется подразделение, которое в ней уже записано.`);
   }
+  if (p.warnings.includes('pc_number_ambiguous')) {
+    note('В поле «Другие сайты» несколько разных чисел — номер ПК не определён. Сохранённый в карточке номер останется прежним.');
+  }
+  if (p.warnings.includes('pc_number_no_digits')) {
+    note('В поле «Другие сайты» нет цифр — номер ПК не определён. Сохранённый в карточке номер останется прежним.');
+  }
 }
 
 function renderBitrixTarget(p) {
@@ -922,6 +1079,18 @@ function renderBitrixTarget(p) {
   box.innerHTML = '';
   const title = document.createElement('div');
   title.className = 'bitrix-target-title';
+
+  if (bitrixUi.fixedTarget) {
+    // Привязка из карточки: выбора нет — только эта карточка
+    title.textContent = 'Карточка в NetworkMap';
+    const text = document.createElement('div');
+    const fixed = bitrixUi.fixedTarget;
+    if (p.linkedUser && p.linkedUser.id === fixed.userId) text.textContent = `Уже связан с карточкой «${fixed.fullName}» — обновится она.`;
+    else if (p.target) text.textContent = `Связать с карточкой «${fixed.fullName}».`;
+    else text.textContent = `Связать с карточкой «${fixed.fullName}» нельзя.`;
+    box.append(title, text);
+    return;
+  }
 
   if (p.linkedUser) {
     title.textContent = 'Карточка в NetworkMap';
@@ -991,6 +1160,16 @@ function renderBitrixChanges(p) {
   box.innerHTML = '';
   // Выбор ещё не сделан (или «связать» без выбранной карточки) — сравнивать не с чем
   const waitingForChoice = !p.target || (bitrixUi.choice && bitrixUi.choice.mode === 'link' && !bitrixUi.choice.userId && !p.linkedUser);
+  if (waitingForChoice && bitrixUi.fixedTarget) {
+    // Привязка из карточки невозможна (сотрудник связан с другой карточкой и т. п.)
+    if (p.blockReason) {
+      const n = document.createElement('div');
+      n.className = 'bitrix-note';
+      n.textContent = p.blockReason;
+      box.appendChild(n);
+    }
+    return;
+  }
   if (waitingForChoice) {
     if (p.blockReason && p.target === null && bitrixUi.choice && bitrixUi.choice.mode === 'link' && bitrixUi.choice.userId) {
       // Выбранную карточку взять нельзя (удалена или уже связана) — причина от сервера
@@ -1035,6 +1214,9 @@ function renderBitrixChanges(p) {
     let hint = changing ? null : BITRIX_FIELD_HINTS[c.action];
     if (c.field === 'phone' && changing && p.profile.phoneSource === 'PERSONAL_MOBILE') hint = 'мобильный — рабочий не заполнен';
     if (c.field === 'department' && c.action === 'keep' && p.warnings.includes('department_ids_only')) hint = 'в Битрикс24 только ID подразделения — останется текущее';
+    if (c.field === 'bitrix_pc_number' && !changing && (p.warnings.includes('pc_number_ambiguous') || p.warnings.includes('pc_number_no_digits'))) {
+      hint = c.from ? 'номер в Битрикс24 не определён — останется текущий' : 'номер в Битрикс24 не определён';
+    }
     addRow(c.label, bitrixValue(isCreate ? null : c.from), bitrixValue(c.to), changing ? 'is-change' : 'is-quiet', hint);
   });
   if (p.target.mode !== 'linked') {
@@ -1057,10 +1239,14 @@ async function bitrixApply() {
   if (!p || !p.canApply || bitrixUi.pendingSeq !== null) return;
   // Последние проверки перед записью. Кнопка и так выключена в этих случаях, но
   // расхождение не должно дойти до записи ни при каком порядке событий.
-  // 1) Сотрудник — тот, чей ID сейчас в поле (та же нормализация, что при поиске).
-  if (bitrixParseId(bitrixEl('bitrix-id-input').value) !== bitrixUi.bitrixId) {
+  // 1) Запрос в поле — тот, по которому найден сотрудник; для поиска по ID — тот же ID
+  //    (та же нормализация, что при поиске).
+  const fieldText = bitrixEl('bitrix-id-input').value.trim();
+  const byId = /^\d+$/.test(fieldText);
+  if (fieldText !== bitrixUi.query || (byId && bitrixParseId(fieldText) !== bitrixUi.bitrixId)) {
     bitrixInvalidatePreview();
-    bitrixSetStatus('ID в поле изменился — нажмите «Найти», чтобы проверить этого сотрудника.', 'error');
+    bitrixClearResults();
+    bitrixSetStatus('Запрос в поле изменился — нажмите «Найти», чтобы проверить этого сотрудника.', 'error');
     return;
   }
   // 2) Карточка — та, что выбрана в окне сейчас.
@@ -1077,7 +1263,8 @@ async function bitrixApply() {
   bitrixSetBusy(true, 'Сохраняю…');
   try {
     handleApiErrorLocally('bitrix:apply');
-    const res = await window.api.bitrix.apply(bitrixUi.bitrixId, p.target, p.fingerprint);
+    const target = bitrixUi.fixedTarget ? { ...p.target, strict: true } : p.target;
+    const res = await window.api.bitrix.apply(bitrixUi.bitrixId, target, p.fingerprint);
     // Запись уже состоялась — список обновляем в любом случае, даже если окно успели
     // закрыть, пока шло сохранение
     await renderUsers();
@@ -1114,26 +1301,38 @@ bitrixEl('bitrix-search-form').addEventListener('submit', (e) => { e.preventDefa
 bitrixEl('bitrix-id-input').addEventListener('input', () => {
   // Предпросмотр относится к конкретному ID — после любой правки поля он недействителен.
   // Подсказку «нажмите Найти» показываем, только если было что аннулировать.
-  const hadPreview = !!(bitrixUi.preview || bitrixUi.bitrixId);
+  const hadPreview = !!(bitrixUi.preview || bitrixUi.bitrixId || bitrixUi.results);
   bitrixInvalidatePreview();
-  bitrixSetStatus(hadPreview ? 'ID изменён — нажмите «Найти».' : '');
+  bitrixClearResults();
+  bitrixSetStatus(hadPreview ? 'Запрос изменён — нажмите «Найти».' : '');
 });
 bitrixEl('bitrix-apply-btn').addEventListener('click', bitrixApply);
 bitrixEl('bitrix-cancel-btn').addEventListener('click', closeBitrixModal);
 bitrixEl('bitrix-modal').addEventListener('keydown', (e) => { if (e.key === 'Escape') closeBitrixModal(); });
 
-/** Строка «связан с Битрикс24» в развёрнутой карточке пользователя. */
+/** Строка «Битрикс24» в развёрнутой карточке пользователя: для связанной — ID, номер ПК
+ *  и «Обновить», для несвязанной — «Связать с Битрикс24» (#10). */
 function buildUserBitrixLine(u) {
-  if (!u.bitrix_id) return null;
   const line = document.createElement('div');
   line.className = 'user-bitrix-link';
+  if (!u.bitrix_id) {
+    const text = document.createElement('span');
+    text.textContent = 'Битрикс24: не связан ';
+    const linkBtn = document.createElement('button');
+    linkBtn.type = 'button';
+    linkBtn.className = 'bitrix-link-card-btn';
+    linkBtn.textContent = '🔗 Связать с Битрикс24';
+    linkBtn.addEventListener('click', () => openBitrixModal(null, { userId: u.id, fullName: u.full_name }));
+    line.append(text, linkBtn);
+    return line;
+  }
   let synced = '';
   if (u.bitrix_synced_at) {
     const d = new Date(`${String(u.bitrix_synced_at).replace(' ', 'T')}Z`); // SQLite datetime('now') — UTC
     synced = ` · сверено ${Number.isNaN(d.getTime()) ? u.bitrix_synced_at : d.toLocaleString('ru-RU')}`;
   }
   const text = document.createElement('span');
-  text.textContent = `Битрикс24: ID ${u.bitrix_id}${synced} `;
+  text.textContent = `Битрикс24: ID ${u.bitrix_id}${u.bitrix_pc_number ? ` · номер ПК из Битрикс24: ${u.bitrix_pc_number}` : ''}${synced} `;
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.textContent = '🔄 Обновить из Битрикс24';
